@@ -1,0 +1,29 @@
+--- a/session.c
++++ b/session.c
+@@ -1147,6 +1147,26 @@
+ 		child_set_env(&env, &envsize, "SSH_ORIGINAL_COMMAND",
+ 		    original_command);
+ 
++#ifdef MAAT_MONITOR_SOCKET
++	/* Set LAST, after every client/admin environment variable, so this
++	 * value can only originate from server KEX, never SSH SendEnv. */
++	{
++		const u_char *sid = sshbuf_ptr(ssh->kex->session_id);
++		size_t sid_len = sshbuf_len(ssh->kex->session_id);
++		char sid_hex[257];
++		static const char hex[] = "0123456789abcdef";
++		size_t j;
++		if (sid == NULL || sid_len < 16 || sid_len > 128)
++			fatal("invalid Maât SSH session ID");
++		for (j = 0; j < sid_len; ++j) {
++			sid_hex[j * 2] = hex[sid[j] >> 4];
++			sid_hex[j * 2 + 1] = hex[sid[j] & 15];
++		}
++		sid_hex[sid_len * 2] = '\0';
++		child_set_env(&env, &envsize, "MAAT_SSH_SESSION_ID", sid_hex);
++	}
++#endif
++
+ 	if (debug_flag) {
+ 		/* dump the environment */
+ 		fprintf(stderr, "Environment:\n");

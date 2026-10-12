@@ -1,0 +1,11 @@
+[Unit]
+Description=Maât SSH-carried HTTP (experimental)
+Requires=maat-http-broker.service
+After=maat-http-broker.service
+[Service]
+Type=simple
+ExecStartPre=/usr/lib/maat/sshd -t -f /etc/maat/sshd_http.conf
+ExecStart=/usr/lib/maat/sshd -D -e -f /etc/maat/sshd_http.conf
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target

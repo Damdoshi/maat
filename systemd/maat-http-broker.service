@@ -1,0 +1,19 @@
+[Unit]
+Description=Maât one-use HTTP identity broker
+Requires=maat-monitor-receiver.service
+After=maat-monitor-receiver.service
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/sbin/maat-http-broker www-data /var/lib/maat/monitor.db /etc/maat/uid_range.dab
+UMask=0077
+RuntimeDirectory=maat-http
+RuntimeDirectoryMode=0711
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/maat-http /var/lib/maat
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target

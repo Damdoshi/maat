@@ -1,0 +1,6 @@
+# Maât host-wide reserved Linux UID namespace. Reserve this block outside Maât.
+# 1.1 billion distinct SSH connection identities; allocated once, never recycled.
+[UIDRange
+    First = 1000000000
+    Last = 2099999999
+]

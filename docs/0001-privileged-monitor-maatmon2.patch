@@ -1,0 +1,129 @@
+--- a/libs/openssh-portable/monitor.c
++++ b/libs/openssh-portable/monitor.c
+@@ -30,6 +30,9 @@
+ #include <sys/types.h>
+ #include <sys/wait.h>
+ #include <sys/socket.h>
++#ifdef MAAT_MONITOR_SOCKET
++#include <sys/un.h>
++#endif
+ #include <sys/tree.h>
+ #include <sys/queue.h>
+ 
+@@ -160,6 +163,11 @@
+ static int invalid_user = 0;
+ static int compat_set = 0;
+ 
++#ifdef MAAT_MONITOR_SOCKET
++/* Privileged monitor, not the unprivileged preauth child. */
++static int maat_emit_verified_publickey(const Authctxt *);
++#endif
++
+ struct mon_table {
+ 	enum monitor_reqtype type;
+ 	int flags;
+@@ -360,6 +368,11 @@
+ 		fatal_f("authentication method name unknown");
+ 
+ 	debug_f("user %s authenticated by privileged process", authctxt->user);
++#ifdef MAAT_MONITOR_SOCKET
++	/* Dedicated Maât sshd only: no acknowledgement means no login. */
++	if (maat_emit_verified_publickey(authctxt) != 0)
++		fatal_f("Maât monitor assertion rejected or unavailable");
++#endif
+ 	auth_attempted = 0;
+ 	ssh->authctxt = NULL;
+ 	ssh_packet_set_log_preamble(ssh, "user %s", authctxt->user);
+@@ -2093,3 +2106,92 @@
+ }
+ #endif /* GSSAPI */
+ 
++
++
++#ifdef MAAT_MONITOR_SOCKET
++/*
++ * MAATMON2: four SSH strings (magic, user, KEX session ID, accepted key
++ * blob). This uses authctxt->prev_keys, which the privileged monitor
++ * populates only after a verified userauth signature. Never parse a
++ * textual authentication log or accept a key supplied by session code.
++ *
++ * This deliberately supports exactly one successful raw Ed25519 publickey
++ * authentication. Other mechanisms, certificates and MFA require an
++ * explicitly designed protocol extension and are rejected in Maât mode.
++ * Root and the privileged monitor remain part of Maât's trusted base.
++ */
++static int
++maat_emit_verified_publickey(const Authctxt *auth)
++{
++	struct sockaddr_un addr;
++	struct sshbuf *payload = NULL;
++	u_char *keyblob = NULL;
++	size_t keyblob_len = 0, len;
++	const u_char *info;
++	int fd = -1, ok = -1, r;
++	struct pollfd pfd;
++	char ack[16];
++	ssize_t n;
++
++	if (geteuid() != 0 || auth == NULL || !auth->valid ||
++	    auth->user == NULL || session_id2 == NULL ||
++	    session_id2_len < 16 || session_id2_len > 128 ||
++	    auth->nprev_keys != 1 || auth->prev_keys == NULL ||
++	    auth->prev_keys[0] == NULL ||
++	    auth->prev_keys[0]->type != KEY_ED25519 ||
++	    auth->session_info == NULL)
++		return -1;
++	/* Require exactly one successful method, without accepting MFA chains. */
++	info = sshbuf_ptr(auth->session_info);
++	len = sshbuf_len(auth->session_info);
++	if (len < 11 || len > 1024 ||
++	    memcmp(info, "publickey ", 10) != 0 || info[len - 1] != '\n' ||
++	    memchr(info, '\n', len - 1) != NULL)
++		return -1;
++	if ((r = sshkey_to_blob(auth->prev_keys[0],
++	    &keyblob, &keyblob_len)) != 0 || keyblob_len == 0 ||
++	    keyblob_len > 1024)
++		goto out;
++	if ((payload = sshbuf_new()) == NULL)
++		goto out;
++	if ((r = sshbuf_put_cstring(payload, "MAATMON2")) != 0 ||
++	    (r = sshbuf_put_cstring(payload, auth->user)) != 0 ||
++	    (r = sshbuf_put_string(payload,
++	    session_id2, session_id2_len)) != 0 ||
++	    (r = sshbuf_put_string(payload, keyblob, keyblob_len)) != 0)
++		goto out;
++	len = sshbuf_len(payload);
++	if (len > 2048)
++		goto out;
++	memset(&addr, 0, sizeof(addr));
++	addr.sun_family = AF_UNIX;
++	if (strlcpy(addr.sun_path, "/run/maat/monitor.sock",
++	    sizeof(addr.sun_path)) >= sizeof(addr.sun_path))
++		goto out;
++	if ((fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0)) < 0)
++		goto out;
++	/* Do not indefinitely stall SSH when broker is unavailable. */
++	pfd.fd = fd;
++	pfd.events = POLLOUT;
++	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
++		goto out;
++	if (poll(&pfd, 1, 2000) != 1 || (pfd.revents & POLLOUT) == 0)
++		goto out;
++	n = send(fd, sshbuf_ptr(payload), len, MSG_NOSIGNAL);
++	if (n != (ssize_t)len)
++		goto out;
++	pfd.events = POLLIN;
++	if (poll(&pfd, 1, 2000) != 1 || (pfd.revents & POLLIN) == 0)
++		goto out;
++	n = recv(fd, ack, sizeof(ack), 0);
++	if (n == 7 && memcmp(ack, "MAATOK2", 7) == 0)
++		ok = 0;
++ out:
++	if (fd >= 0)
++		close(fd);
++	if (keyblob != NULL)
++		freezero(keyblob, keyblob_len);
++	sshbuf_free(payload);
++	return ok;
++}
++#endif /* MAAT_MONITOR_SOCKET */

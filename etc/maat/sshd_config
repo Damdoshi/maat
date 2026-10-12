@@ -1,0 +1,20 @@
+# EXAMPLE, deliberately INERT by default. DO NOT disable DenyUsers before a
+# citizen registry and a public-key authorization policy have been deployed.
+Port 22222
+ListenAddress 127.0.0.1
+HostKey /etc/maat/ssh_host_ed25519_key
+PidFile /run/maat/sshd.pid
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+DenyUsers *
+AuthorizedKeysFile none
+DisableForwarding yes
+AllowAgentForwarding no
+X11Forwarding no
+PermitTTY no
+ForceCommand /bin/false
+PermitUserEnvironment no
+LogLevel INFO

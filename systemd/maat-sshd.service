@@ -1,0 +1,14 @@
+[Unit]
+Description=Maât isolated OpenSSH server (experimental)
+Requires=maat-monitor-receiver.service
+After=network.target maat-monitor-receiver.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/lib/maat/sshd -t -f /etc/maat/sshd_config
+ExecStart=/usr/lib/maat/sshd -D -e -f /etc/maat/sshd_config
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
