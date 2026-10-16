@@ -1,0 +1,418 @@
+//! # Affinidi Trusted Messaging SDK
+//!
+//! The Affinidi Trusted Messaging (ATM) SDK provides a high-level interface for
+//! [DIDComm v2](https://identity.foundation/didcomm-messaging/spec/) messaging
+//! through a mediator service. It handles message encryption, signing, routing,
+//! and transport so you can focus on building your application.
+//!
+//! ## Key Concepts
+//!
+//! - **[`ATM`]** - The main entry point. Holds configuration, profiles, and manages
+//!   background tasks (e.g. message deletion).
+//! - **[`profiles::ATMProfile`]** - Represents a DID identity with an associated
+//!   mediator. Each profile can independently send and receive messages.
+//! - **Mediator** - A service that stores and forwards DIDComm messages on behalf
+//!   of your profile. Discovered automatically from the mediator's DID Document.
+//! - **[`protocols::Protocols`]** - Pre-built DIDComm protocol implementations
+//!   (Trust Ping, Message Pickup 3.0, Routing 2.0, etc.).
+//! - **Transports** - The SDK supports both REST (HTTPS) and WebSocket (WSS)
+//!   transports. REST is used for authentication and bulk operations; WebSocket
+//!   enables low-latency sending and live message streaming.
+//!
+//! ## Getting Started
+//!
+//! ### 1. Initialize the TDK shared state
+//!
+//! The SDK builds on top of `affinidi-tdk-common` which manages DID resolution
+//! and secrets. You need a [`TDKSharedState`] instance first:
+//!
+//! ```rust,ignore
+//! use affinidi_tdk::common::{TDKSharedState, environments::TDKEnvironments};
+//! use std::sync::Arc;
+//!
+//! // Load environment configuration (DIDs, secrets, mediator endpoints)
+//! let mut environment = TDKEnvironments::fetch_from_file(
+//!     Some("environments.json"),
+//!     "default",
+//! )?;
+//!
+//! let tdk = Arc::new(TDKSharedState::default().await);
+//! ```
+//!
+//! ### 2. Build an ATM configuration and create the SDK instance
+//!
+//! Use [`config::ATMConfig::builder()`] to configure the SDK, then pass it to
+//! [`ATM::new()`]:
+//!
+//! ```rust,ignore
+//! use affinidi_messaging_sdk::{ATM, config::ATMConfig};
+//!
+//! let config = ATMConfig::builder()
+//!     // Add custom SSL/TLS certificates if the mediator uses self-signed certs
+//!     .with_ssl_certificates(&mut environment.ssl_certificates)
+//!     // Optional: tune the per-profile message fetch cache
+//!     .with_fetch_cache_limit_count(100)
+//!     .with_fetch_cache_limit_bytes(10 * 1024 * 1024)
+//!     .build()?;
+//!
+//! let atm = ATM::new(config, tdk).await?;
+//! ```
+//!
+//! ### 3. Register a profile
+//!
+//! A profile ties a DID to a mediator. Add it to both the TDK (for secrets/DID
+//! resolution) and the ATM SDK:
+//!
+//! ```rust,ignore
+//! use affinidi_messaging_sdk::profiles::ATMProfile;
+//!
+//! // Get a profile from your environment configuration
+//! let alice_tdk = environment.profiles.get("Alice").unwrap();
+//! tdk.add_profile(alice_tdk).await;
+//!
+//! // Convert and register with ATM (live_stream=false means no WebSocket yet)
+//! let alice = atm
+//!     .profile_add(
+//!         &ATMProfile::from_tdk_profile(&atm, alice_tdk).await?,
+//!         false,
+//!     )
+//!     .await?;
+//! ```
+//!
+//! ### 4. Send a message (REST)
+//!
+//! The simplest way to verify connectivity is a DIDComm Trust Ping:
+//!
+//! ```rust,ignore
+//! // Send a signed trust-ping, requesting a pong response
+//! let ping = atm
+//!     .trust_ping()
+//!     .send_ping(
+//!         &alice,       // sender profile
+//!         &target_did,  // recipient DID
+//!         true,         // signed
+//!         true,         // request pong response
+//!         false,        // don't block waiting for response
+//!     )
+//!     .await?;
+//! ```
+//!
+//! ### 5. Retrieve and unpack messages
+//!
+//! After sending a message that produces a response, fetch and decrypt it:
+//!
+//! ```rust,ignore
+//! use affinidi_messaging_sdk::messages::GetMessagesRequest;
+//!
+//! let response = atm
+//!     .get_messages(
+//!         &alice,
+//!         &GetMessagesRequest {
+//!             message_ids: vec![msg_id],
+//!             delete: true, // delete after retrieval
+//!         },
+//!     )
+//!     .await?;
+//!
+//! for msg in response.success {
+//!     let (message, metadata) = atm.unpack(&msg.msg.unwrap()).await?;
+//!     println!("Received: {:?}", message);
+//! }
+//! ```
+//!
+//! ### 6. Upgrade to WebSocket for live streaming
+//!
+//! For lower latency and push-based message delivery, enable the WebSocket
+//! transport on a profile:
+//!
+//! ```rust,ignore
+//! use std::time::Duration;
+//!
+//! // Open a WebSocket connection to the mediator
+//! atm.profile_enable_websocket(&alice).await?;
+//!
+//! // Send a ping (now routed over WebSocket automatically)
+//! let ping = atm
+//!     .trust_ping()
+//!     .send_ping(&alice, &target_did, true, true, false)
+//!     .await?;
+//!
+//! // Wait for the pong via the live stream
+//! let pong = atm
+//!     .message_pickup()
+//!     .live_stream_get(
+//!         &alice,
+//!         &ping.message_id,
+//!         Duration::from_secs(10),
+//!         true, // auto-delete
+//!     )
+//!     .await?;
+//! ```
+//!
+//! ### 7. Graceful shutdown
+//!
+//! Always shut down cleanly to close WebSocket connections and stop background
+//! tasks:
+//!
+//! ```rust,ignore
+//! atm.graceful_shutdown().await;
+//! ```
+//!
+//! ## Module Overview
+//!
+//! | Module | Description |
+//! |--------|-------------|
+//! | [`config`] | SDK configuration via the builder pattern ([`config::ATMConfig`]) |
+//! | [`profiles`] | DID profile and mediator management ([`profiles::ATMProfile`]) |
+//! | [`messages`] | Pack, unpack, send, list, get, fetch, and delete DIDComm messages |
+//! | [`protocols`] | Higher-level DIDComm protocol implementations (Trust Ping, Message Pickup, Routing) |
+//! | [`transports`] | REST and WebSocket transport layer |
+//! | [`errors`] | Error types ([`errors::ATMError`]) |
+//! | [`delete_handler`] | Background message deletion task |
+//! | [`public`] | Public utility functions (e.g. well-known DID resolution) |
+//!
+//! ## Debug Logging
+//!
+//! Enable SDK debug logs via the `RUST_LOG` environment variable:
+//!
+//! ```bash
+//! export RUST_LOG=none,affinidi_messaging_sdk=debug
+//! ```
+
+#[cfg(feature = "tsp")]
+use crate::protocols::tsp::TspOps;
+/// Re-exports of the TSP relationship-store API so consumers can implement a
+/// durable store or select one via the config builder.
+#[cfg(feature = "tsp")]
+pub use crate::protocols::tsp::{
+    BackoffPolicy, CapabilitySource, EvictionPolicy, InMemoryRelationshipStore, InviteRateLimiter,
+    PeerCapability, PersistentRelationshipStore, RecoveryAction, RecoveryCoordinator,
+    RecoveryMetrics, RecoveryState, RelationshipKv, RelationshipStore, SendProtocol, SendReadiness,
+    TSP_DISCOVER_FEATURE_URI, ThreadDigests, TspPolicy, TspSupport, TspWebSocket, full_jitter,
+    invite_refusal_is_benign, readiness_for,
+};
+/// Re-export of the pure-TSP authentication handler so a TSP-only client can
+/// register it on the TDK in place of the built-in DIDComm auth flow.
+#[cfg(feature = "tsp")]
+pub use crate::protocols::tsp_auth::TspAuthHandler;
+use crate::protocols::{
+    discover_features::DiscoverfeaturesOps, message_pickup::MessagePickupOps,
+    oob_discovery::OOBDiscoveryOps, routing::RoutingOps, trust_ping::TrustPingOps,
+    trust_tasks::TrustTasksOps,
+};
+use affinidi_task_utils::CancellationToken;
+use affinidi_tdk_common::TDKSharedState;
+use config::ATMConfig;
+use delete_handler::DeletionHandlerCommands;
+use errors::ATMError;
+use profiles::Profiles;
+use std::{sync::Arc, time::Duration};
+use tokio::sync::{
+    Mutex, RwLock, broadcast,
+    mpsc::{self, Receiver, Sender},
+};
+use tracing::{debug, warn};
+use transports::websockets::WebSocketResponses;
+
+/// Upper bound on how long [`ATM::graceful_shutdown`] waits for the Deletion
+/// Handler to acknowledge its stop. Generous for a live handler, bounded so a
+/// dead or wedged one cannot hold shutdown open.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+//pub mod authentication;
+pub mod config;
+pub mod delete_handler;
+pub mod errors;
+pub mod messages;
+pub mod profiles;
+pub mod protocols;
+pub mod public;
+pub mod transport_adapter;
+pub mod transports;
+pub mod tsp_wire;
+
+pub use transport_adapter::DidCommTransport;
+pub use transports::websockets::ReceiveHealth;
+pub use tsp_wire::{TSP_MAGIC_BYTE, TSP_MAGIC_BYTE_LONG, looks_like_tsp};
+
+#[derive(Clone)]
+pub struct ATM {
+    pub(crate) inner: Arc<SharedState>,
+}
+
+/// Private SharedState struct for the ATM to be used across tasks
+pub(crate) struct SharedState {
+    pub(crate) config: ATMConfig,
+    pub(crate) tdk_common: Arc<TDKSharedState>,
+    pub(crate) profiles: Arc<RwLock<Profiles>>,
+    pub(crate) deletion_handler_send_stream: Sender<delete_handler::DeletionHandlerCommands>, // Sends MPSC messages to the Deletion Handler
+    pub(crate) deletion_handler_recv_stream:
+        Mutex<Receiver<delete_handler::DeletionHandlerCommands>>, // Receives MPSC messages from the Deletion Handler
+    /// Shutdown token for the supervised deletion-handler task. Cancelling it
+    /// stops the handler (and tells its supervisor not to restart it).
+    pub(crate) deletion_shutdown: CancellationToken,
+    /// Per-peer key-state freshness bookkeeping for TSP (spec Rev 3 §7.4.2):
+    /// when each VID was last heard from, and when it was last resolved.
+    #[cfg(feature = "tsp")]
+    pub(crate) tsp_key_state: affinidi_tsp::keystate::KeyStateTracker,
+}
+
+/// Affinidi Trusted Messaging SDK
+/// This is the top level struct for the SDK
+///
+/// Example:
+/// ```ignore
+/// use affinidi_messaging_sdk::ATM;
+/// use affinidi_messaging_sdk::config::ATMConfigBuilder;
+///
+/// let config = ATMConfigBuilder::default().build()?;
+/// let atm = ATM::new(config, tdk_shared_state).await?;
+/// ```
+impl ATM {
+    /// Creates a new instance of the SDK with a given configuration
+    /// You need to add at least the DID Method for the SDK DID to work
+    pub async fn new(config: ATMConfig, tdk_common: Arc<TDKSharedState>) -> Result<ATM, ATMError> {
+        // Create a new channel with a capacity of at most 32. This communicates from SDK to the deletion handler
+        let (sdk_deletion_tx, deletion_sdk_rx) = mpsc::channel::<DeletionHandlerCommands>(32);
+
+        // Create a new channel with a capacity of at most 32. This communicates from deletion handler to the SDK
+        let (deletion_sdk_tx, sdk_deletion_rx) = mpsc::channel::<DeletionHandlerCommands>(32);
+
+        let shared_state = SharedState {
+            config: config.clone(),
+            tdk_common,
+            profiles: Arc::new(RwLock::new(Profiles::default())),
+            deletion_handler_send_stream: sdk_deletion_tx,
+            deletion_handler_recv_stream: Mutex::new(sdk_deletion_rx),
+            deletion_shutdown: CancellationToken::new(),
+            #[cfg(feature = "tsp")]
+            tsp_key_state: affinidi_tsp::keystate::KeyStateTracker::new(),
+        };
+
+        let atm = ATM {
+            inner: Arc::new(shared_state),
+        };
+
+        // Start the deletion handler
+        atm.start_deletion_handler(deletion_sdk_rx, deletion_sdk_tx)
+            .await?;
+
+        debug!("ATM SDK initialized");
+
+        Ok(atm)
+    }
+
+    /// Shut the SDK down: stop every profile's websocket transport, then stop
+    /// the Deletion Handler.
+    ///
+    /// Ordering is load-bearing. The websocket transports go FIRST because they
+    /// are the only part of the SDK that keeps acting on the outside world after
+    /// a shutdown begins: each one auto-reconnects on its own timer and holds
+    /// the mediator's one-socket-per-DID slot for its profile. Stopping the
+    /// Deletion Handler first (the historical order) left a window — and, if the
+    /// handler was already gone so no `Exit` ever arrived, an unbounded wait —
+    /// in which a half-shut-down session still owned a live, reconnecting socket
+    /// that the caller believed was closed. That window is how a service that
+    /// opens a session per refresh cycle accumulates orphaned sockets which then
+    /// duel over the same DID.
+    ///
+    /// Every step is bounded: shutdown must not be able to hang on a wedged
+    /// background task.
+    pub async fn graceful_shutdown(&self) {
+        debug!("Shutting down ATM SDK");
+
+        // 1. Stop the websocket transports. `stop_websocket` clears the
+        //    profile's channel slot, so this is idempotent across repeat calls.
+        {
+            let profiles = &*self.inner.profiles.read().await;
+            for (_, profile) in profiles.0.iter() {
+                let _ = profile.stop_websocket().await;
+            }
+        }
+
+        // 2. Stop the Deletion Handler and wait (briefly) for its `Exit`. A
+        //    handler that already died sends nothing, so this wait is bounded —
+        //    never let a dead background task hold shutdown open.
+        let _ = self.abort_deletion_handler().await;
+        {
+            let mut guard = self.inner.deletion_handler_recv_stream.lock().await;
+            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, guard.recv()).await {
+                Ok(_) => debug!("Deletion Handler stopped"),
+                Err(_) => warn!(
+                    "Deletion Handler did not acknowledge shutdown within {}s; \
+                     continuing (its websockets are already stopped)",
+                    SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+                ),
+            }
+        }
+    }
+
+    /// If you have set the ATM SDK to be in DirectChannel mode, you can get the inbound channel here
+    /// This allows you to directly stream messages from the WebSocket Handler to your own client code
+    pub fn get_inbound_channel(&self) -> Option<broadcast::Receiver<WebSocketResponses>> {
+        self.inner
+            .config
+            .inbound_message_channel
+            .as_ref()
+            .map(|sender| sender.subscribe())
+    }
+
+    /// Subscribe to the unprocessable-message channel, if configured via
+    /// [`crate::config::ATMConfigBuilder::with_unprocessable_message_channel`].
+    /// Each inbound message the SDK can't process — malformed base64/UTF-8, a
+    /// failed signature check, an unexpected/rejected wrapping, or another unpack
+    /// failure — is broadcast here (with its raw payload and failure reason)
+    /// just before the drain deletes/drops it, so you can observe or quarantine
+    /// it. `None` if no channel was configured.
+    pub fn get_unprocessable_message_channel(
+        &self,
+    ) -> Option<broadcast::Receiver<crate::protocols::message_pickup::UnprocessableMessage>> {
+        self.inner
+            .config
+            .unprocessable_message_channel
+            .as_ref()
+            .map(|sender| sender.subscribe())
+    }
+
+    /// Get the TDK Shared State
+    pub fn get_tdk(&self) -> &TDKSharedState {
+        &self.inner.tdk_common
+    }
+
+    /// Access Trust Ping protocol methods
+    pub fn trust_ping(&self) -> TrustPingOps<'_> {
+        TrustPingOps { atm: self }
+    }
+
+    /// Access Trust Tasks protocol methods (the messaging tasks: ping, account,
+    /// acl, access-list — carried over the framework binding envelope).
+    pub fn trust_tasks(&self) -> TrustTasksOps<'_> {
+        TrustTasksOps { atm: self }
+    }
+
+    /// Access Message Pickup 3.0 protocol methods
+    pub fn message_pickup(&self) -> MessagePickupOps<'_> {
+        MessagePickupOps { atm: self }
+    }
+
+    /// Access Routing protocol methods
+    pub fn routing(&self) -> RoutingOps<'_> {
+        RoutingOps { atm: self }
+    }
+
+    /// Access OOB Discovery protocol methods
+    pub fn oob_discovery(&self) -> OOBDiscoveryOps<'_> {
+        OOBDiscoveryOps { atm: self }
+    }
+
+    /// Access Discover Features protocol methods
+    pub fn discover_features(&self) -> DiscoverfeaturesOps<'_> {
+        DiscoverfeaturesOps { atm: self }
+    }
+
+    /// Access Trust Spanning Protocol (TSP) client methods.
+    #[cfg(feature = "tsp")]
+    pub fn tsp(&self) -> TspOps<'_> {
+        TspOps { atm: self }
+    }
+}

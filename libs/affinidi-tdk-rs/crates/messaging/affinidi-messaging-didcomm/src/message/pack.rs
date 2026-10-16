@@ -1,0 +1,401 @@
+//! Message packing — encrypt, sign, or send plaintext DIDComm messages.
+
+use crate::error::DIDCommError;
+use crate::jwe::{decrypt, encrypt};
+use crate::jws::sign;
+use crate::message::Message;
+use affinidi_crypto::jose::key_agreement::{PrivateKeyAgreement, PublicKeyAgreement};
+
+/// Pack a message as encrypted (authcrypt — sender authenticated).
+///
+/// # Arguments
+/// * `msg` - The DIDComm message to encrypt
+/// * `sender_kid` - The sender's key agreement key ID
+/// * `sender_private` - The sender's key agreement private key
+/// * `recipients` - Slice of (kid, public_key) pairs for each recipient
+pub fn pack_encrypted_authcrypt(
+    msg: &Message,
+    sender_kid: &str,
+    sender_private: &PrivateKeyAgreement,
+    recipients: &[(&str, &PublicKeyAgreement)],
+) -> Result<String, DIDCommError> {
+    let plaintext = msg.to_json()?;
+    encrypt::authcrypt(&plaintext, sender_kid, sender_private, recipients)
+}
+
+/// Pack a message as encrypted (anoncrypt — anonymous).
+///
+/// # Arguments
+/// * `msg` - The DIDComm message to encrypt
+/// * `recipients` - Slice of (kid, public_key) pairs for each recipient
+pub fn pack_encrypted_anoncrypt(
+    msg: &Message,
+    recipients: &[(&str, &PublicKeyAgreement)],
+) -> Result<String, DIDCommError> {
+    let plaintext = msg.to_json()?;
+    encrypt::anoncrypt(&plaintext, recipients)
+}
+
+/// Pack a message as signed (JWS with EdDSA).
+///
+/// # Arguments
+/// * `msg` - The DIDComm message to sign
+/// * `signer_kid` - The signer's key ID (DID URL)
+/// * `private_key` - The signer's Ed25519 private key
+pub fn pack_signed(
+    msg: &Message,
+    signer_kid: &str,
+    private_key: &[u8; 32],
+) -> Result<String, DIDCommError> {
+    let payload = msg.to_json()?;
+    sign::sign_ed25519(&payload, signer_kid, private_key)
+}
+
+/// Pack a message as signed with one or more signers (multi-signature JWS).
+///
+/// Every signer signs the same serialized message; the result is a JWS
+/// General JSON envelope with one signature entry per signer. Signers may mix
+/// curves (Ed25519 / P-256 / secp256k1).
+pub fn pack_signed_multi(
+    msg: &Message,
+    signers: &[sign::JwsSigner],
+) -> Result<String, DIDCommError> {
+    let payload = msg.to_json()?;
+    sign::sign_multi(&payload, signers)
+}
+
+/// Pack a message as plaintext JSON.
+pub fn pack_plaintext(msg: &Message) -> Result<String, DIDCommError> {
+    serde_json::to_string(msg).map_err(|e| DIDCommError::Serialization(format!("plaintext: {e}")))
+}
+
+/// Unpack an encrypted message (convenience re-export of decrypt).
+pub use decrypt::SenderKey;
+#[allow(deprecated)]
+pub use decrypt::decrypt as unpack_encrypted;
+pub use decrypt::decrypt_bound as unpack_encrypted_bound;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use affinidi_crypto::jose::key_agreement::Curve;
+
+    #[test]
+    fn pack_unpack_authcrypt() {
+        let msg = Message::new(
+            "https://didcomm.org/basicmessage/2.0/message",
+            serde_json::json!({"content": "Hello!"}),
+        )
+        .from("did:example:alice")
+        .to(vec!["did:example:bob".into()]);
+
+        let sender = PrivateKeyAgreement::generate(Curve::X25519);
+        let recipient = PrivateKeyAgreement::generate(Curve::X25519);
+
+        let packed = pack_encrypted_authcrypt(
+            &msg,
+            "did:example:alice#key-1",
+            &sender,
+            &[("did:example:bob#key-1", &recipient.public_key())],
+        )
+        .unwrap();
+
+        let decrypted = unpack_encrypted_bound(
+            &packed,
+            "did:example:bob#key-1",
+            &recipient,
+            Some(SenderKey::new(
+                "did:example:alice#key-1",
+                &sender.public_key(),
+            )),
+        )
+        .unwrap();
+
+        let unpacked = Message::from_json(&decrypted.plaintext).unwrap();
+        assert_eq!(unpacked.body["content"], "Hello!");
+        assert!(decrypted.authenticated);
+    }
+
+    #[test]
+    fn pack_unpack_anoncrypt() {
+        let msg = Message::new(
+            "https://didcomm.org/basicmessage/2.0/message",
+            serde_json::json!({"content": "Anonymous!"}),
+        );
+
+        let recipient = PrivateKeyAgreement::generate(Curve::X25519);
+
+        let packed =
+            pack_encrypted_anoncrypt(&msg, &[("did:example:bob#key-1", &recipient.public_key())])
+                .unwrap();
+
+        let decrypted =
+            unpack_encrypted_bound(&packed, "did:example:bob#key-1", &recipient, None).unwrap();
+
+        let unpacked = Message::from_json(&decrypted.plaintext).unwrap();
+        assert_eq!(unpacked.body["content"], "Anonymous!");
+        assert!(!decrypted.authenticated);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn pack_signed_roundtrip() {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand_10::rng());
+
+        let msg =
+            Message::new("test-type", serde_json::json!({"data": 42})).from("did:example:alice");
+
+        let packed = pack_signed(&msg, "did:example:alice#key-1", &sk.to_bytes()).unwrap();
+
+        let verified =
+            crate::jws::verify::verify_ed25519(&packed, &sk.verifying_key().to_bytes()).unwrap();
+        let unpacked = Message::from_json(&verified.payload).unwrap();
+        assert_eq!(unpacked.body["data"], 42);
+    }
+
+    #[test]
+    fn pack_signed_multi_roundtrip() {
+        use crate::jws::sign::JwsSigner;
+        use crate::jws::verify::{VerifyKey, parse_jws, verify_parsed_signature};
+        use k256::ecdsa::SigningKey as K256SigningKey;
+        use p256::ecdsa::SigningKey as P256SigningKey;
+        use p256::elliptic_curve::Generate as _;
+
+        let ed = ed25519_dalek::SigningKey::generate(&mut rand_10::rng());
+        let p256 = P256SigningKey::generate();
+        let k256 = K256SigningKey::generate();
+
+        let msg =
+            Message::new("test-type", serde_json::json!({"data": 7})).from("did:example:alice");
+
+        // One JWS carrying three signatures (mixed curves) over the same payload.
+        let packed = pack_signed_multi(
+            &msg,
+            &[
+                JwsSigner::Ed25519 {
+                    kid: "did:example:alice#ed",
+                    private: &ed.to_bytes(),
+                },
+                JwsSigner::P256 {
+                    kid: "did:example:alice#p256",
+                    private: &p256.to_bytes().into(),
+                },
+                JwsSigner::Secp256k1 {
+                    kid: "did:example:alice#k256",
+                    private: &k256.to_bytes().into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let parsed = parse_jws(&packed).unwrap();
+        assert_eq!(parsed.signatures.len(), 3);
+
+        // Every signature verifies under its own resolved key, in signer order.
+        let keys = [
+            VerifyKey::Ed25519(ed.verifying_key().to_bytes()),
+            VerifyKey::P256(
+                p256.verifying_key()
+                    .to_sec1_point(false)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            VerifyKey::Secp256k1(
+                k256.verifying_key()
+                    .to_sec1_point(false)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ];
+        let mut kids = Vec::new();
+        for (sig, key) in parsed.signatures.iter().zip(keys.iter()) {
+            verify_parsed_signature(sig, key).expect("each signature verifies");
+            kids.push(
+                sig.kid
+                    .clone()
+                    .expect("each signature is attributed to a kid"),
+            );
+        }
+        assert!(kids.contains(&"did:example:alice#ed".to_string()));
+        assert!(kids.contains(&"did:example:alice#p256".to_string()));
+        assert!(kids.contains(&"did:example:alice#k256".to_string()));
+
+        // The signed payload round-trips to the original message.
+        let unpacked = Message::from_json(&parsed.payload).unwrap();
+        assert_eq!(unpacked.body["data"], 7);
+    }
+
+    #[test]
+    fn pack_unpack_authcrypt_p256() {
+        let msg = Message::new(
+            "https://didcomm.org/basicmessage/2.0/message",
+            serde_json::json!({"content": "P-256 Hello!"}),
+        )
+        .from("did:example:alice")
+        .to(vec!["did:example:bob".into()]);
+
+        let sender = PrivateKeyAgreement::generate(Curve::P256);
+        let recipient = PrivateKeyAgreement::generate(Curve::P256);
+
+        let packed = pack_encrypted_authcrypt(
+            &msg,
+            "did:example:alice#p256",
+            &sender,
+            &[("did:example:bob#p256", &recipient.public_key())],
+        )
+        .unwrap();
+
+        let decrypted = unpack_encrypted_bound(
+            &packed,
+            "did:example:bob#p256",
+            &recipient,
+            Some(SenderKey::new(
+                "did:example:alice#p256",
+                &sender.public_key(),
+            )),
+        )
+        .unwrap();
+
+        let unpacked = Message::from_json(&decrypted.plaintext).unwrap();
+        assert_eq!(unpacked.body["content"], "P-256 Hello!");
+        assert!(decrypted.authenticated);
+    }
+
+    #[test]
+    fn pack_unpack_authcrypt_k256() {
+        let msg = Message::new(
+            "https://didcomm.org/basicmessage/2.0/message",
+            serde_json::json!({"content": "K-256 Hello!"}),
+        )
+        .from("did:example:alice")
+        .to(vec!["did:example:bob".into()]);
+
+        let sender = PrivateKeyAgreement::generate(Curve::K256);
+        let recipient = PrivateKeyAgreement::generate(Curve::K256);
+
+        let packed = pack_encrypted_authcrypt(
+            &msg,
+            "did:example:alice#k256",
+            &sender,
+            &[("did:example:bob#k256", &recipient.public_key())],
+        )
+        .unwrap();
+
+        let decrypted = unpack_encrypted_bound(
+            &packed,
+            "did:example:bob#k256",
+            &recipient,
+            Some(SenderKey::new(
+                "did:example:alice#k256",
+                &sender.public_key(),
+            )),
+        )
+        .unwrap();
+
+        let unpacked = Message::from_json(&decrypted.plaintext).unwrap();
+        assert_eq!(unpacked.body["content"], "K-256 Hello!");
+        assert!(decrypted.authenticated);
+    }
+
+    #[test]
+    fn pack_unpack_anoncrypt_p256() {
+        let msg = Message::new(
+            "https://didcomm.org/basicmessage/2.0/message",
+            serde_json::json!({"content": "P-256 anon"}),
+        );
+
+        let recipient = PrivateKeyAgreement::generate(Curve::P256);
+
+        let packed =
+            pack_encrypted_anoncrypt(&msg, &[("did:example:bob#p256", &recipient.public_key())])
+                .unwrap();
+
+        let decrypted =
+            unpack_encrypted_bound(&packed, "did:example:bob#p256", &recipient, None).unwrap();
+
+        let unpacked = Message::from_json(&decrypted.plaintext).unwrap();
+        assert_eq!(unpacked.body["content"], "P-256 anon");
+        assert!(!decrypted.authenticated);
+    }
+
+    #[test]
+    fn pack_unpack_anoncrypt_k256() {
+        let msg = Message::new(
+            "https://didcomm.org/basicmessage/2.0/message",
+            serde_json::json!({"content": "K-256 anon"}),
+        );
+
+        let recipient = PrivateKeyAgreement::generate(Curve::K256);
+
+        let packed =
+            pack_encrypted_anoncrypt(&msg, &[("did:example:bob#k256", &recipient.public_key())])
+                .unwrap();
+
+        let decrypted =
+            unpack_encrypted_bound(&packed, "did:example:bob#k256", &recipient, None).unwrap();
+
+        let unpacked = Message::from_json(&decrypted.plaintext).unwrap();
+        assert_eq!(unpacked.body["content"], "K-256 anon");
+        assert!(!decrypted.authenticated);
+    }
+
+    /// Test signed-then-encrypted: sign a message first, then encrypt the JWS
+    /// as an attachment in a wrapper message.
+    #[test]
+    #[allow(deprecated)]
+    fn pack_signed_then_authcrypt() {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand_10::rng());
+        let sender_ka = PrivateKeyAgreement::generate(Curve::X25519);
+        let recipient_ka = PrivateKeyAgreement::generate(Curve::X25519);
+
+        let msg = Message::new("test-type", serde_json::json!({"signed_encrypted": true}))
+            .from("did:example:alice");
+
+        // Step 1: Sign
+        let signed = pack_signed(&msg, "did:example:alice#sign-1", &sk.to_bytes()).unwrap();
+
+        // Step 2: Wrap signed JWS in a message and encrypt
+        let wrapper = Message::new(
+            "signed-encrypted-wrapper",
+            serde_json::json!({"jws": signed}),
+        );
+
+        let packed = pack_encrypted_authcrypt(
+            &wrapper,
+            "did:example:alice#ka-1",
+            &sender_ka,
+            &[("did:example:bob#ka-1", &recipient_ka.public_key())],
+        )
+        .unwrap();
+
+        // Step 3: Decrypt
+        let decrypted = unpack_encrypted_bound(
+            &packed,
+            "did:example:bob#ka-1",
+            &recipient_ka,
+            Some(SenderKey::new(
+                "did:example:alice#ka-1",
+                &sender_ka.public_key(),
+            )),
+        )
+        .unwrap();
+        assert!(decrypted.authenticated);
+
+        // Step 4: Extract and verify the signed inner payload
+        let inner = Message::from_json(&decrypted.plaintext).unwrap();
+        let jws_str = inner.body["jws"].as_str().unwrap();
+        let verified =
+            crate::jws::verify::verify_ed25519(jws_str, &sk.verifying_key().to_bytes()).unwrap();
+        let original = Message::from_json(&verified.payload).unwrap();
+        assert_eq!(original.body["signed_encrypted"], true);
+    }
+
+    #[test]
+    fn pack_plaintext_roundtrip() {
+        let msg = Message::new("test-type", serde_json::json!({"hello": "world"}));
+
+        let packed = pack_plaintext(&msg).unwrap();
+        let unpacked: Message = serde_json::from_str(&packed).unwrap();
+        assert_eq!(unpacked.body["hello"], "world");
+    }
+}

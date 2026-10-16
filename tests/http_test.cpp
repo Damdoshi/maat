@@ -1,4 +1,5 @@
 #include "http/http_domain.hpp"
+#include "../libs/openssh-portable/maat_uid_guard.h"
 #include "http/identity_broker.hpp"
 #include "monitor_protocol.hpp"
 #include "replay_store.hpp"
@@ -14,6 +15,17 @@
 #include <vector>
 #include <algorithm>
 namespace {
+// Unit tests must not depend on LDAP/SSSD/NSS configuration of CI hosts.
+// The production broker continues to use NSSUIDCollisionPolicy (fail closed).
+class AvailableUIDs final : public maat::UIDCollisionPolicy {
+public:
+    bool isFree(uid_t) const override { return true; }
+};
+class OccupiedUIDs final : public maat::UIDCollisionPolicy {
+public:
+    bool isFree(uid_t) const override { return false; }
+};
+const AvailableUIDs testUIDs;
 int count=0;
 void check(bool ok,const char* message) {
     ++count;
@@ -31,39 +43,6 @@ std::vector<uint8_t> key() {
     return k;
 }
 std::string sessionHex(){return std::string(64,'a');}
-std::string issue(maat::SessionTicketChannel& issuer,bool expect){
-    int fds[2];check(socketpair(AF_UNIX,SOCK_SEQPACKET,0,fds)==0,"socketpair issue");
-    auto msg=maat::requestMessage("MAATGET2","");msg.resize(4+8);
-    check(send(fds[0],msg.data(),msg.size(),0)==ssize_t(msg.size()),"issue send");
-    bool accepted=issuer.serve(fds[1]);check(accepted==expect,"issue acceptance");
-    std::string token;
-    if(accepted) {
-        uint8_t reply[256];ssize_t n=recv(fds[0],reply,sizeof(reply),MSG_DONTWAIT);
-        check(n>0,"issue response");
-        std::vector<uint8_t> bytes(reply,reply+n);size_t off=0;
-        check(maat::readString(bytes,off,40)=="MAATHTTP1","issue version");
-        token=maat::readString(bytes,off,64);
-        check(off==bytes.size(),"no trailing reply bytes");
-    }
-    close(fds[0]);close(fds[1]);return token;
-}
-bool verify(maat::TicketVerifier& verifier,const std::string& token,std::string* name=nullptr){
-    int fds[2];check(socketpair(AF_UNIX,SOCK_SEQPACKET,0,fds)==0,"socketpair verify");
-    auto msg=maat::requestMessage("MAATCHECK1",token);
-    check(send(fds[0],msg.data(),msg.size(),0)==ssize_t(msg.size()),"verify send");
-    bool accepted=verifier.serve(fds[1]);
-    if(accepted) {
-        uint8_t buf[256];ssize_t n=recv(fds[0],buf,sizeof(buf),MSG_DONTWAIT);
-        check(n>0,"verify response");
-        std::vector<uint8_t> bytes(buf,buf+n);size_t off=0;
-        check(maat::readString(bytes,off,20)=="MAATIDENT1","verify version");
-        auto user=maat::readString(bytes,off,128);
-        auto key=maat::readString(bytes,off,51);
-        check(user=="maatweb" && key.size()==51 && off==bytes.size(),"SSH identity returned");
-        if(name)*name=user;
-    }
-    close(fds[0]);close(fds[1]);return accepted;
-}
 maat::HTTPRequest parse(const std::string& wire){
     int p[2];check(pipe(p)==0,"pipe");
     check(write(p[1],wire.data(),wire.size())==ssize_t(wire.size()),"feed request");
@@ -105,20 +84,12 @@ int main(){
     }
     bad([]{maat::SessionIdentifier s("aBcdef");},"hex case rejected");
     bad([]{maat::SessionIdentifier s("deadbeef");},"short session rejected");
-    bad([]{maat::RequestTicket t("deadbeef");},"short ticket rejected");
-    bad([]{maat::EphemeralUID(999999999ULL);},"UID below reserved range rejected");
-    bad([]{maat::EphemeralUID(2100000000ULL);},"UID beyond reserved range rejected");
-    check(maat::EphemeralUID(1000000000ULL).value()==1000000000U,"first reserved UID valid");
-    maat::RequestTicket generated;
-    check(generated.hex().size()==64,"secure token length");
-    maat::RequestTicket reconstructed(generated.hex());
-    check(generated.hex()==reconstructed.hex(),"token roundtrip");
     auto request=parse("POST /whoami.php HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nX-Maat-Ticket: evil\r\nX-Maat-User: fake\r\n\r\ntest");
-    auto clean=request.forwarded(generated.hex());
+    auto clean=request.forwarded();
     check(clean.find("X-Maat-User: fake")==std::string::npos,"identity header scrub");
     check(clean.find("X-Maat-Ticket: evil")==std::string::npos,"ticket header scrub");
     check(clean.find("test")!=std::string::npos,"POST body preserved");
-    check(clean.find("X-Maat-Ticket: "+generated.hex())!=std::string::npos,"issued ticket injected");
+    check(clean.find("X-Maat-Ticket:")==std::string::npos,"no bearer ever forwarded");
     bad([]{parse("GET / HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n");},"chunked rejected");
     bad([]{parse("GET / HTTP/1.1\r\nHost: local\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n");},"duplicate length rejected");
     bad([]{parse("GET / HTTP/1.1\r\nHost: local\r\nConnection: upgrade\r\n\r\n");},"upgrade rejected");
@@ -131,30 +102,24 @@ int main(){
     int fd=mkstemp(path);check(fd>=0,"temp db");close(fd);
     {
         maat::ReplayStore monitor(path);
-        maat::IdentityRepository repo(path);
-        maat::SessionTicketChannel issuer(repo,maat::SessionIdentifier(sessionHex()));
-        maat::TicketVerifier verifier(repo,getuid());
-        check(issue(issuer,false).empty(),"unregistered session denied");
+        maat::IdentityRepository repo(path,maat::UIDRange(),testUIDs);
         auto identity=maat::AuthenticatedSession("maatweb",std::vector<uint8_t>(32,0xaa),maat::PublicKey(key()));
         check(monitor.record(identity),"valid SSH monitor assertion persisted");
         uid_t allocatedUID=0;
         check(repo.bind(maat::SessionIdentifier(sessionHex()),allocatedUID),"root binds authenticated session once");
+        check(allocatedUID==maat::UIDRange::defaultFirst && maat_uid_plausible(allocatedUID),
+              "broker allocates UID at default lower bound accepted by OpenSSH");
         check(!repo.bind(maat::SessionIdentifier(sessionHex()),allocatedUID),"binding replay denied");
-        const auto token=issue(issuer,true);
-        check(token.size()==64,"ticket issued");
-        check(issue(issuer,false).empty(),"SSH session cannot mint second token");
-        check(!verify(verifier,std::string(64,'1')),"fake ticket rejected");
-        check(verify(verifier,token),"valid ticket consumed");
-        check(!verify(verifier,token),"replay rejected");
+        std::string user;std::vector<uint8_t> identityKey;
+        check(repo.identityForBoundSession(maat::SessionIdentifier(sessionHex()),user,identityKey),
+              "registered session resolves identity without bearer ticket");
+        check(user=="maatweb" && identityKey==key(),"bound identity exact");
 
-        maat::TicketVerifier wrongUid(repo,getuid()+1);
-        check(!verify(wrongUid,token),"wrong PHP UID rejected");
     }
     uid_t firstUID=0;
     {
-        maat::IdentityRepository reopened(path);
-        maat::TicketVerifier verifier(reopened,getuid());
-        check(!verify(verifier,generated.hex()),"unknown token after reopen");
+        maat::IdentityRepository reopened(path,maat::UIDRange(),testUIDs);
+
         uid_t replayUID=0;
         check(!reopened.bind(maat::SessionIdentifier(sessionHex()),replayUID),"session binding replay survives restart");
         // The ledger and assignment are durable: a second real monitor
@@ -167,7 +132,7 @@ int main(){
         check(firstUID==1000000001U,"UID ledger strictly monotonic across restart");
     }
     {
-        maat::IdentityRepository reopened(path);
+        maat::IdentityRepository reopened(path,maat::UIDRange(),testUIDs);
         maat::ReplayStore monitor(path);
         const std::string third(64,'d');
         auto thirdIdentity=maat::AuthenticatedSession("maatweb",std::vector<uint8_t>(32,0xdd),maat::PublicKey(key()));
@@ -177,5 +142,21 @@ int main(){
         check(newerUID>firstUID,"allocated UID cannot be recycled after restart");
     }
     unlink(path);unlink((std::string(path)+"-wal").c_str());unlink((std::string(path)+"-shm").c_str());
+    // A detected collision must never allocate or bind a session.
+    {
+        char conflictPath[]="/tmp/maat-http-occupied-XXXXXX";
+        int conflictFD=mkstemp(conflictPath);
+        check(conflictFD>=0,"occupied fixture created");close(conflictFD);
+        maat::ReplayStore monitor(conflictPath);
+        auto conflictIdentity=maat::AuthenticatedSession("maatweb",std::vector<uint8_t>(32,0xfe),maat::PublicKey(key()));
+        check(monitor.record(conflictIdentity),"occupied fixture SSH assertion");
+        OccupiedUIDs occupied;
+        maat::IdentityRepository denied(conflictPath,maat::UIDRange(),occupied);
+        uid_t unused=0;
+        check(!denied.bind(maat::SessionIdentifier(std::string(64,'e')),unused),"host occupied UID fails closed");
+        unlink(conflictPath);
+        unlink((std::string(conflictPath)+"-wal").c_str());
+        unlink((std::string(conflictPath)+"-shm").c_str());
+    }
     std::fprintf(stderr,"PASS %d HTTP/session/broker checks\n",count);
 }

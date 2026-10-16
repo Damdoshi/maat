@@ -1,0 +1,58 @@
+//! Helper functions to determine message type
+
+use crate::errors::ATMError;
+use std::str::FromStr;
+
+pub enum MessageType {
+    AffinidiAuthenticate,            // Affinidi Messaging Authentication Response
+    AffinidiAuthenticateRefresh,     // Affinidi Messaging Authentication Refresh
+    ForwardRequest,                  // DidComm Routing 2.0 Forward Request
+    MessagePickupStatusRequest,      // Message Pickup 3.0 Status Request
+    MessagePickupStatusResponse,     // Message Pickup 3.0 Status Request
+    MessagePickupDeliveryRequest,    // Message Pickup 3.0 Delivery Request
+    MessagePickupMessagesReceived,   // Message Pickup 3.0 Messages Received (ok to delete)
+    MessagePickupLiveDeliveryChange, // Message Pickup 3.0 Live-delivery-change (Streaming enabled)
+    ProblemReport,                   // Problem Report Protocol
+    TrustPing,                       // Trust Ping Protocol
+    TrustTaskEnvelope,               // Trust Tasks framework — DIDComm binding envelope
+    DiscoverFeaturesQueries,         // Discover Features 2.0 Protocol - Queries
+    DiscoverFeaturesDisclose,        // Discover Features 2.0 Protocol - Disclose
+    Other(String),                   // Other message type
+}
+
+impl FromStr for MessageType {
+    type Err = ATMError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "https://didcomm.org/trust-ping/2.0/ping" => Ok(Self::TrustPing),
+            "https://trusttasks.org/binding/didcomm/0.1/envelope" => Ok(Self::TrustTaskEnvelope),
+            "https://affinidi.com/atm/1.0/authenticate" => Ok(Self::AffinidiAuthenticate),
+            "https://affinidi.com/atm/1.0/authenticate/refresh" => {
+                Ok(Self::AffinidiAuthenticateRefresh)
+            }
+            "https://didcomm.org/messagepickup/3.0/status-request" => {
+                Ok(Self::MessagePickupStatusRequest)
+            }
+            "https://didcomm.org/messagepickup/3.0/status" => Ok(Self::MessagePickupStatusResponse),
+            "https://didcomm.org/messagepickup/3.0/live-delivery-change" => {
+                Ok(Self::MessagePickupLiveDeliveryChange)
+            }
+            "https://didcomm.org/messagepickup/3.0/delivery-request" => {
+                Ok(Self::MessagePickupDeliveryRequest)
+            }
+            "https://didcomm.org/messagepickup/3.0/messages-received" => {
+                Ok(Self::MessagePickupMessagesReceived)
+            }
+            "https://didcomm.org/routing/2.0/forward" => Ok(Self::ForwardRequest),
+            "https://didcomm.org/report-problem/2.0/problem-report" => Ok(Self::ProblemReport),
+            "https://didcomm.org/discover-features/2.0/queries" => {
+                Ok(Self::DiscoverFeaturesQueries)
+            }
+            "https://didcomm.org/discover-features/2.0/disclose" => {
+                Ok(Self::DiscoverFeaturesDisclose)
+            }
+            _ => Ok(Self::Other(s.to_string())),
+        }
+    }
+}

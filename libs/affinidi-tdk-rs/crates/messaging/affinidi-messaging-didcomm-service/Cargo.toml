@@ -1,0 +1,58 @@
+[package]
+name = "affinidi-messaging-didcomm-service"
+version = "0.21.1"
+description = "Shared DIDComm service framework for always-online DIDComm client. Manages mediator connection, message lifecycle, and handler dispatch."
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+
+[features]
+## Multiplex TSP alongside DIDComm on the listener's single websocket.
+## Enables the SDK's TSP surface (`atm.tsp().unpack_bytes`) used to route
+## inbound TSP frames to a `TspHandler`. Off by default — a DIDComm-only build
+## is unaffected.
+tsp = ["affinidi-messaging-sdk/tsp", "dep:affinidi-tsp"]
+
+[dependencies]
+affinidi-tdk-common = { version = "0.7", path = "../../tdk/affinidi-tdk-common" }
+# Path + version, like every other crate in this family. It was a bare
+# registry requirement, so this crate compiled against the *published* SDK
+# rather than the workspace one — which is how a third `trust-tasks-rs` node
+# survived the 0.12 move and produced `expected MediatorAcl, found a different
+# MediatorAcl` from inside this workspace.
+affinidi-messaging-sdk = { version = "0.36", path = "../affinidi-messaging-sdk" }
+affinidi-messaging-didcomm = "0.15.9"
+## Trust Tasks payload types (the atm.trust_tasks() surface accepts these).
+trust-tasks-rs = "0.31"
+affinidi-secrets-resolver = "0.5"
+## Reads the cleartext sender VID off a TSP envelope, to keep each peer's
+## inbound frames in order (`tsp` feature only).
+affinidi-tsp = { version = "0.2", path = "../affinidi-tsp", optional = true }
+
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha256 = "1"
+regex = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = { version = "0.1", features = ["valuable"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+[dev-dependencies]
+# DID generation for the `echo_server` example. The end-to-end tests that ran
+# against the embedded test mediator moved with it to
+# affinidi/affinidi-messaging-mediator.
+affinidi-did-common = "0.4"
+
+[[example]]
+name = "echo_server"
+path = "examples/echo_server.rs"

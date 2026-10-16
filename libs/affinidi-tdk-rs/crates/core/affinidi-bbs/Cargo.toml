@@ -1,0 +1,44 @@
+[package]
+name = "affinidi-bbs"
+description = "BBS Signatures (IETF draft-irtf-cfrg-bbs-signatures) implementation over BLS12-381."
+version = "0.4.0"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords = ["ssi", "affinidi", "bbs", "zero-knowledge", "disclosure"]
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[example]]
+name = "bbs_selective_disclosure"
+path = "examples/bbs_selective_disclosure.rs"
+
+[dependencies]
+# The curve stack comes from `bls12_381_plus`'s own re-exports
+# (`bls12_381_plus::{elliptic_curve, ff, group}`) rather than from separate
+# declarations here.
+#
+# This is not cosmetic. `bls12_381_plus` deliberately links BOTH RustCrypto
+# generations — its `groups` feature is `["group_013", "group"]` and cannot be
+# narrowed — and its public API (`G1Projective::hash`) takes the *0.13*
+# `ExpandMsg`. Declaring our own `elliptic-curve`/`ff`/`group` meant pinning a
+# generation by hand and hoping it matched the one its API expects; a bump on
+# either side would have produced a trait-mismatch error naming neither crate.
+# Taking the types from the crate whose functions consume them makes the match
+# structural. See #775.
+bls12_381_plus = { version = "0.9", features = ["alloc"] }
+hex = "0.4"
+rand = "0.10"
+sha2 = "0.10"
+thiserror = "2"
+zeroize = "1"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+## TI7: shared test-vector loader. Path-only (no version) dev-dep — dropped
+## from the published manifest, so this never reaches crates.io.
+affinidi-tdk-test-support = { path = "../../tdk/affinidi-tdk-test-support" }

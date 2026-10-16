@@ -9,12 +9,6 @@
 namespace maat {
 namespace {
 bool peer(int fd,uid_t uid){ucred c{};socklen_t n=sizeof(c);return getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&c,&n)==0 && n==sizeof(c) && c.uid==uid;}
-std::vector<uint8_t> recvPacket(int fd) {
-    std::vector<uint8_t> r(512);
-    ssize_t n=recv(fd,r.data(),r.size(),MSG_TRUNC);
-    if(n<=0 || n>ssize_t(r.size())) throw std::invalid_argument("invalid packet size");
-    r.resize(size_t(n)); return r;
-}
 void put(std::vector<uint8_t>& b,const std::string& s) {
     uint32_t n=uint32_t(s.size());
     b.push_back(uint8_t(n>>24));b.push_back(uint8_t(n>>16));b.push_back(uint8_t(n>>8));b.push_back(uint8_t(n));
@@ -63,28 +57,31 @@ int RootSessionBinder::receive(int fd, SessionIdentifier& session, uid_t& bridge
         return borrowed;
     }catch(const std::exception&){close(borrowed);return -1;}
 }
-bool SessionTicketChannel::serve(int fd) {
-    try {
-        auto p=recvPacket(fd);size_t off=0;
-        if(readString(p,off,20)!="MAATGET2" || off!=p.size()) return false;
-        RequestTicket ticket;
-        if(!repository_.issue(session_,ticket)) return false;
-        auto msg=requestMessage("MAATHTTP1",ticket.hex());
-        return send(fd,msg.data(),msg.size(),MSG_NOSIGNAL)==ssize_t(msg.size());
-    }catch(const std::exception&){return false;}
+bool SessionConnectionChannel::serve(int fd) {
+    const int http=receiveOneFD(fd,"MAATLINK1");
+    if(http<0) return false;
+    std::string user;std::vector<uint8_t> key;
+    const bool authorized=repository_.identityForBoundSession(session_,user,key);
+    if(!authorized || !registry_.remember(http,session_)) {
+        close(http);return false;
+    }
+    // Broker owns http after remember(). The bridge must not write HTTP
+    // until the registration acknowledgement has arrived.
+    const auto ack=requestMessage("MAATREADY1","");
+    return send(fd,ack.data(),ack.size(),MSG_NOSIGNAL)==ssize_t(ack.size());
 }
-bool TicketVerifier::serve(int fd) {
-    if(!peer(fd,phpUID_)) return false;
-    try {
-        auto p=recvPacket(fd);size_t off=0;
-        if(readString(p,off,20)!="MAATCHECK1") return false;
-        RequestTicket ticket(readString(p,off,64));
-        if(off!=p.size()) return false;
-        std::string user;std::vector<uint8_t> key;
-        if(!repository_.consume(ticket,user,key)) return false;
-        std::vector<uint8_t> msg; put(msg,"MAATIDENT1");put(msg,user);
-        put(msg,std::string(key.begin(),key.end()));
-        return send(fd,msg.data(),msg.size(),MSG_NOSIGNAL)==ssize_t(msg.size());
-    }catch(const std::exception&){return false;}
+bool AcceptedConnectionVerifier::serve(int fd) {
+    if(!peer(fd,apacheUID_)) return false;
+    const int accepted=receiveOneFD(fd,"MAATLOOKUP2");
+    if(accepted<0) return false;
+    SessionIdentifier session(std::string(64,'0'));
+    const bool matched=registry_.matchOnce(accepted,session);
+    close(accepted);
+    if(!matched) return false;
+    std::string user;std::vector<uint8_t> key;
+    if(!repository_.identityForBoundSession(session,user,key)) return false;
+    std::vector<uint8_t> answer;put(answer,"MAATIDENT2");put(answer,user);
+    put(answer,std::string(key.begin(),key.end()));
+    return send(fd,answer.data(),answer.size(),MSG_NOSIGNAL)==ssize_t(answer.size());
 }
 }

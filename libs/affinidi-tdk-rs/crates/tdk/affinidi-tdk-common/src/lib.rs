@@ -1,0 +1,463 @@
+#![forbid(unsafe_code)]
+/*!
+# affinidi-tdk-common
+
+Shared building blocks for Affinidi Trust Development Kit (TDK) crates.
+
+The crate is organised around four core concepts:
+
+- **[`TDKConfig`]** ([`config`]) — typed configuration with a builder. Owns the
+  optional DID resolver, secrets resolver, environment-file path, and custom
+  authentication handlers used by the rest of the stack.
+- **[`TDKSharedState`]** — the runtime container that other Affinidi crates take
+  by reference. It bundles the DID resolver, secrets resolver, HTTPS client, and
+  the [`AuthenticationCache`].
+  Subsystems are exposed via accessors (e.g. [`TDKSharedState::client`]) rather
+  than public fields, so the internal layout can evolve without breaking
+  consumers.
+- **[`TDKProfile`]** + **[`TDKEnvironment`]** ([`profiles`], [`environments`]) —
+  serialisable identity profiles and the on-disk format for grouping profiles
+  by environment (local / dev / prod).
+- **[`KeyringStore`](secrets::KeyringStore)** ([`secrets`]) — handle into the
+  OS native credential store (macOS Keychain, Windows Credential Manager,
+  freedesktop Secret Service) for persisting profile secrets.
+
+Errors are funneled through [`TDKError`]; consumers convert it to their own
+error types via `From<TDKError>` impls.
+
+# API stability & evolution
+
+This crate is consumed widely (re-exported by the `affinidi-tdk` facade and a
+private dependency of several others), so its public surface is treated as a
+stability contract. The boundary:
+
+- **Stable consumer surface** — [`TDKSharedState`] (its accessor methods),
+  [`TDKConfig`] + its builder, [`TDKProfile`], [`TDKEnvironment`] /
+  [`TDKEnvironments`], and [`TDKError`]. Consumers depend on these.
+- **Internal (not API)** — the OS-keyring integration
+  ([`KeyringStore`](secrets::KeyringStore) internals), environment-file IO, the
+  [`AuthenticationCache`] machinery, and HTTP-client construction. These may
+  change without a breaking release.
+
+**How additive evolution stays non-breaking** (so an internal change doesn't
+cascade consumer bumps): the data/config types keep their fields `pub(crate)`
+(or, for `TDKProfile`, a private `secrets` field) and are built via
+constructors/builders — so the layout can grow without breaking external
+construction; subsystems are reached through accessor methods rather than public
+fields; and `TDKError` is `#[non_exhaustive]`. New public types must follow the
+same pattern. See `docs/adr/0003-public-api-semver-policy.md`.
+
+**Swapping a subsystem** (e.g. an alternate secrets store, a remote environment
+source, a mock authenticator for tests): invert *that one* subsystem at the
+boundary — the secrets resolver and DID resolver are already reached through
+traits ([`affinidi_secrets_resolver::SecretsResolver`] and the
+`affinidi_did_resolver_cache_sdk` resolver traits); introduce a trait for the
+keyring/auth piece only when a real second implementation appears. A full
+trait-inversion of [`TDKSharedState`] over all its subsystems was considered and
+deliberately deferred: the abstractions mostly already exist and the concrete
+churn it would isolate is rare, so it isn't worth pre-abstracting.
+*/
+
+use std::sync::OnceLock;
+
+// `Arc` is only used by the extra-roots TLS path, which is compiled out on
+// Android (see `create_http_client`).
+#[cfg(not(target_os = "android"))]
+use std::sync::Arc;
+
+use affinidi_did_authentication::{AuthorizationTokens, errors::DIDAuthError};
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+use affinidi_secrets_resolver::{SecretsResolver, ThreadedSecretsResolver};
+use config::TDKConfig;
+use environments::{TDKEnvironment, TDKEnvironments};
+use errors::TDKError;
+use profiles::TDKProfile;
+use reqwest::Client;
+use rustls::{ClientConfig, pki_types::CertificateDer};
+use rustls_platform_verifier::ConfigVerifierExt;
+// `Verifier::new_with_extra_roots` is not available on the Android backend of
+// `rustls-platform-verifier` (see `create_http_client`).
+#[cfg(not(target_os = "android"))]
+use rustls_platform_verifier::Verifier;
+use tracing::warn;
+
+pub mod config;
+pub mod environments;
+pub mod errors;
+pub mod profiles;
+pub mod secrets;
+pub mod tasks;
+
+pub use affinidi_net_guard as net_guard;
+pub use affinidi_secrets_resolver as secrets_resolver;
+use tasks::authentication::AuthenticationCache;
+
+/// Runtime state shared across Affinidi TDK crates.
+///
+/// Construct with [`TDKSharedState::new`]. Subsystems are exposed via accessor
+/// methods rather than public fields so internals can evolve without a
+/// breaking change. Cloning is cheap — every subsystem is internally
+/// reference-counted.
+#[derive(Clone)]
+pub struct TDKSharedState {
+    pub(crate) config: TDKConfig,
+    pub(crate) did_resolver: DIDCacheClient,
+    pub(crate) secrets_resolver: ThreadedSecretsResolver,
+    pub(crate) client: Client,
+    pub(crate) environment: TDKEnvironment,
+    pub(crate) authentication: AuthenticationCache,
+}
+
+/// How long an idle pooled connection may be reused before it is discarded.
+///
+/// **Deliberately shorter than any plausible server-side keep-alive.** reqwest's
+/// default is 90s, which is *longer* than the common defaults in front of our
+/// endpoints — nginx's `keepalive_timeout` is 75s and an AWS ALB's idle timeout
+/// is 60s. When the client's window is the wider one there is a race: the peer
+/// closes a connection the pool still believes is good, the next request is
+/// written into it, and the caller sees the EOF as
+/// `hyper::Error(IncompleteMessage)` on send.
+///
+/// That is not theoretical. Periodic traffic sits squarely in the danger zone:
+/// a 60s health-check leaves a connection idle for exactly as long as the proxy
+/// is willing to hold it, so a percentage of cycles fail with no retry to cover
+/// them (observed as recurring "Failed to send TSP reply" warnings).
+///
+/// 15s keeps the pool useful for bursty traffic while guaranteeing we drop a
+/// connection well before any of those servers would. The cost of being wrong
+/// in this direction is one extra TLS handshake; the cost of being wrong in the
+/// other is a dropped request.
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Build a reusable HTTP/HTTPS [`Client`] backed by `rustls` with the platform
+/// trust verifier, optionally extended with `extra_roots`.
+///
+/// Idle pooled connections are dropped after [`POOL_IDLE_TIMEOUT`] rather than
+/// reqwest's 90s default — see that constant for why the shorter window is the
+/// safe direction to err in.
+///
+/// Pass an empty slice for the default behaviour (platform trust store only).
+/// Non-empty `extra_roots` are added on top of the platform store via
+/// `Verifier::new_with_extra_roots` — useful for environments with
+/// internal/private CAs (see
+/// [`TDKEnvironment::ssl_certificate_paths`](environments::TDKEnvironment::ssl_certificate_paths)).
+///
+/// Installs `rustls`'s `aws-lc-rs` crypto provider as the process default
+/// exactly once via [`OnceLock`] — repeated calls are a no-op.
+///
+/// # Platform support
+///
+/// `extra_roots` is **not supported on Android**: `rustls-platform-verifier`'s
+/// Android backend delegates entirely to the platform trust store and provides
+/// no API to append extra roots. On `target_os = "android"`, passing non-empty
+/// `extra_roots` returns a [`TDKError::Config`] error; an empty slice (platform
+/// trust store only) works on all platforms.
+///
+/// # Errors
+///
+/// Returns [`TDKError::Config`] if the platform TLS verifier or the
+/// [`reqwest::Client`] cannot be constructed, or if non-empty `extra_roots`
+/// are supplied on Android (see *Platform support*).
+pub fn create_http_client(extra_roots: &[CertificateDer<'static>]) -> Result<Client, TDKError> {
+    let tls_config = platform_tls_config(extra_roots)?;
+    reqwest::ClientBuilder::new()
+        .use_rustls_tls()
+        .use_preconfigured_tls(tls_config)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .user_agent(user_agent())
+        .build()
+        .map_err(|e| TDKError::Config(format!("HTTP client build failed: {e}")))
+}
+
+/// Build a [`GuardedClient`](affinidi_net_guard::GuardedClient) for URLs an
+/// attacker can influence (DID-document endpoints, redirect targets, anything
+/// derived from a DID), with the same TLS setup, pool idle timeout and user
+/// agent as [`create_http_client`].
+///
+/// On top of that client it enforces `policy` in both halves: the URL is
+/// vetted before a request is built (the only check an IP literal meets), and
+/// every address a name resolves to is vetted at connect time. It also uses
+/// no proxy, finite timeouts, no redirects, a capped body read and
+/// `https_only` unless the policy has dev loopback. See
+/// [`affinidi_net_guard`] (re-exported as [`net_guard`]).
+///
+/// # Errors
+///
+/// As [`create_http_client`].
+pub fn create_guarded_http_client(
+    extra_roots: &[CertificateDer<'static>],
+    policy: &affinidi_net_guard::EgressPolicy,
+) -> Result<affinidi_net_guard::GuardedClient, TDKError> {
+    let tls_config = platform_tls_config(extra_roots)?;
+    affinidi_net_guard::GuardedClientBuilder::new(policy.clone())
+        .tls_preconfigured(tls_config)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .user_agent(user_agent())
+        .build()
+        .map_err(|e| TDKError::Config(format!("guarded HTTP client build failed: {e}")))
+}
+
+fn user_agent() -> String {
+    format!(
+        "Affinidi Trust Development Kit {}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// The rustls configuration both client constructors share: the platform
+/// verifier, plus `extra_roots` where the platform allows it.
+fn platform_tls_config(extra_roots: &[CertificateDer<'static>]) -> Result<ClientConfig, TDKError> {
+    static CRYPTO_INIT: OnceLock<()> = OnceLock::new();
+    CRYPTO_INIT.get_or_init(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+
+    let tls_config = if extra_roots.is_empty() {
+        ClientConfig::with_platform_verifier()
+            .map_err(|e| TDKError::Config(format!("rustls platform verifier init failed: {e}")))?
+    } else {
+        // `rustls-platform-verifier` 0.7 only implements
+        // `Verifier::new_with_extra_roots` on the non-Android backends; the
+        // Android backend delegates to the platform trust store and exposes no
+        // way to append extra roots. Referencing it on Android is a compile
+        // error, so the extra-roots path is `cfg`-gated out there and we
+        // surface a clear runtime error instead of breaking the cross-compile
+        // or silently dropping the requested roots (issue #483).
+        #[cfg(target_os = "android")]
+        {
+            return Err(TDKError::Config(
+                "extra TLS roots (ssl_certificate_paths) are not supported on Android: \
+                 rustls-platform-verifier has no `new_with_extra_roots` on the Android backend"
+                    .to_string(),
+            ));
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let crypto_provider = rustls::crypto::CryptoProvider::get_default()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+            let verifier = Verifier::new_with_extra_roots(
+                extra_roots.iter().cloned(),
+                crypto_provider.clone(),
+            )
+            .map_err(|e| {
+                TDKError::Config(format!(
+                    "rustls platform verifier (with extra roots) init failed: {e}"
+                ))
+            })?;
+            ClientConfig::builder_with_provider(crypto_provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    TDKError::Config(format!("rustls protocol-version setup failed: {e}"))
+                })?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_no_client_auth()
+        }
+    };
+    Ok(tls_config)
+}
+
+impl TDKSharedState {
+    /// Build a new [`TDKSharedState`] from the supplied configuration.
+    ///
+    /// The DID resolver is selected in priority order:
+    /// 1. `config.did_resolver` — a pre-built resolver instance
+    /// 2. `config.did_resolver_config` — a custom resolver configuration
+    /// 3. Default local-mode resolver
+    ///
+    /// The secrets resolver is similarly taken from config if present, else a
+    /// fresh empty in-memory resolver is created.
+    ///
+    /// The [`AuthenticationCache`] task is spawned and runs until
+    /// [`TDKSharedState::shutdown`] is called.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TDKError::Config`] if the DID resolver or HTTP client fails
+    /// to initialise.
+    pub async fn new(config: TDKConfig) -> Result<Self, TDKError> {
+        let did_resolver = if let Some(resolver) = config.did_resolver.clone() {
+            resolver
+        } else {
+            let resolver_config = config
+                .did_resolver_config
+                .clone()
+                .unwrap_or_else(|| DIDCacheConfigBuilder::default().build());
+            DIDCacheClient::new(resolver_config)
+                .await
+                .map_err(|e| TDKError::Config(format!("DID resolver init failed: {e}")))?
+        };
+
+        let secrets_resolver = if let Some(sr) = config.secrets_resolver.clone() {
+            sr
+        } else {
+            let (sr, _) = ThreadedSecretsResolver::new(None).await;
+            sr
+        };
+
+        // Resolve the environment in priority order:
+        // 1. pre-built env supplied via TDKConfigBuilder::with_environment,
+        // 2. file-load via environment_path + environment_name (when
+        //    load_environment is true),
+        // 3. default empty environment.
+        // Its `ssl_certificates` feed the HTTPS client we build next.
+        let environment = if let Some(env) = config.prebuilt_environment.clone() {
+            env
+        } else if config.load_environment {
+            match TDKEnvironments::fetch_from_file(
+                Some(&config.environment_path),
+                &config.environment_name,
+            ) {
+                Ok(env) => env,
+                Err(e) => {
+                    warn!(
+                        path = %config.environment_path,
+                        name = %config.environment_name,
+                        error = %e,
+                        "environment-file load failed; falling back to default"
+                    );
+                    TDKEnvironment::default()
+                }
+            }
+        } else {
+            TDKEnvironment::default()
+        };
+
+        // Parse environment-supplied PEM files; these become extra trust
+        // roots on top of the platform verifier.
+        let extra_roots = environment.load_ssl_certificates()?;
+        let client = create_http_client(&extra_roots)?;
+
+        let authentication = AuthenticationCache::new(
+            config.authentication_cache_limit as u64,
+            &did_resolver,
+            secrets_resolver.clone(),
+            &client,
+            config.custom_auth_handlers.clone(),
+        );
+        authentication.start();
+
+        Ok(TDKSharedState {
+            config,
+            did_resolver,
+            secrets_resolver,
+            client,
+            environment,
+            authentication,
+        })
+    }
+
+    /// Add a [`TDKProfile`]'s secrets to the shared `SecretsResolver`.
+    ///
+    /// Note: this borrows the profile's secrets — the original `Vec` lives
+    /// on with the profile until it is dropped or [`TDKProfile::take_secrets`]
+    /// is called. For tighter plaintext lifetime, prefer
+    /// [`add_profile_drained`](Self::add_profile_drained), which moves the
+    /// secrets into the resolver in one call.
+    pub async fn add_profile(&self, profile: &TDKProfile) {
+        self.secrets_resolver.insert_vec(profile.secrets()).await;
+    }
+
+    /// Drain a profile's secrets into the shared `SecretsResolver`.
+    ///
+    /// Security-preferred variant of [`add_profile`](Self::add_profile): the
+    /// plaintext is moved out of the profile (which retains an empty
+    /// allocation), the resolver holds the only live copies, and
+    /// `Zeroize`-on-drop fires promptly when those copies are dropped.
+    ///
+    /// Use this when the profile is no longer needed as a secret carrier
+    /// after registration. Use [`add_profile`](Self::add_profile) when the
+    /// caller still needs the profile to retain its secrets (e.g. for
+    /// later re-registration into a different resolver).
+    pub async fn add_profile_drained(&self, profile: &mut TDKProfile) {
+        let secrets = profile.take_secrets();
+        self.secrets_resolver.insert_vec(&secrets).await;
+    }
+
+    /// Resolve the effective mediator DID for a profile, using the active
+    /// environment as the fallback. Delegates to
+    /// [`TDKEnvironment::resolve_mediator`].
+    pub fn resolve_mediator<'a>(&'a self, profile: &'a TDKProfile) -> Option<&'a str> {
+        self.environment.resolve_mediator(profile)
+    }
+
+    /// Load the environment's [`admin_did`](environments::TDKEnvironment::admin_did)
+    /// secrets into the shared `SecretsResolver`, returning the admin
+    /// `TDKProfile` (with secrets drained) for further use.
+    ///
+    /// Admin secrets are sensitive and **not** loaded automatically by
+    /// [`new`](Self::new). Call this only when you need the admin identity
+    /// active in the resolver.
+    ///
+    /// The returned profile carries `alias` / `did` / `mediator` only — its
+    /// `secrets` `Vec` is drained before return, so the only live plaintext
+    /// copy is the one held by the resolver. The original entry on
+    /// [`TDKEnvironment::admin_did`] is unmodified (the environment owns the
+    /// canonical copy on disk).
+    ///
+    /// Returns `Ok(None)` if no admin DID is configured.
+    pub async fn activate_admin_profile(&self) -> Result<Option<TDKProfile>, TDKError> {
+        let Some(admin) = self.environment.admin_did() else {
+            return Ok(None);
+        };
+        let mut admin = admin.clone();
+        let secrets = admin.take_secrets();
+        self.secrets_resolver.insert_vec(&secrets).await;
+        Ok(Some(admin))
+    }
+
+    /// Authenticate the given `profile` against `target_did` using the
+    /// shared [`AuthenticationCache`] with default retry / timeout
+    /// settings (see
+    /// [`tasks::authentication::DEFAULT_AUTH_RETRIES`] /
+    /// [`tasks::authentication::DEFAULT_AUTH_TIMEOUT`]).
+    ///
+    /// Returns cached tokens if a valid record exists; otherwise runs a
+    /// fresh DID Auth handshake (or refresh, depending on token state).
+    pub async fn authenticate_profile(
+        &self,
+        profile: &TDKProfile,
+        target_did: &str,
+    ) -> Result<AuthorizationTokens, DIDAuthError> {
+        self.authentication
+            .authenticate_default(profile.did.clone(), target_did.to_string())
+            .await
+    }
+
+    /// Configuration this state was built from.
+    pub fn config(&self) -> &TDKConfig {
+        &self.config
+    }
+
+    /// DID resolver cache client.
+    pub fn did_resolver(&self) -> &DIDCacheClient {
+        &self.did_resolver
+    }
+
+    /// Threaded `SecretsResolver` (clone-cheap, internally `Arc`).
+    pub fn secrets_resolver(&self) -> &ThreadedSecretsResolver {
+        &self.secrets_resolver
+    }
+
+    /// Shared HTTP/HTTPS client. Cloning is cheap.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// Active environment (profiles, default mediator, etc).
+    pub fn environment(&self) -> &TDKEnvironment {
+        &self.environment
+    }
+
+    /// In-process authentication cache + worker handle.
+    pub fn authentication(&self) -> &AuthenticationCache {
+        &self.authentication
+    }
+
+    /// Stop the background [`AuthenticationCache`] task and wait for it to
+    /// exit. Call before process shutdown for graceful drain.
+    pub async fn shutdown(&self) {
+        self.authentication.terminate().await;
+    }
+}

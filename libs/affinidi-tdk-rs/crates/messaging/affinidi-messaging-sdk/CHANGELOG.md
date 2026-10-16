@@ -1,0 +1,2595 @@
+# Changelog
+
+## Unreleased (0.36.2) — a frame arriving as a live-stream wait times out is no longer lost
+
+### Fixed
+
+- **A live-stream frame that arrived just as a wait timed out could be
+  silently lost.** 0.32.1 re-homes a frame whose waiter has *dropped* its
+  receiver. A narrower window remained: the waiter's `select!` had chosen its
+  timeout but not yet dropped the receiver, so the websocket task's hand-over
+  succeeded and the frame was then discarded with the receiver. On timeout the
+  waiter now closes its receiver and keeps anything already handed over;
+  after the close a hand-over fails and the frame is re-homed as before.
+  Applies to `live_stream_next`, `live_stream_next_frame`,
+  `live_stream_next_packed` and `live_stream_get`.
+- Stored messages lost this way came back on a later pickup. A frame that is
+  never stored did not: a mediator monitor batch lost here is gone, which
+  showed up as `the_monitor_follows_a_message_from_arrival_to_deletion` in
+  affinidi-messaging-mediator failing about 1 run in 10, a monitor event
+  missing for 30 s.
+- No API change. A caller polling with a `wait` may now receive, at the end
+  of a wait, a frame it would previously have lost (R3.6).
+
+## Unreleased (0.36.1) — protocol types from `affinidi-messaging-mediator-types`
+
+The mediator protocol types (ACLs, accounts, message pickup, problem reports,
+`Clock`) now come from the new `affinidi-messaging-mediator-types` crate rather
+than `affinidi-messaging-mediator-common`. They are the same items, re-exported
+from the same SDK paths, so nothing changes for callers. The SDK no longer
+depends on anything from the mediator, which is moving to its own repository.
+
+If you also use `affinidi-messaging-mediator-common` and pass these types
+between it and the SDK, use mediator-common 0.17.7 or later: it re-exports the
+same crate. With 0.17.6 the two would be distinct types.
+
+## Unreleased (0.36.0) — trust-tasks 0.31
+
+Moves to `trust-tasks-rs` / `trust-tasks-proof` 0.31. The generated Trust Task types are in this crate's public API, so it moves a minor. 0.31 makes a `vta-account` storage config name its account's context (trustoverip/dtgwg-trust-tasks-tf#758), which touches nothing here. No source change.
+
+## Unreleased (0.35.0) — trust-tasks 0.30
+
+Moves to `trust-tasks-rs` / `trust-tasks-proof` 0.30. The generated Trust Task types are in this crate's public API (the `TrustTasks` methods return `trust_tasks_rs::specs::messaging` responses, and `decode_monitor_event` returns a `TrustTask`), so it moves a minor. 0.29 adds `keys/sign-jws` and `keys/sign-csr`; 0.30's one break makes `rooms/info` and `rooms/usage` require a proof. Neither touches anything here. No source change.
+
+## 0.34.1 — a reconnected socket is no longer closed by heartbeats it missed while disconnected
+
+### Behaviour change
+
+Reconnect semantics change without a signature change.
+
+- **The websocket watchdog no longer replays ticks it missed while
+  disconnected, and every new socket gets a full interval before its first
+  ping.** The 20 s heartbeat timer was built once per transport task with
+  tokio's default `MissedTickBehavior::Burst`, and its `select!` arm only runs
+  while a socket exists, so ticks that fell due while disconnected piled up.
+  On reconnect they fired back to back: the first sent a ping, the second found
+  it unanswered milliseconds later and closed the new socket as `Missed Pong`.
+  Each failed reconnect waited out its backoff (more missed ticks) and consumed
+  two, so the backlog only grew. After any disconnection longer than about two
+  intervals the transport never held a socket again, and received nothing,
+  until the process was restarted, while HTTP kept answering. Seen 2026-10-11 on
+  two VTAs and a VTC after a DNS outage (each new socket closed 23–420 ms after
+  opening, roughly once a minute, for over an hour) and after a mediator
+  restart. The timer now uses `MissedTickBehavior::Delay` and is re-armed at the
+  one success site for the first connect and every reconnect, beside the
+  existing per-socket resets.
+
+## Unreleased (0.34.0) — trust-tasks 0.28
+
+Moves to `trust-tasks-rs` / `trust-tasks-proof` 0.28. The generated Trust Task types are in this crate's public API (the `TrustTasks` methods return `trust_tasks_rs::specs::messaging` responses, and `decode_monitor_event` returns a `TrustTask`), so it moves a minor. 0.28's one breaking change (the rooms 0.1 specs' `NOT_AUTHORIZED` error-code constants are withdrawn for the standard `permissionDenied`) touches nothing here. No source change.
+
+## 0.33.2 — a recipient that stops collecting is noticed, and poison frames stop filling senders' queues
+
+A mediator keeps a message until its recipient deletes it, and counts it
+against the **sender's** per-recipient queue (`limits.queue.peer`, default 50)
+until then. So a recipient whose sends still work but whose receive side has
+quietly stopped does not fail itself — it fails everyone writing to it, who are
+refused `e.p.limits.queue.peer`. Seen 2026-10-05 on mediator 0.37.0: two OpenVTC
+admin sessions each held 49 VTA replies, the oldest an hour old, and every
+further reply was refused. This release closes the three ways this SDK let that
+happen, and makes the receive side observable.
+
+### Behaviour changes
+
+Ack/delete/reconnect semantics change without a signature change. Read these
+before upgrading a service.
+
+- **The live websocket stream deletes DIDComm frames it cannot unpack.** They
+  used to be logged (and reported on the unprocessable-message channel) and left
+  at the mediator, where they were redelivered on every reconnect and every
+  redelivery request and stayed in their sender's quota for their whole life.
+  The live stream now follows the pickup drain's rule: a failure known to be a
+  property of the bytes (`DidcommError`, `MsgReceiveError`,
+  `VerificationFailed` — undecryptable, a bad signature) is deleted at once; a
+  policy rejection per `with_purge_policy_rejected_messages`; a transient
+  failure (DID resolution, network, an unpack that outlived its 20 s bound, or
+  any error not on that allow-list) is left for redelivery and deleted only
+  once it has failed three times **and** for at least an hour, so a short
+  resolver outage with quick redeliveries discards nothing; a frame sent to a
+  key this profile has not loaded (`SecretsError`) is **never** deleted — it is
+  most likely a legitimate message, and the mediator's expiry bounds it. Each
+  deletion is a WARN naming the frame id (`sha256` of the packed frame), the
+  envelope kind and the sender key or DID the envelope names (read without
+  decrypting, so a lead, not an identity), and the error. Every frame is still
+  reported on the unprocessable-message channel first.
+  `ATMConfigBuilder::with_delete_unprocessable(false)` keeps the old behaviour.
+  TSP frames were already deleted this way.
+- **Receive-leg probe, on by default.** Ping/pong proves the socket, not that the
+  mediator still delivers to it. After 60 s with no inbound data frame (and only
+  while the transport holds nothing for the application), the transport writes
+  a live-delivery request straight to the socket. The mediator answers it, and
+  redelivers anything waiting, through the path being tested. If nothing at all
+  arrives within 30 s, the transport logs a WARN and reconnects. The probe's
+  answer is consumed by the transport and never reaches the application. Cost:
+  one status message and one inbox redelivery pass per idle minute per socket;
+  messages an application read but never deleted are offered again (the
+  at-least-once contract already allowed this). Tune or disable with
+  `ATMConfigBuilder::with_receive_probe(Option<Duration>)`.
+- **`ATM::delete_message_background` gives up after 5 s** (`DELETE_ENQUEUE_TIMEOUT`)
+  when the deletion handler's queue is full, returning `ATMError::SDKError`,
+  instead of waiting without limit. The handler retries a failing batch with
+  backoff and `Retry-After`, so the queue could stay full long enough to park
+  every caller — including the delivery layer's single dispatcher.
+
+### Added
+
+- `ATMProfile::receive_health() -> Option<watch::Receiver<ReceiveHealth>>`: the
+  receive side's health, published on every change — when the last data frame
+  arrived, frames held for the application, since when the application has
+  stopped taking them, an outstanding probe, probe-forced reconnects, and
+  unprocessable frames deleted or retained. `ReceiveHealth` is
+  `#[non_exhaustive]` and re-exported at the crate root.
+  `ConnState` is unchanged: a degraded receive side must not stop sends.
+- `ATMProfile::reconnect_websocket()`: drop the socket and connect again at
+  once. The fresh connect re-enables live delivery, which redelivers the inbox.
+- `ATMConfigBuilder::with_delete_unprocessable(bool)`,
+  `ATMConfigBuilder::with_receive_probe(Option<Duration>)`,
+  `config::DEFAULT_RECEIVE_PROBE_AFTER`,
+  `messages::delete::DELETE_ENQUEUE_TIMEOUT`.
+
+### Fixed
+
+- **A stalled application is reported.** When frames have been held for the
+  application for 60 s with none taken (reads pause once the caches fill), the
+  transport logs one WARN per episode — nothing is being deleted at the
+  mediator and peers will start being refused — and sets
+  `ReceiveHealth::consumer_stalled_since`; an INFO when it drains. It does not
+  reconnect: a reconnect cannot make an application read, and the redelivery on
+  connect would only duplicate frames into the packed cache.
+- **The inline unpack on the transport task is bounded** (20 s). It resolves
+  DIDs over the network, and a hung resolver used to stall the whole socket —
+  reads, sends and the watchdog — behind one frame.
+- **Every await in the TSP inbound chain is bounded**
+  (`transport_adapter`): an unpack attempt (20 s, counted as transient inside
+  the existing retry budget), recording a control message (10 s; on timeout the
+  frame is left at the mediator for redelivery, not released), and releasing a
+  frame (10 s).
+- The transient-versus-poison classification is shared by the TSP adapter and
+  the DIDComm live stream, so both halves of one socket agree. An HTTP-status
+  failure underneath an unpack now counts as transient.
+
+## 0.33.1 — the websocket transport recovers from sleep and dead networks
+
+### Fixed
+
+- **A websocket connect could hang forever and take the transport with it.**
+  The TCP connect, proxy tunnel, TLS handshake and HTTP upgrade had no deadline,
+  and the connect runs inline on the transport task. One stalled attempt (the
+  typical case is a laptop waking from sleep, with the first reconnect going out
+  before the network is back) stalled every reconnect after it. The listener
+  stayed `Disconnected` until the process restarted. A connect now fails after
+  30 s like any other connect error, and the backoff ladder retries.
+- **The missed-pong watchdog never fired.** It pinged every 20 s and closed
+  the socket if `awaiting_pong` was still set on the next tick, but nothing ever
+  set the flag. A half-open socket (peer gone, no FIN or RST) therefore sat
+  `Connected` indefinitely and received nothing. The flag is now set when a ping
+  is sent and cleared by any inbound frame. A silent socket is closed and
+  reconnected within about 40 s. The check is skipped while reads are paused on
+  full inbound caches, because no pong can be read then. A failed ping write
+  now counts as a dead socket.
+- Closing a socket that is being abandoned, and writing a ping, are each bounded
+  to 5 s, so the task does not park flushing frames to a peer that is gone.
+
+## Unreleased (0.33.0) — trust-tasks 0.27
+
+Moves to `trust-tasks-rs` / `trust-tasks-proof` 0.27. The generated Trust Task types are in this crate's public API (the `TrustTasks` methods return `trust_tasks_rs::specs::messaging` responses, and `decode_monitor_event` returns a `TrustTask`), so it moves a minor. 0.27's one breaking change (git-ns `ActivityItem.source` becomes a typed enum) touches nothing here.
+
+## Unreleased (0.32.3) — a repeated TSP accept is ignored, not refused
+
+`TspOps::record_incoming_control` now treats a second accept for a relationship
+already `Bidirectional` as a no-op: it returns the state unchanged, keeps the
+first accept's digest, and logs at `debug`. It used to return
+`invalid relationship transition: ReceiveAccept in state Bidirectional`, which
+consumers logged as an error although nothing was wrong. This happens when a
+community re-sends its accept or a relay delivers it twice (seen in VTI-61
+retesting). It applies only to an accept that belongs to the relationship
+held: one that echoes the invite we recorded, or is the accept we recorded.
+Any other accept is still refused.
+
+## Unreleased (0.32.2) — no behaviour change
+
+No behaviour change and no public API change. The `dart_interop_unpack_all`
+test imports its JWK with `Secret::from_jwk_value`, as
+`affinidi-secrets-resolver` 0.5.15 deprecates `Secret::from_str` (#893).
+
+## Unreleased (0.32.1) — live-stream messages no longer lost to a timed-out waiter
+
+### Fixed
+
+- **An inbound DIDComm message could be silently lost on the websocket
+  transport.** `live_stream_next` parks a waiter with the websocket task,
+  waits up to its `wait`, then drops its receiver and sends `CancelNext`. A
+  message that arrived between the two was handed to the dead waiter with
+  `let _ = sender.send(..)`, and the failed send discarded it. It was never
+  cached, and the mediator had already delivered it. A caller polling in
+  windows hits this constantly. The mediator console's monitor reader polls in
+  500 ms windows, and in testing it lost **3–5% of single messages (6 of 200)**,
+  surfacing only as a console `lost` gap. After the fix it lost **0 of 200**.
+  Every consumer that polls `live_stream_next` / `live_stream_next_frame` with a
+  `wait` was exposed, and a `live_stream_get` that gave up a moment early lost
+  its reply the same way.
+
+  Unpacked messages now follow the rule the packed-frame path already had:
+  each home that turns a message away hands it to the next, in order: the
+  `live_stream_get` waiter for its thread, then live `Next` waiters oldest
+  first, then the direct channel (if it has receivers), then the cache. None
+  of them drops it. Regression tests cover a gone `Next` waiter, a gone waiter
+  ahead of a live one, and a gone `Get` waiter. All three fail on 0.32.0.
+
+**Behaviour note for consumers (R3.6):** no API change. The only observable
+difference is that messages which used to vanish now arrive: on the next
+`live_stream_next`, or in the cache for a later `live_stream_get`. Code that
+de-duplicates by message id is unaffected. Code that had compensated for the
+losses with blind resends may now see the original as well.
+
+## Unreleased (0.32.0) — tdk-common 0.7, trust-tasks 0.26
+
+Moves to `affinidi-tdk-common` 0.7 and `trust-tasks-*` 0.26 (on data-integrity 0.8). Both are public dependencies here (`TDKSharedState`, `TDKProfile`, and the trust-tasks proof types), so this crate moves a minor. No source change.
+
+## Unreleased (0.31.1) — a TSP relationship can be started with a peer on another mediator; a reply to a request collected by pickup threads to the sender's id
+
+**A cold invite to a peer on another mediator.** `send_control` (invite,
+accept, cancel) routes across mediators only when it knows the peer's
+mediator, and it knew one only if it was learned from a routed invite *from*
+the peer or set with `set_peer_mediator`. A node starting a relationship has
+neither, so its invite went Direct to its own mediator, which refuses Direct
+delivery for an account it does not host:
+
+```
+e.p.direct_delivery.denied: Mediator is not accepting direct delivery of TSP messages. They must be relayed through a routing envelope
+```
+
+It failed this way on every attempt (VTI-56: a community's TSP push to a
+member on another mediator never left, and fell back to DIDComm an hour
+later). The new `TspOps::peer_mediator` falls back to the peer's DID
+document when nothing was learned: the DID its `TSPTransport` service names.
+If the document lists ours among several, ours is used. `send_control` and
+`ATM::send_to` both use it. The fallback is read, never stored, so a
+persisted `PeerCapability` is still only what was learned or set.
+
+**A reply to a request collected by Delivery-Request.**
+`send_delivery_request_frames` overwrote each delivered DIDComm message's
+`id` with the mediator's id for it. That id was already returned beside the
+frame for acking. A handler replying with `thid = message.id` threaded to
+the mediator's hash instead of the sender's id, so the sender's waiter never
+matched it. The same request collected live kept its id and was answered
+(VTI-49: two of seven DID mints from a VTA to a DID-hosting server timed out
+whenever the server's 30-second backup poll collected the request). The
+message now keeps its own id. `send_delivery_request`, which returns no id
+beside the message, still sets `id` to the mediator's id, because its callers
+delete by it.
+
+## Unreleased (0.31.0) — trust-tasks-rs 0.25
+
+Moves to `trust-tasks-rs` 0.25, with the rest of the `trust-tasks-*` family at 0.25. That release conforms the Trust Task vetting, member and endorsement specs to the DTG Credentials v1 statement and authority credentials (trustoverip/dtgwg-trust-tasks-tf#691). A public dependency moving a minor is breaking, so this crate moves a minor. No source change.
+
+## Unreleased (0.30.1) — an already-gone delete from a Fjall or in-memory mediator is no longer a warning
+
+The deletion handler treats a `not_found` refusal as "already deleted": it logs
+it at debug and remembers the id so a redelivered copy is not deleted again. It
+recognised that refusal only by the Redis backend's problem-report descriptor
+(`database.message.delete.not_found`). A mediator on its Fjall or in-memory
+store answers the same case with a bare `NOT_FOUND: message_hash (…)`, so every
+redelivered duplicate it answered was logged as
+
+```
+WARN deletion_handler: the mediator refused some ids: [("…", "NOT_FOUND: message_hash (…)")] deleted=0 failed=1
+```
+
+and was never recorded as deleted. Both forms are now recognised. Mediator
+0.33.1 answers with the descriptor on every backend; this is for the mediators
+already deployed.
+
+## Unreleased (0.30.0) — trust-tasks-rs 0.24
+
+trust-tasks-rs and trust-tasks-proof 0.23 -> 0.24. A minor rather than a patch, as for 0.21, 0.22 and 0.23: the public API carries generated Trust Task types, so a consumer must move in the same change. 0.24 changes how a `oneOf` branch that uses a compound `not` is generated (trust-tasks-rs #665: `auth/passkey/enroll/invite/update/0.1` and `auth/revoke-session/0.2` become structs with optional members instead of uninhabited enums); this crate uses neither, and trust-tasks-proof is unchanged. No source change.
+
+## Unreleased (0.29.0) — the legacy mediator admin senders are removed
+
+Removed, with what replaces each (all on `atm.trust_tasks()`):
+
+- `Mediator`, `MediatorOps`, `ATM::mediator()` and `Protocols::mediator`: the
+  senders of the removed DIDComm admin protocols. Use `account_get`,
+  `account_list`, `account_add`, `account_update`, `account_remove`,
+  `acl_get`, `access_list_list`, `access_list_update`, `audit_list` and
+  `config_show`.
+- `MessageType::{MediatorAdministration, MediatorAccountManagement,
+  MediatorACLManagement}`; those type URIs now parse as `MessageType::Other`.
+- `ATM::purge_queue`, `ATM::purge_queue_filtered` and `ATM::queue_status`, the
+  REST senders, with `PurgeOptions`, `PurgeQueueResponse`,
+  `QueueStatusResponse` and `QueueSideStatus`. Use `queue_purge` and
+  `queue_status`.
+- `protocols::mediator::administration`, and the re-exports of the removed
+  mediator-common request types from `accounts` and `acls_handler`.
+- The `regex` dependency, which only the removed code used.
+
+Takes mediator-common 0.17.
+
+## Unreleased (0.28.1) — delivery can be settled on the mediator's receipt
+
+- `atm.trust_tasks().message_status(profile, msg_ids)` sends a
+  `messaging/message/status/0.1` Trust Task and returns where each message the
+  profile sent stands at its mediator: `queued`, `delivered`, `collected`,
+  `withdrawn`, `discarded` or `unknown`.
+- `DidCommTransport` implements `MessageTransport::outbox_status` over it,
+  keyed by hop id and limited to the ids asked about. `affinidi-messaging-
+  delivery` 0.1.19 settles an outbox entry on that answer instead of inferring
+  pickup from the outbox listing, so a message a live recipient collects before
+  the first poll is confirmed rather than re-sent, and one the mediator
+  discards is not read as delivered. Against a mediator that does not serve the
+  task, it answers `None` and the listing is used as before.
+
+Requires `affinidi-messaging-core` 0.1.11. See affinidi-tdk-rs#896.
+
+## Unreleased (0.28.0) — trust-tasks-rs 0.23
+
+trust-tasks-rs and trust-tasks-proof 0.22 -> 0.23. A minor rather than a patch, as for 0.21 and 0.22: the public API carries generated Trust Task types, so a consumer must move in the same change. 0.23 also resolves a proof's key only when the issuer lists it under the relationship the proof declares (proofPurpose, VTI-KEY-022), so a Trust Task signed with a key its DID document does not list for that purpose is now refused.
+
+## Unreleased
+
+### 0.27.2 — the authcrypt sender is the key that decrypted the message
+
+No public API change.
+
+**Security.** `unpack` resolves the authcrypt sender key for exactly the
+envelope's `skid` and hands `affinidi-messaging-didcomm` 0.15.9's
+`decrypt_bound` the key together with that key id; the key id reported as
+`UnpackMetadata::encrypted_from_kid`, and used by the addressing-consistency
+check, is the same `skid`. Messages refused as a result:
+
+- an authcrypt JWE whose `skid` and `apu` differ, or that lacks either —
+  refused before any DID resolution;
+- a `skid` that is a bare DID (it was resolved to the sender's first
+  key-agreement key) or that names a verification method outside the sender's
+  `keyAgreement` (embedded or referenced, absolute or `#fragment`, are
+  accepted);
+- a JWE from a sender still on the pre-0.14 ECDH-1PU KEK.
+
+`transport_adapter`: an `encrypted_from_kid` without a `#fragment` yields no
+authenticated sender.
+
+### 0.27.1 — a mutual TSP cancellation is answered
+
+Rev 3 §7.3: a cancellation (`TSP_RFD`) of a relationship held in both
+directions is answered with a cancellation before it is forgotten.
+`TspOps::record_incoming_control` now sends that answer itself, naming the
+relationship digest the peer's cancellation named. Until now it only reported
+`IncomingControl::reply_expected` and left the answer to the caller — but by
+then it had already moved the relationship to `None`, so the only answering
+API, `cancel_relationship`, refused with "invalid transition: SendCancel in
+state None" and the peer was never answered (Keyring VTI-38).
+
+- New `TspOps::answer_cancellation(profile, their_did, relationship_digest)`
+  sends a cancellation without running the state machine, and is refused
+  unless the pair's state is `None`. It is what `record_incoming_control`
+  uses, and what a caller retries with.
+- `IncomingControl::reply_expected` (and `InboundKind::RelationshipControl`'s
+  `reply_expected` from the transport adapter) now means *the answer is still
+  owed*: `false` once the SDK has sent it, `true` only when the send failed.
+- For a cancellation, `InboundKind::RelationshipControl::thread_digest` is the
+  relationship digest the cancellation named, not the cancellation frame's own
+  digest — the one a reply can refer to.
+
+A consumer that answered on `reply_expected` with `cancel_relationship` now
+simply stops being asked to; nothing is sent twice.
+
+### 0.27.0 — trust-tasks-rs 0.22
+
+Dependency bump, no code change. 0.22 renamed part of the `persona/*` family;
+nothing here uses those tasks, and the messaging specifications these crates do
+use are unchanged.
+
+A minor rather than a patch because `trust_tasks_rs` types cross this crate's
+public API — `MediatorAcl` among them — so a consumer combining it with another
+`trust-tasks-rs` user has to move in step. A graph holding both versions does
+not merely carry a duplicate; it fails to compile on those types.
+
+### 0.26.27 — TSP relationships across two mediators
+
+A routed TSP message now goes out through this profile's own mediator even
+when its route starts somewhere else. `send_routed_opaque` (and so
+`send_routed`, `send_nested_routed` and the routed relationship accept) puts
+the profile's mediator in front of a route whose first hop is another
+intermediary. Before, the routing layer was sealed to that first hop but
+posted to our own mediator, which took the frame for Direct delivery to a
+local account and refused it with 403 "recipient is not local to this
+mediator". Rev 3 §7.2.4 lets a responder add hops of its own, and this is
+the one it needs. A route that already starts at our mediator, and a
+single-hop route, are sent exactly as before.
+
+The case this fixes is Keyring VTI-41: a client on mediator A invites a peer
+on mediator B with a `Reply_Path` of `[A, client]`, and the peer's accept
+never left B. It now travels `[B, A, client]`.
+
+`send_control` also routes when the peer's mediator is known and is not ours
+(learned from a routed invite, or set with `set_peer_mediator`): invites,
+accepts without a reply path and cancellations go
+`[own, peer_mediator, peer]`, as `ATM::send_to` already did for application
+messages. With the peer's mediator unknown or shared, it is Direct as
+before.
+
+The receiving mediator has to admit the relayed hop, which arrives with no
+Authorization header: `enable_inter_mediator_relay = true` (or the legacy
+`SEND_FORWARDED` in `global_acl_default`), and `relay_trusted_mediators`
+either empty or listing the relaying mediator.
+
+### 0.26.26 — a TSP send survives a connection closed under it
+
+`TspOps::send_raw` — the POST behind every TSP send, including a VTA's
+Trust Task replies — made one attempt. When a pooled keep-alive connection
+was closed under the request (by an ngrok tunnel or a load balancer, seen as
+hyper `IncompleteMessage`), the message was lost with nothing retrying or
+recording it, and the caller waited out its own timeout for a task that had
+completed (Keyring VTI-39).
+
+It now re-POSTs the **identical bytes** up to twice more (after 100 ms, then
+400 ms) when no HTTP answer came back: a failed connect, a closed, reset or
+incomplete connection, or the new 30 s per-request timeout. It never
+re-seals, and it never retries an HTTP status — a 4xx or 5xx is the
+mediator's answer. The re-send is safe because the mediator stores a message
+idempotently on the hash of its bytes (mediator 0.28.10 and later), so a
+retry of a POST that was in fact stored is a no-op. The timeout is set on
+this request only; the shared TDK client is unchanged.
+
+### 0.26.25 — asking for an account's lifetime counters
+
+`trust_tasks().account_get_detailed(profile, did_hash, include_activity,
+include_stats)` and `account_list_detailed(..., include_stats)` request each
+account's `stats` — messages and bytes sent and received, split by wire
+protocol — alongside the activity times. Additive: the existing
+`account_get` / `account_list` and their `_with_activity` forms are
+unchanged.
+
+**Only ask a mediator that serves them** (0.28.36 or later): `includeStats`
+is a request member, so a mediator that predates it refuses the whole
+request rather than ignoring the member.
+
+### 0.26.24 — Trust Tasks over either transport
+
+Every `trust_tasks()` method now goes over whichever transport the profile
+and mediator have in common. Callers write the same code either way: no
+TSP-specific methods, no transport argument.
+
+All of them funnel through one `exchange`, which is where the wire is now
+chosen, by the same `TspOps::select_protocol` that `ATM::send_to` uses:
+- **`TspPolicy::Off` (the default) is DIDComm**, so nothing moves wire until
+  an application opts in with `with_tsp_policy`.
+- **`Preferred` / `Required`** pick TSP for a mediator known to speak it with
+  a relationship already in place — which is also what TSP requires before
+  the receiver will accept the mediator's sealed reply.
+
+Over TSP the document is the payload of a Direct message to the mediator,
+and its sealed reply is collected from the inbox **by thread id and by
+sender**: a thread id only identifies, so the reply must also have been
+sealed by the mediator, or a peer holding a relationship could answer
+someone else's Trust Task. The inbox is read with `DoNotDelete` and only the
+matched reply is deleted, so a frame meant for another reader of the same
+mailbox stays where it is, and a failed delete is logged rather than
+swallowed. Each sweep walks the whole mailbox, so traffic arriving alongside
+the reply cannot push it out of view. A reply that doesn't arrive within 15s
+is an error naming the transport, never a silent wait.
+
+The document and its Data Integrity proof are identical on both wires.
+
+### 0.26.23 — asking for account activity
+
+`trust_tasks().account_get_with_activity(profile, did_hash, include_activity)`
+and `account_list_with_activity(..., include_activity)` request each
+account's `last_received_at` and `last_authenticated_at`. Additive: the
+existing `account_get` / `account_list` are unchanged and don't ask.
+
+**Only ask a mediator that serves it** (0.28.33 or later). `includeActivity`
+is a request member, so a mediator that predates it refuses the whole
+request as a schema violation rather than ignoring the member.
+
+### 0.26.22 — `config/reload`
+
+`trust_tasks().config_reload(profile)` sends the generic `config/reload` Trust
+Task (rootAdmin). The mediator re-reads its limits from its configuration
+file and returns the keys whose running value changed. Additive.
+
+### 0.26.21 — the legacy mediator admin client is deprecated
+
+- **Deprecated:** `protocols::mediator::administration::Mediator`, the client
+  for the legacy DIDComm `mediator/1.0` admin, account and ACL management
+  protocols. Every method on it, and on the `atm.mediator()` wrappers that
+  already were deprecated, now says to use `atm.trust_tasks()`.
+- **Also deprecated:** `ATM::purge_queue`, `purge_queue_filtered` and
+  `queue_status`, the clients for the REST `/purge` and `/queue/status`
+  routes. Use `trust_tasks().queue_purge()` and `trust_tasks().queue_status()`
+  instead.
+- **Why:** the mediator (0.28.29) can now switch these protocols and routes
+  off with `security.legacy_admin_protocols`. They still work where it
+  serves them.
+- Deprecation only: no behaviour changes.
+
+### 0.26.20 — `config/patch`
+
+`trust_tasks().config_patch(profile, overrides)` sends the generic
+`config/patch` Trust Task (rootAdmin only). It changes mediator limits at
+runtime; a `null` value removes a key's override. The response lists what took
+effect now (`applied`), what was stored for the next start
+(`pending_restart`), and what was refused, with the reason (`rejected`).
+Additive.
+
+### 0.26.19 — a reply reaches the call that asked for it
+
+`send_message(.., wait_for_response = true, ..)` — which every Trust Task call
+and other request/response exchange uses — now registers interest in the reply
+**before** transmitting the request, instead of after. The websocket task hands
+an inbound message to a registered reply before any pending
+`live_stream_next`, so registering first closes the window in which a fast
+reply was given to a concurrent live-stream reader: the reader received a
+message it did not ask for, and the call timed out ten seconds later. An
+application that reads its live stream (pushed messages, monitor events) while
+making request/response calls on the same profile hit this under load.
+
+`CancelGetMessage` now actually drops the registration (it was a no-op), so a
+timed-out or failed wait no longer leaves a stale entry that a later message
+with the same id is handed to. A request that fails to transmit cancels its
+registration. `live_stream_get` is unchanged for callers.
+### 0.26.18 — the traffic monitor
+
+`trust_tasks().monitor_subscribe(profile, filter, lease_seconds,
+max_events_per_second, renew)` and `trust_tasks().monitor_unsubscribe(profile,
+id)`, plus `protocols::trust_tasks::decode_monitor_event(&Message)` to pick the
+signed `messaging/monitor/event` batches out of a live stream. The profile needs
+its websocket enabled; events are never queued.
+
+### 0.26.17 — `message_delete` and `queue_purge`
+
+`trust_tasks().message_delete(profile, did_hash, msg_ids)` and
+`trust_tasks().queue_purge(profile, did_hash, queue, peer, older_than_seconds, dry_run)`
+— the `messaging/message/delete` and `messaging/queue/purge` Trust Tasks. Dry-run
+a purge and confirm the count before running it for real.
+
+### 0.26.16 — `message_list` and `message_get`
+
+`trust_tasks().message_list(profile, did_hash, queue, peer, cursor, limit)` and
+`trust_tasks().message_get(profile, did_hash, msg_id)` — the
+`messaging/message/list` and `messaging/message/get` Trust Tasks. `message_get`
+returns the stored envelope still encrypted; a caller holding the recipient's
+key can unpack it locally.
+
+### 0.26.15 — `queue_status`
+
+`trust_tasks().queue_status(profile, did_hash, include_peers)` — the
+`messaging/queue/status` Trust Task: an account's two queues live, optionally
+broken down by counterparty. `did_hash = None` reads the caller's own.
+
+### 0.26.14 — `stats_show` and `queue_list`
+
+`trust_tasks().stats_show(profile)` and
+`trust_tasks().queue_list(profile, queue, sort, min_count, cursor, limit)` —
+the admin-only `messaging/stats/show` and `messaging/queue/list` Trust Tasks, for
+mediator operator tooling. Requires `trust-tasks-rs` 0.21.10.
+
+### 0.26.13 — every Trust Task leaves with `issuedAt` and a proof
+
+`trust_tasks()` requests now carry `issuedAt` and an `eddsa-jcs-2022` Data
+Integrity `proof` made with the profile's Ed25519 key (an `assertionMethod` key
+if the DID declares one, else its `authentication` key — the usual case for a
+`did:peer:2` profile). Most `messaging/*` specs require both on the request,
+and the mediator is about to start enforcing them; this ships first so clients
+are already compliant when it does.
+
+**Nothing that works today stops working.** A mediator that does not verify
+proofs ignores them. A profile with no Ed25519 key — or whose own DID cannot be
+resolved at send time — sends the request unsigned and logs a warning, as it
+did before; a mediator that enforces proofs answers such a request with
+`proofRequired`. A signing failure with a key in hand is an error, never a
+silent downgrade to unsigned.
+
+New dependencies: `trust-tasks-proof` 0.21 (`affinidi` backend only) and
+`chrono`. Both were already in the build graph through `trust-tasks-rs` and the
+workspace's own `affinidi-data-integrity`.
+
+### 0.26.12 — a re-establishing send survives the peer inviting us first
+
+`send_reestablishing` reads the send readiness and then invites, and those are
+two separate awaits on the relationship store. The peer can move our half
+between them: its own invite arrives, `None` + `ReceiveInvite` leaves us
+`InviteReceived`, and `SendInvite` is legal only from `None`. The invite was
+then refused with
+
+```
+invalid transition: SendInvite in state InviteReceived
+```
+
+and the payload was never sent — the method returned that error instead.
+
+That is not a failed send. It is the outcome the invite existed to produce,
+reached from the other side: a relationship is on record again, and
+`admits_application_message()` is true for every state but `None`, so §3.6
+admits the payload. And the collision is commonest exactly where this method
+matters most, because two endpoints repairing the same broken relationship at
+once is what a mediator restart or a peer redeploy produces.
+
+A refused invite is now answered by **re-reading the store** rather than by
+inspecting the error: our half no longer `None` means carry on to the payload;
+still `None` means the invite failed for its own reasons and that error stands.
+The payload is sent exactly once either way. The decision is the new pure
+`invite_refusal_is_benign(SendReadiness) -> bool`, exported beside
+`readiness_for` and unit-tested with it — the race lives between two awaits and
+cannot be staged in a test, so the decision is what is pinned.
+
+**Behavioural change to send semantics (R3.6).** A `send_reestablishing` call
+that returned `Err` on this collision now returns `Ok` with the payload
+delivered. No signature changes. Callers that treated the error as "the peer is
+unreachable" were being told the wrong thing; nothing needs to change on their
+side, but a consumer with its own workaround for it can drop it. Found by
+`vta-service`, whose one-shot D6 recovery reported the peer as silent for a frame
+that had never left the node (OpenVTC/verifiable-trust-infrastructure#1582).
+
+### 0.26.11 — queue status, and a purge you can narrow
+
+`ATM::queue_status()` returns this DID's own depth, effective limits, resulting
+saturation and oldest-message age at the mediator. The point is to pace
+**before** being refused: saturation reaching 1.0 is the depth at which the
+mediator starts rejecting sends, so a client that slows at 0.8 never gets
+there. A climbing `oldestAgeSecs` beside a steady depth says the peer has
+stopped collecting — which depth alone cannot distinguish from a busy queue.
+
+`ATM::purge_queue_filtered()` narrows a purge by counterparty, by age, or to a
+dry run. `purge_queue()` is unchanged and is now a shim over it with no
+options, which takes the mediator's faster whole-folder path.
+
+`PurgeQueueResponse` gains `scanned`, `dry_run`, `failed` and `truncated`, all
+`#[serde(default)]`, so a response from an older mediator still deserialises.
+`failed` is non-zero when the mediator matched a message but could not remove
+it — the queue is then not as empty as `count` alone suggests.
+
+Query values are percent-encoded rather than interpolated: the mediator rejects
+unknown parameters, so an unescaped `&` in a peer value would turn one
+parameter into two and fail loudly — but it should not be possible to reach
+that in the first place.
+
+### 0.26.10 — the deletion handler stops re-deleting redelivered messages
+
+0.26.8 stopped discarding the mediator's answer to a background delete, and what
+it surfaced was a flood of warnings on every service that had just connected:
+
+```
+WARN deletion_handler: the mediator refused some ids:
+  [("5c514f…", "…code: w.m.database.message.delete.not_found… 404")] deleted=1 failed=1
+```
+
+Nothing new was broken. The duplicate deletes had always been there; 0.26.8 was
+simply the first build that said so.
+
+**Where the duplicate comes from.** Live delivery is deliberately at-least-once.
+The mediator re-pushes a recipient's whole undelivered inbox when a socket
+enables live delivery, and again when a duplicate socket displaces an existing
+session — fetched `DoNotDelete`, on the stated understanding that a client which
+already had a message "simply sees it again and deletes it as usual". With
+auto-delete on receipt, "as usual" is a second `DELETE` for an id the mediator
+has already dropped, which it answers `not_found`. This is why every one of
+those warnings landed within milliseconds of a connect.
+
+Three changes:
+
+- **Ids are de-duplicated within a batch.** `deleted=1 failed=1` on a single
+  request was one id sent twice: two deliveries of one message, queued twice,
+  coalesced into one `DELETE`, the second occurrence refused.
+- **Ids deleted in the last 60 seconds are not deleted again.** The redelivered
+  copy usually arrives in the *next* batch, where within-batch de-duplication
+  cannot see it. The cache is per `(profile, id)` and bounded at 4096 entries.
+  Suppression is short by design: a message id is `sha256` of the stored body,
+  so an entry that never expired could in principle strand a byte-identical
+  message — expiry makes that self-healing.
+- **`not_found` is reported at `debug`, not `warn`.** It means the message is
+  already gone, which is the expected answer here; the mediator itself logs it
+  at debug as "may already be deleted". A `permission_denied` or a database
+  error still warns, and now it can be seen — those are ids the mediator will
+  never accept, i.e. messages redelivered for as long as they live.
+
+Deletion is still at-least-once end to end: a suppressed delete costs nothing,
+since an un-deleted message is redelivered and queued again. Behaviour-only; no
+API change.
+
+### 0.26.9 — `purge_queue`
+
+`ATM::purge_queue(profile, folder)` empties one of the calling profile's own
+queues at the mediator in a single call (`DELETE /purge/{folder}`), with
+`PurgeQueueResponse { count, bytes }`.
+
+Deleting by id is the right tool while a queue is healthy. It stops being one
+when a queue is *stuck*: `/list` is capped at 100 with no cursor, `/fetch` pages,
+and every batch is separately authenticated — so clearing a large backlog costs
+exactly the request volume that gets a node rate-limited, which is usually how
+the backlog started.
+
+The queue that strands a deployment is often a **peer's send queue** rather than
+this node's inbox: a message is held against the sender's account until the
+recipient deletes it, so a receiver whose deletes are failing fills the send
+queue of everyone talking to it, up to `queued_send_messages_hard` (1000 by
+default), after which that peer cannot send at all. This is how such a peer gets
+itself back.
+
+Purging destroys messages — they are not returned to their senders. Additive.
+
+### 0.26.8 — background deletions batch, and their failures are no longer silent
+
+The deletion handler sent one `DELETE` per message and discarded the result
+(`let _ = atm.delete_messages_direct(...)`). Both halves hurt, and they compound:
+one request per message means each carries its own authentication and counts
+against the mediator's per-IP budget, so the deletes that would drain a backlog
+are what tip it into rate-limiting them — and with the outcome thrown away, a 429
+left no trace and was never retried, so the message stayed on the mediator to be
+redelivered and queued for deletion again.
+
+Who that hurts is not the node doing it: a message is held against the
+**sender's** account until the **recipient** deletes it, so a receiver whose
+deletes are quietly failing fills the send queue of every peer talking to it.
+
+Now everything already queued for one profile goes in a single `DELETE` (capped
+at the mediator's own limit of 100), a refusal is retried with backoff honouring
+`Retry-After`, and giving up is logged at error naming the count. Per-id
+refusals inside a successful response are surfaced too. Internal only — no API
+change.
+
+### 0.26.7 — §7.2.2 drop counter (D8)
+
+Observability for the relationship gate (design note
+`tsp-relationship-recovery.md`, D8). `ATMConfigBuilder::with_relationship_drop_counter`
+injects an `Arc<AtomicU64>` that the gate increments each time it drops an
+inbound TSP application message from a VID it holds no relationship with (at both
+`unpack_bytes` and `unpack_message`). A rising count is the "a peer arrived whose
+relationship we lost" alarm — the one event that was previously invisible except
+in a single error-level log line. Additive; no counter configured is a no-op.
+
+### 0.26.6 — TSP relationship recovery runtime (D6–D9)
+
+The runtime layer over the D1–D5 recovery cores (design note
+`tsp-relationship-recovery.md`), all additive:
+
+- **Eviction sweep + enumeration (D6/D9).** `RelationshipKv` gains
+  `scan_prefix` (default: yields nothing, so a non-scanning backend degrades to
+  no eviction rather than a compile error).
+  `PersistentRelationshipStore::evict_idle` sweeps relationships idle past an
+  `EvictionPolicy` and `forget`s the whole record; `established_relationships`
+  lists the `Bidirectional` pairs a proactive startup reconcile (D9) re-asserts.
+- **Single-flight coordinator (D6) + metrics (D8).** `RecoveryCoordinator` holds
+  one `RecoveryState` per peer behind a lock, driven by a `BackoffPolicy` and an
+  injected clock: `begin` gives one caller `Start` and coalesces the rest to
+  `InFlight`; `settle_success`/`settle_failure` advance it; `metrics()` reports
+  `RecoveryMetrics { attempts, successes, give_ups }`.
+- **Inbound-invite rate limiting (D7).** `InviteRateLimiter` — one accepted
+  invite per interval per peer, so an authenticated peer cannot flood invites to
+  keep a live relationship perpetually mid-handshake (D2 made accepting one
+  cheap).
+
+### 0.26.5 — TSP relationship recovery
+
+Rev 3 §7.2.2 has an endpoint silently drop application traffic from a VID it
+holds no relationship with, so a restart onto the ephemeral relationship store —
+or a peer losing its half — makes an established peer's messages vanish until a
+re-handshake, with no visible error. This adds the recovery mechanism, as
+additive, pure, tested decision cores (design note `tsp-relationship-recovery.md`):
+
+- **Durable store (D1):** `PersistentRelationshipStore<B: RelationshipKv>`, a
+  durable `RelationshipStore` over a three-method byte backend; one
+  length-prefixed key per facet per pair. `ThreadDigests` gains
+  `Serialize`/`Deserialize`. A consumer supplies only a `RelationshipKv` adapter
+  over the store it already runs.
+- **Recovery-aware send (D3):** `SendReadiness` + `readiness_for` +
+  `TspOps::send_reestablishing` — re-establish (invite, then §3.6-bundle the
+  payload) before sending when our own half is missing.
+- **Bounded recovery (D4):** `BackoffPolicy` (capped exponential + `full_jitter`)
+  and single-flight `RecoveryState`/`RecoveryAction` for timeout-driven recovery,
+  bounded so a down peer is not re-invited forever; `TspOps::reset_relationship`
+  for the stale-local-half case.
+- **Idle eviction (D5):** `EvictionPolicy` (7-day default) +
+  `PersistentRelationshipStore::{touch, last_active}`.
+
+All additive; no existing signatures change. The behavioural half — the
+`affinidi-tsp` reconcile transition these compose with — ships in that crate.
+
+## Unreleased (0.26.3) — an authentication or transport-adapter `429` stays typed
+### 0.26.4 — inbound TSP control messages reach the consumer
+
+`tsp_to_inbound` recorded a relationship control message and then dropped it,
+because `Inbound` had no way to carry a message kind. It now surfaces it with
+`InboundKind::RelationshipControl`, so a consumer can apply its own
+authorization policy — accept, refuse, or ignore — instead of the transport
+deciding by silence.
+
+Recording still happens first and is unconditional: it is what admits the
+application messages that follow (§7.2.2 with §3.6), and it grants nothing.
+
+A recording **failure** is still not surfaced. A message a protocol rule
+refused — a cancellation for a relationship we do not hold, or the losing side
+of the §7.2.3 invite race — has no relationship for a consumer to decide about,
+and answering it would reply to a message TSP has already discarded.
+
+**Behavioural change (R3.6), shipped as a patch.** A consumer subscribed to the
+inbound stream now sees frames it never saw before: `Protocol::TSP` messages
+with an empty payload and `kind = RelationshipControl`. A consumer that routes
+on `kind` (or on `is_relationship_control()`) is unaffected; one that assumes
+every TSP frame is a binding envelope will fail to parse it and should skip it,
+which is what `vta-sdk`'s TSP pump already does by design. The patch level is
+forced by the same redirect constraint as `affinidi-messaging-core` 0.1.8 —
+`vta-sdk` 0.40.0 requires `^0.26`.
+
+0.26.2 typed the SDK's own HTTP calls, but two paths still flattened a status
+to text: authenticating to the mediator (`DIDAuthError` became
+`ATMError::AuthenticationError(String)`) and `DidCommTransport`, which wrapped
+every ATM error as `MessagingError::Transport(String)` on its way through
+`MessagingService`.
+
+### Added
+
+- `ATMError::DIDAuth(Box<DIDAuthError>)`. Its Display is the same
+  `Authentication error: …` as `AuthenticationError`.
+- `ATMError::http_status()` / `is_rate_limited()` now also see an HTTP status
+  inside `ATMError::DIDAuth` — including behind the retry loop's
+  `DIDAuthError::RetriesExhausted`.
+
+### Changed
+
+- `HttpStatusError` moved to `affinidi-messaging-core` 0.1.7 and is re-exported
+  here as `affinidi_messaging_sdk::errors::HttpStatusError`; same fields and
+  methods. It now parses an HTTP-date `Retry-After` too (a past date is `0`).
+- **BEHAVIOUR:** `From<DIDAuthError> for ATMError` produces
+  `ATMError::DIDAuth`, not `ATMError::AuthenticationError(String)`. Nothing in
+  this workspace matched the old variant for these errors;
+  `AuthenticationError(String)` itself remains.
+- **BEHAVIOUR:** `TspAuthHandler` turns a non-success `/challenge` or
+  `/tsp/authenticate` response into `DIDAuthError::HttpStatus` (was
+  `DIDAuthError::Authentication(String)`).
+- **BEHAVIOUR:** `DidCommTransport::{send, ack, outbox_message_ids}` return
+  `MessagingError::HttpStatus` when the underlying `ATMError` carries an HTTP
+  status (a send, or the authentication in front of it); its `context` is
+  prefixed with what the adapter was doing (e.g. `didcomm forward+send failed:
+  send DIDComm message`). Any other failure is still
+  `MessagingError::Transport`.
+- Requires `affinidi-messaging-core` 0.1.7 and `affinidi-did-authentication`
+  0.3.13.
+
+## Unreleased (0.26.2) — an HTTP status is data, and a `429` says who sent it
+
+A non-success HTTP response used to reach the caller as
+`ATMError::TransportError(String)`, the status buried in text. A caller could
+not tell the mediator rate-limiting it from a proxy doing so, or either from a
+mediator fault, without parsing the message.
+
+### Added
+
+- `ATMError::HttpStatus(Box<HttpStatusError>)` (boxed so every
+  `Result<_, ATMError>` does not grow). `HttpStatusError` is
+  `#[non_exhaustive]` and carries `context`, `url`, `status`,
+  `rate_limit_source` (the `x-rate-limit-source` header), `retry_after_secs`
+  (a delta-seconds `Retry-After`) and `body`. Build one with `new` /
+  `from_parts` / `with_url`.
+- `ATMError::is_rate_limited()`, `ATMError::http_status()`,
+  `HttpStatusError::is_rate_limited()` and `HttpStatusError::retry_after()`.
+
+  ```rust
+  match atm.send_message(&profile, &packed, &msg_id, false, false).await {
+      Err(err) if err.is_rate_limited() => {
+          let status = err.http_status().unwrap();
+          // status.rate_limit_source: Some("mediator"), or None when a proxy
+          // (or a mediator older than 0.26.1) refused without labelling it.
+          // status.retry_after_secs: how long to wait.
+      }
+      _ => {}
+  }
+  ```
+
+  If the headers are missing but the body is the contract's
+  `{"error":"rate_limited",…}`, its `limiter` and `retryAfterSecs` are used.
+  No other body is read for attribution.
+
+### Changed
+
+- **BEHAVIOUR:** these failures are now `ATMError::HttpStatus` instead of
+  `ATMError::TransportError`:
+  - DIDComm send (`POST /inbound`) and TSP send (`TspOps::send_raw`);
+  - the websocket upgrade, when the mediator answers it with an HTTP status;
+  - `list_messages`, `fetch_messages`, `get_messages`, `delete_messages`;
+  - OOB invitation create / retrieve / delete, and the mediator's
+    `/.well-known/did`.
+
+  A `match` on `TransportError` stops matching these. `ATMError` is
+  `#[non_exhaustive]`, so nothing stops compiling; patch bump per ADR 0003.
+  The text still starts `Transport (HTTP(S)) error:` but otherwise differs,
+  e.g. `send DIDComm message: rate-limited by mediator (HTTP 429, retry after
+  4s), url(…), body(…)`.
+- The websocket reconnect waits at least as long as a refused upgrade's
+  `Retry-After` asked (within the existing 60s cap). A shorter wait is a
+  reconnect the limiter will refuse again.
+- `reqwest` is no longer optional. It was already in every build through
+  `affinidi-tdk-common`, whose client the SDK uses; the SDK now names its
+  response type. The `tsp` feature is unchanged.
+
+### Fixed
+
+- `well_known_did` parsed the body with `unwrap()` **before** checking the
+  status, so any non-JSON error body panicked. That included the mediator's
+  plain-text `429`. It now checks the status first and returns a parse failure
+  as an error.
+
+### Not typed yet
+
+- **Authentication.** `/authenticate/challenge`, `/authenticate` and
+  `/tsp/authenticate` go through `affinidi-did-authentication`, which reports a
+  status as `DIDAuthError::Authentication(String)`, which becomes
+  `ATMError::AuthenticationError(String)`. That crate's retry loop also swaps
+  the last error for "Maximum number of authentication retries reached", so the
+  status is lost twice. Fixing this needs a change to that crate.
+- **HTTP-date `Retry-After`** is not parsed. The mediator sends seconds.
+
+## Unreleased (0.26.1) — inbound TSP control messages are recorded
+
+A **patch** rather than a minor: no signature moves, and nothing that worked
+before stops working. What changes is that something which never worked now
+does.
+
+`transport_adapter::tsp_to_inbound` used `unpack`, which returns
+`(payload, sender)` and cannot say what kind of message arrived. So a TSP
+control message — invite, accept, cancellation — was handed to the consumer as
+application data it could only fail to parse, and `record_incoming_control` was
+never called. No relationship was ever recorded, so §7.2.2 discarded every
+application message that followed: the endpoint went quiet, and since §7.2.2
+drops rather than refuses, it said nothing about why.
+
+Recording is the whole fix. `RelationshipState::admits_application_message` is
+true for **any** recorded relationship, not only a completed one, so nothing has
+to accept for traffic to flow.
+
+Also: padding and `XCTL` are handled by name instead of reaching the consumer as
+application data, and both are released from the mediator — "discard silently"
+(§9.4) means not answering the peer, not leaving the frame to be redelivered on
+every reconnect for ever.
+
+Deciding whether to *accept* an invite still belongs above this layer and is not
+yet surfaced; that needs `Inbound` to carry a message kind, which is a breaking
+change to `affinidi-messaging-core`.
+
+## Unreleased (0.26.0) — `trust-tasks-rs` 0.21
+
+Breaking, and by public dependency rather than by anything in this crate's own
+source. `trust_tasks_rs` types appear in this SDK's public API — `MediatorAcl`
+on `account_update` is the one a consumer hits first — so a consumer resolving
+0.20 beside this crate's 0.21 gets `expected MediatorAcl, found a different
+MediatorAcl`, at every such call site.
+
+That class of break is invisible to cargo-semver-checks: no signature in this
+crate moves. It takes a minor because of what a consumer observes, not because
+a tool reported it.
+
+`trust-tasks` 0.21.0 is the release carrying the TSP binding's move to
+`affinidi-tsp` 0.2 (Rev 3). Nothing downstream can take Rev 3 while this family
+still pins 0.20.
+
+## Unreleased (0.25.0) — TSP Rev 3
+
+Requires `affinidi-tsp` 0.2. **See that crate's changelog first: the wire format
+changed and there is no Rev 2 compatibility.** Everything here follows from it.
+
+- **`unpack_message` returns `InboundTsp`**, an enum separating an application
+  payload from a control message, rather than a payload alone. A caller that
+  ignored control messages was silently dropping the relationship handshake.
+- **Relationship state is enforced, not just recorded.** `RelationshipStore`
+  gains `thread_digests` / `set_thread_digests` / `reply_path` / `set_reply_path`,
+  all defaulted, so an existing implementation still compiles — but one that does
+  not override them keeps no digest, and so loses the §7.2.3 invite-race tiebreak
+  and recognises any cancellation.
+- New: `form_relationship_routed` (§7.2.4, an invite that asks for its accept
+  over a route), and `form_parallel_relationship` /
+  `accept_parallel_relationship` / `record_parallel_accept` (§7.2.5,
+  introducing a VID over a relationship that already exists).
+- **§7.4.2 key-state freshness is applied on every unpack**, driven by
+  `ATMConfig::with_tsp_key_state_policy`. A peer's VID is re-resolved when an
+  unpack fails against the key state we hold, and after the peer has been
+  silent longer than the policy's threshold, rate-limited so a failing peer
+  cannot drive resolution traffic. No new public call: `unpack`,
+  `unpack_message` and `unpack_control` all go through it.
+- **`InboundTsp` gains `Padding` and `UpperLayerControl`, and is
+  `#[non_exhaustive]`.** Two of Rev 3's payload types were arriving as ordinary
+  application messages, because neither carries a relationship `ControlMessage`
+  and that was the only thing the dispatch looked at:
+
+  - `XPAD`, a padding-only message, reached the application as an *empty
+    message from a contact*. §9.4 says "the receiver SHOULD silently discard
+    padding messages", and it exists to make traffic analysis harder — so
+    delivering it is worse than not sending it. Now reported as `Padding` and
+    dropped; it is named rather than swallowed so a caller can still clear it
+    from the mailbox.
+  - `XCTL`, an upper-layer control message, was indistinguishable from `XSCS`.
+    The two travel identically and TSP interprets neither; the separate type
+    code exists only to say the sender meant it as control for the layer above,
+    which collapsing them discarded.
+
+  `unpack`/`unpack_bytes` now refuse a padding message rather than return an
+  empty `Vec` that looks like a real message with no content — that signature
+  has no way to express the distinction, and `unpack_message` does.
+
+- **New `send_padding` and `send_generic_control`.** `affinidi-tsp` could pack
+  both, but nothing in the SDK sent them, so the traffic-shaping countermeasure
+  and the upper-layer control channel were unreachable through the client. The
+  first also covers §7.4.3: an endpoint that rotated after a suspected
+  compromise sends padding to each peer, because "a peer holding stale key state
+  will fail to verify it and will therefore obtain the new key state, whereas a
+  peer that receives nothing has no occasion to".
+
+- **Five problem codes are retired** in favour of a single uniform refusal — see
+  the mediator changelog for the list and the reasoning. A consumer matching on
+  any of them will stop matching.
+
+## Unreleased (0.24.0) — `trust-tasks-rs` 0.20
+
+- Bumps `trust-tasks-rs` 0.19 → 0.20. **No source change** — only manifests.
+  0.20 is additive for everything this crate uses: its one breaking change is a
+  `process-attestation` schema tightening (digest floor 16 → 43 base64url
+  characters, a category correction, a dropped duplicate member), and no crate
+  in this workspace references that spec.
+- **Breaking for consumers, for the same reason as every previous
+  `trust-tasks-rs` move here.** This crate's public API carries generated types —
+  `TrustTasks::account_update` takes an `account::update::v0_1::MediatorAcl` and
+  returns an `account::update::v0_1::Account` — so the dependency is a *public*
+  one. A consumer must move to 0.20 in the same change: two `trust-tasks-rs`
+  versions in one graph do not warn, they fail with `expected MediatorAcl, found
+  a different MediatorAcl`.
+- That failure is why this bump exists. `verifiable-trust-infrastructure` needs
+  0.20.1 for `vta/contexts/secrets/1.0` and could not reach it while this crate
+  required ^0.19.
+
+## Unreleased (0.22.0) — `trust-tasks-rs` 0.18
+
+- Bumps `trust-tasks-rs` 0.17 → 0.18. No source change: 0.18.0 carries exactly
+  one upstream change (trustoverip/dtgwg-trust-tasks-tf#370, retyping the
+  `resolved` array of `persona/profile/get/1.0`), and this crate does not touch
+  the persona family.
+- **Breaking for consumers, for the same reason as 0.21.0.** This crate's public
+  API carries generated types — `TrustTasks::account_update` takes an
+  `account::update::v0_1::MediatorAcl` and returns an
+  `account::update::v0_1::Account` — so the dependency is a *public* one. A
+  consumer must move to 0.18 in the same change: two `trust-tasks-rs` versions
+  in one graph do not warn, they fail with `expected MediatorAcl, found a
+  different MediatorAcl`.
+- That failure is why this bump exists. `vta-sdk` could not reach 0.18 while
+  this crate required ^0.17.
+
+## Unreleased (0.21.1) — a mediated peer is TSP-capable
+
+- `TspOps::select_protocol` decided "does this peer speak TSP" with
+  `!ResolvedVid::endpoints.is_empty()`. With `affinidi-tsp` 0.1.15 that list
+  holds only direct transport URLs, and a *mediated* peer — whose `TSPTransport`
+  service names its mediator's DID — publishes none, so it would have read as
+  "no TSP" for exactly the peers TSP reaches through a mediator. Now uses
+  `ResolvedVid::advertises_tsp()`, which covers both shapes.
+- No behaviour change for an unmediated peer, and none under a fresh cached
+  capability or a completed relationship (both settle before the resolve).
+
+## Unreleased (0.21.0) — `trust-tasks-rs` 0.17
+
+- Bumps `trust-tasks-rs` 0.12 → 0.17.
+- **Breaking for consumers.** 0.17 marks the generated payload, response and
+  component types `#[non_exhaustive]`. This crate's public API carries them —
+  `TrustTasks::account_update` takes an `account::update::v0_1::MediatorAcl` —
+  so a consumer that builds one with a struct literal, with or without
+  `..Default::default()`, no longer compiles and must use the generated
+  builder. A consumer must also move to 0.17 in the same change: two
+  `trust-tasks-rs` versions in one graph do not merely warn, they fail with
+  `expected MediatorAcl, found a different MediatorAcl`.
+- The twelve payload constructions in `protocols/trust_tasks.rs` moved to
+  builders behind one `payload()` helper. No wire change and no behaviour
+  change: the same members are set, and the only new failure mode is a
+  builder left missing a required member, which every call site sets.
+
+## Unreleased (0.20.0) — `trust-tasks-rs` 0.12
+
+- Bumps `trust-tasks-rs` 0.11 → 0.12.
+- **Breaking for consumers, despite no source change here.** This crate's
+  public API carries `trust-tasks-rs` types — `TrustTasks::account_update`
+  takes an `account::update::v0_1::MediatorAcl` — so a consumer must move to
+  0.12 in the same change. Two `trust-tasks-rs` versions in one graph do not
+  merely warn; they fail to compile with `expected MediatorAcl, found a
+  different MediatorAcl`.
+- No behaviour change in this crate.
+## Unreleased (0.19.12) — dependency refresh
+
+- Bumps `base64` 0.22 → 0.23.
+- Bumps `tokio-tungstenite` 0.29 → 0.30.
+- No source or API change; the bumps are declaration-only and the crate
+  compiles unmodified against them. Bumped workspace-wide in the same
+  change so no two versions of these crates are compiled side by side.
+
+## Unreleased (0.19.11) — drop the unmaintained `rustls-pemfile`
+
+- SSL certificate loading in `config.rs` now parses PEM with
+  `CertificateDer::pem_reader_iter` from `rustls-pki-types`, which `rustls`
+  already re-exports as `rustls::pki_types`. The `rustls-pemfile` dependency is
+  removed; it is archived and unmaintained (RUSTSEC-2025-0134), and its final
+  release is a thin wrapper over exactly this code.
+- No new dependency and no behaviour change: the same certificates parse into
+  the same `CertificateDer` values.
+
+## [0.19.10] - 2026-08-22
+
+### Fixed
+
+- **The websocket close frame is no longer discarded.** It was matched as
+  `Message::Close(_)` and answered with
+  `debug!("WebSocket connection closed by server")`, so the mediator's only
+  chance to say *why* it closed a socket was dropped on the floor.
+
+  That is the client half of the mediator's 0.18.21 fix, and without it that fix
+  would be inert: a deliberately refused connection was indistinguishable from a
+  dropped one, so the reconnect loop simply ran again. Two app instances sharing
+  a DID duelled indefinitely and the user was shown a network error.
+
+  The close code and reason are now logged at **WARN**. A server that closed us
+  on purpose is the one disconnect an operator needs to see, and the text is the
+  difference between "check your network" and "you have this open twice".
+
+  Reconnect behaviour is unchanged.
+
+## [0.19.9] - 2026-08-19
+
+### Changed
+
+- **Track `trust-tasks-rs` 0.11.0**, up from 0.9.0. Both releases in between are
+  additive — new task families, no change to any type this crate uses — so
+  nothing here had to move but the requirement:
+
+  - **0.10.0** added the `vta/contexts/*` and `vta/webvh/*` families (the
+    did:webvh lifecycle: DIDs, hosting servers, agent names) and the eight
+    `vta/services/*` families that supersede a VTA's `/services/*` REST routes.
+  - **0.11.0** corrected two of those `vta/services/*` schemas after writing the
+    handlers found them unable to express the operation: rollback can
+    legitimately publish no log entry, and disable takes a drain window the
+    agent may refuse to honour.
+
+  The reason to take it here is that a VTA cannot: `vta-sdk` must speak the same
+  `trust-tasks-rs` these crates do, because `acl_setup` builds a `MediatorAcl`
+  and hands it to `TrustTasks::account_update`. Two semver-incompatible copies
+  make that a type error, so the VTA stays on 0.9 until this workspace moves.
+
+
+## [0.19.8] - 2026-08-17
+
+### Changed
+
+- **Track `trust-tasks-rs` 0.9.0**, up from 0.6.1. Three breaking releases sit
+  in between, none of which reaches this crate's source:
+
+  - **0.7.0** made `StandardCode` `#[non_exhaustive]`. Nothing here matches on
+    it, so no arm had to be added — and this is the last time a new framework
+    error code will break a downstream `match`.
+  - **0.8.0** added `StandardCode::Cancelled` and the `trust-task-control/0.1`
+    payloads, and moved emitted error documents to `trust-task-error/0.5`.
+    Additive on the Rust side because of the attribute above.
+  - **0.9.0** gave `consume_inbound` a required `PayloadPolicy` argument
+    (SPEC.md §7.2 item 2) and replaced `ValidatedPayload::SCHEMA_JSON` with
+    `Payload::PAYLOAD_SCHEMA`. This crate calls neither: it builds documents
+    through `TrustTask::for_payload` / `respond_with` and decodes replies
+    directly, so only the version requirement moved.
+
+  The `v0_1` payload types the `trust_tasks()` surface returns — `ping`,
+  `account`, `acl`, `access_list`, `audit`, `config` — are shape-identical
+  across the move. What changes is which crate version provides them.
+
+  It ships as a patch rather than a minor, for the reason 0.19.2 and 0.19.7
+  both give: consumers require `affinidi-messaging-sdk` `^0.19` and resolve it
+  from the registry, so a 0.20 would pull a second registry copy of this crate
+  into their graphs — the exact defect this bump exists to remove, relocated one
+  crate over. The cost is unchanged and still worth stating: `trust-tasks-rs` is
+  a public dependency of the `trust_tasks()` surface, so this is
+  **source-breaking for a consumer still on `trust-tasks-rs` 0.6.x** despite the
+  patch version. Move that pin in the same change.
+
+## [0.19.7] - 2026-08-14
+
+### Changed
+
+- **Track `trust-tasks-rs` 0.6.1**, up from 0.4.0. Two breaking releases sit in
+  between. 0.5.0 added an optional `ceremony` member to the `TrustTask<P>`
+  envelope, which breaks struct-literal construction and exhaustive
+  destructuring but nothing else. 0.6.0 narrowed `DigestMultibase` to the two
+  multibase headers W3C Controlled Identifiers 1.0 §2.4 normatively requires —
+  `z` (base58btc) and `u` (base64url-no-pad) — and enforces each alphabet
+  rather than assuming it, so values previously accepted (base32, base16,
+  base64pad, and strings that were never valid base58) now fail to parse.
+
+  Neither reaches this crate: documents are built through
+  `TrustTask::for_payload` / `respond_with` rather than by struct literal, and
+  no source changed beyond the version requirement.
+
+  It ships as a patch rather than a minor, for the reason 0.19.2 gives: consumers
+  require `affinidi-messaging-sdk` `^0.19` and resolve it from the registry, and
+  a 0.20 would pull a second registry copy of this crate into their graphs. The
+  cost is that `trust-tasks-rs` is a public dependency of the `trust_tasks()`
+  surface, so this is **source-breaking for a consumer still on `trust-tasks-rs`
+  0.4.x or 0.5.x** despite the patch version.
+
+## [0.19.6] - 2026-08-14
+
+### Fixed
+
+- **A torn-down profile no longer spins the inbound stream forever.** The
+  inbound poll loop treated every error as transient, backed off 500ms and
+  retried — for the life of the process. That is right for a socket
+  reconnecting, but `ATMError::ProfileError` means the profile has no mediator,
+  or its `ws_channel_tx` slot is empty, and that slot is only ever emptied by an
+  explicit teardown (`stop_websocket` / `cleanup_failed_websocket`). A reconnect
+  happens *inside* the transport task and keeps the same command sender, so
+  nothing short of a fresh `profile_enable_websocket` can refill it — and that
+  installs a new transport with a new stream anyway.
+
+  The result was a 2Hz poll against a transport that would never come back, each
+  attempt logging `WebSocket channel not set for profile <did>`: roughly 172,000
+  warnings a day, per leaked profile, drowning every other line in the log.
+  Observed in the trust registry, whose startup fetches its identity from a VTA
+  over an ephemeral `did:key` session; the session is shut down when the fetch
+  completes, and its inbound stream outlived it.
+
+  A terminal error now ends the stream. The delivery layer's forwarder task
+  (`while let Some(item) = stream.next()`) retires cleanly when it does, so the
+  dead transport stops pumping while every other transport is unaffected.
+
+- **An inbound TSP frame that cannot be unpacked is now deleted instead of being
+  redelivered forever.** This stream polls with `auto_delete = false`, so the
+  mediator holds its copy until the consumer acks after a durable handoff. But a
+  frame that fails to unpack never becomes an `Inbound`, so it never reaches the
+  delivery layer that would ack it — and the ack handle was computed and then
+  dropped on the floor. Every reconnect and every restart redelivered it, so one
+  sender whose DID no longer resolves became a permanent boot-time error on the
+  receiving node, indefinitely.
+
+  Unpack failures are now classified the way the trust registry classifies the
+  same failure, so both ends of a TSP hop agree on what "transient" means: a
+  resolution or network fault is retried in-process (3 attempts, 200ms doubling
+  to 800ms) rather than costing a frame we still hold, while bytes that can
+  never decrypt or parse are not retried at all. A frame that exhausts the
+  budget — or that was poison to begin with — is deleted from the mediator and
+  logged at error level with the frame id.
+
+  The retry budget is deliberately tight because the inbound stream is
+  sequential: every retry stalls all other inbound traffic for that profile. The
+  tradeoff is stated plainly at the call site — a resolver outage lasting longer
+  than the budget will discard a frame that would have been valid, which is why
+  the delete is an auditable error line rather than a silent drop.
+
+## [0.19.5] - 2026-08-11
+
+### Fixed
+
+- **A TSP frame now names itself in a build without the `tsp` feature, instead
+  of surfacing as a JSON parse error.** Recognising a TSP frame and processing
+  one are different jobs, but classification lived behind the `tsp` feature
+  alongside the machinery. A build without it therefore did not merely fail to
+  *handle* a TSP frame — it failed to *recognise* one, handed the CESR bytes to
+  the DIDComm unpacker, and reported
+
+  ```text
+  Error unpacking message: DidcommError("Cannot parse message as JSON",
+  "invalid number at line 1 column 2")
+  ```
+
+  CESR qb64 opens with `-`, which `serde_json` reads as the start of a number,
+  hence the column-2 failure. Nothing in that message names TSP, names the
+  missing feature, or suggests the frame was well-formed and simply unreadable
+  by this build.
+
+  This was found downstream: a VTC advertising `#tsp` in its DID document, built
+  without the feature, accepted every community join and recorded none. Senders
+  saw success — the frames were delivered, just never decoded.
+
+  Two `#[cfg(not(feature = "tsp"))]` warnings written for exactly this case could
+  never fire, because both sit *downstream* of classification —
+  `transport_adapter::tsp_to_inbound`'s fallback is reached only after a frame
+  has been tagged TSP, which was the gated step. Its doc comment read "a
+  DIDComm-only build never advertises TSP, so this is unreachable in practice";
+  a build does not control what its operator's DID document advertises.
+
+  Classification now lives in the new `tsp_wire` module and is compiled into
+  **every** build — it inspects one leading byte and needs no TSP machinery.
+  Unpacking still requires the feature; the difference is that a build lacking
+  it now says so by name. Three paths improve:
+
+  - the live websocket transport tags the frame as packed rather than feeding it
+    to the DIDComm unpacker;
+  - `transport_adapter::tsp_to_inbound`'s non-`tsp` arm is now reachable and
+    logs at ERROR, naming the transport, why this build cannot read it, and both
+    remedies (rebuild with `--features tsp`, or stop advertising `TSPTransport`);
+  - the DIDComm-only pickup path (`_handle_delivery`) identifies a TSP
+    attachment and purges it as undeliverable-by-name, rather than as a failed
+    DIDComm unpack.
+
+  No behaviour change for a build **with** `tsp`: classification is byte-for-byte
+  the same test, and `TspOps::is_tsp` now delegates to the shared implementation
+  so the gated and ungated answers cannot disagree. `tsp_wire::TSP_MAGIC_BYTE`
+  is pinned to `affinidi_tsp::TSP_MAGIC_BYTE` by a test that compiles under the
+  feature, and a second test asserts the two classifiers agree on real frames, so
+  the copy cannot drift.
+
+  The regression guard is
+  `transports::websockets::websocket::tests::a_tsp_frame_is_delivered_packed_in_every_build`,
+  which compiles in **every** feature configuration. Re-introducing a
+  `#[cfg(feature = "tsp")]` around the classification fails the default build —
+  verified by mutation. Notably, that same mutation still *passes* with `tsp`
+  enabled, which is exactly how the original defect survived: every TSP-focused
+  test run has the feature on, so no existing test could have caught it.
+
+### Added
+
+- `tsp_wire::{looks_like_tsp, TSP_MAGIC_BYTE}`, re-exported at the crate root.
+  Lets any consumer — including one built without `tsp` — tell a TSP frame from
+  a DIDComm one without pulling in the TSP stack.
+
+## [0.19.4] - 2026-08-10
+
+### Fixed
+
+- **A poll in flight no longer blocks `stop_websocket`, so shutdown is prompt.**
+  The four `live_stream_next*` entry points in `message_pickup` took a **read**
+  guard on `Mediator::ws_channel_tx` to get the command sender and then held it
+  across the wait for a frame. `stop_websocket` takes the **write** guard on that
+  same lock, so any teardown with a poll parked had to wait the poll out.
+
+  For the delivery layer that is `INBOUND_POLL_WAIT`, 10 seconds — its inbound
+  pump issues a read-ahead after every frame, so a consumer whose work finished
+  mid-window paid the remainder on exit. A CLI felt this as a fixed pause after
+  every command: the result printed, then up to 10s of nothing before the process
+  left. For a `wait: None` caller it was worse — that sleep is `Duration::MAX`,
+  so the read guard was held until a frame arrived, and a shutdown could block
+  indefinitely.
+
+  The sender is now cloned out and the guard dropped before the wait. `mpsc::Sender`
+  is `Clone`, so this costs nothing and the poll behaves identically; only the
+  lock is released earlier. No API change.
+
+  Covered by `profiles::tests::a_poll_in_flight_does_not_block_stop_websocket`,
+  which parks a 120s poll and asserts `stop_websocket` still returns within 2s.
+
+## [0.19.3] - 2026-08-09
+
+### Changed
+
+- **Tracks `trust-tasks-rs` 0.4.0 (was 0.2.46). Source-breaking for a consumer
+  that also depends on `trust-tasks-rs` 0.2.x, despite the patch version.**
+  `atm.trust_tasks()` returns `trust_tasks_rs` types — `TrustTask<R>`,
+  `account::update::v0_1::MediatorAcl`, `audit::list::v0_1::Response` and the
+  rest — so `trust-tasks-rs` is a *public* dependency of this crate's API.
+  Crossing its leading version component changes those types' identity: a caller
+  still on 0.2.x gets `E0308` at the call site, not a deprecation warning.
+
+  It ships as a patch because it cannot ship as a minor. `vta-sdk` requires
+  `affinidi-messaging-sdk = "0.19"` and resolves it from the registry (it
+  deliberately keeps no `[patch.crates-io]`), and this workspace's own mediator
+  depends on `vta-sdk`. A 0.20 would therefore pull a *second*, registry copy of
+  this crate into the mediator's graph alongside the workspace one — the ADR
+  0003 trap. Update in lockstep instead: a consumer moves its own
+  `trust-tasks-rs` requirement to `0.4` in the same change that takes this
+  version.
+
+- Nothing in this crate is affected by the framework's own breaking changes.
+  `TrustTask` gained `parentThreadId` and `ErrorPayload` gained `inResponseTo`,
+  both of which only break struct-literal construction — this crate builds
+  documents through `TrustTask::for_payload` / `respond_with`. The digest-carrying
+  members that became the `DigestMultibase` newtype (`audit`, `chat`, `consent`,
+  `policy`, `task-consent`) are not constructed here. `decode_body` deserialises
+  whatever the mediator returns without asserting a Type URI, so an older peer's
+  documents still parse.
+
+- No wire-format change from this crate. `parentThreadId` is optional and
+  omitted when unset, so a request this SDK sends is byte-identical to 0.19.2's
+  unless the caller populates it.
+
+## [0.19.2] - 2026-08-08
+
+Dependency-pin bump only; no API or behaviour change.
+
+- Track `affinidi-messaging-core` 0.1.6, which adds `Protocol::DIDCommV1` for
+  the new `affinidi-messaging-didcomm-v1` crate and makes `Protocol`
+  `#[non_exhaustive]`. This crate's exact-patch pin has to move in lockstep.
+  Nothing here matches on `Protocol`, so no code changed.
+
+## [0.19.1] - 2026-08-07
+
+Follow-ups to the AgenticSec review of #671. No API change.
+
+### Security
+
+- **Unsupported signer curves are no longer retried forever (DoS / liveness).**
+  `resolve_verify_key` returned a bare `Option`, collapsing two failures with
+  opposite retry semantics: *the DID did not resolve* (transient — the network
+  or registry may recover) and *the DID resolved but carries no key this build
+  can verify with* (deterministic — e.g. a P-384 or P-521 signer, which fails
+  identically forever). Both surfaced as the retryable `ATMError::DidcommError`,
+  so the message-pickup drain re-queued the deterministic case on **every**
+  pickup cycle — the same poison-loop the `VerificationFailed` split fixed for
+  bad signatures, still present on this path. The two arms are now distinct: an
+  unusable key yields `ATMError::VerificationFailed` (purged), an unresolvable
+  DID stays `ATMError::DidcommError` (retried).
+
+- **The authoritative signature is resolved first (resolution-amplification
+  reduction).** Under the default policy a signed message is accepted only if a
+  *verified* signer matches the inner `from`, so if that signature fails the
+  message is rejected regardless of the others — and every resolution spent on
+  the others was attacker-directed outbound work for nothing. Signatures whose
+  `kid` matches `from` are now visited first, so a message stuffed with
+  signatures costs **one** DID resolution instead of `max_signatures` before
+  rejection. This reorders *resolution*, not semantics: every signature within
+  the cap is still visited and the same signers are recorded.
+
+  This **reduces** the amplification ceiling, it does not remove it. A single
+  frame can still drive resolutions across its crypto layers and forward hops
+  (`MAX_CRYPTO_LAYERS + MAX_FORWARD_DEPTH`); those are legitimate for a real
+  multi-hop message and cannot be cut without changing routing behaviour. Making
+  the budget operator-configurable would require adding a field to the public
+  `UnpackPolicy`, which is breaking — deliberately deferred rather than bundled
+  into a security patch.
+
+- **Tolerated signatures are no longer silent.** With
+  `allow_invalid_signatures` enabled, a co-signature that cannot be verified was
+  recorded in `UnpackMetadata::unverified_signers` and nothing else — an
+  application that keys authorization off co-signature validity had no signal
+  its check had been skipped. Every tolerated path now emits a `warn!` naming
+  the `kid` and the reason, and says explicitly that the signature must not be
+  treated as valid. The authoritative (`from`-matching) signature must still
+  verify under `validate_addressing_consistency`, so this remains a *visibility*
+  fix, not a policy change.
+
+## [0.19.0] - 2026-07-29
+
+> **BREAKING CHANGE.** `atm.unpack` now rejects non-authenticated envelopes by
+> default — it accepts only the authenticated-encryption wrappings
+> `authcrypt(plaintext)`, `authcrypt(sign(plaintext))` and
+> `anoncrypt(authcrypt(plaintext))`. Because the default
+> behaviour changes for every caller, this is a breaking release: the version
+> bumps `0.18 → 0.19` (a SemVer minor bump is the breaking increment for a `0.x`
+> crate). Restore the previous "accept anything" behaviour explicitly with
+> `ATMConfigBuilder::with_unpack_policy(UnpackPolicy { .. })` — see below.
+>
+> **Also breaking:** `UnpackMetadata` gains two public fields (`wrapping`,
+> `signers`), which breaks any struct-literal construction of it downstream. It
+> is now sealed with `#[non_exhaustive]`, so future field additions will *not*
+> be breaking — external code should read its (public) fields rather than
+> construct it, and use `UnpackMetadata::default()` + field assignment if it
+> ever needs to build one.
+
+### Rollout across the VTI ecosystem (R3.6)
+
+Publishing `0.19.0` does **not** by itself deliver this fix to the services that
+depend on it — a `^0.18` requirement will not resolve to `0.19`. Each consuming
+repo has to move its pin deliberately. Pins as observed at the time of writing:
+
+| Repo / crate | How it depends | Picks up `0.19` automatically? |
+| --- | --- | --- |
+| `verifiable-trust-infrastructure` → `vta-sdk` | `affinidi-messaging-sdk = "0.18"` (direct, optional) | **No** — needs an explicit bump |
+| `affinidi-trust-registry-rs` | `affinidi-messaging-sdk = "0.18"` (workspace) | **No** — needs an explicit bump |
+| `verifiable-trust-infrastructure` (workspace) | `affinidi-tdk = "0.8"` | ⚠️ **Yes, silently** — via `affinidi-tdk` 0.8.5, a *patch* |
+| `affinidi-webvh-service` | `affinidi-tdk = "0.8"` | ⚠️ **Yes, silently** — same |
+| `vti-push-gateway` | `affinidi-tdk = "0.7"` | **No** — two minors behind the facade |
+| `cierge` | `vta-sdk = "0.20.25"` (transitive) | Only once `vta-sdk` bumps |
+| `vti-message-bridge` | `vta-sdk = "0.18"` (transitive) | Only once `vta-sdk` bumps |
+
+**⚠️ The facade delivers this break as a *patch*.** `affinidi-tdk` re-exports
+this crate wholesale (`pub use affinidi_messaging_sdk as messaging;`, default-on
+feature), so the new acceptance policy and the sealed `UnpackMetadata` reach
+every facade consumer — and `affinidi-tdk` can only ship as **0.8.5**, not
+`0.9.0`. `vta-sdk` (external, on crates.io, depended on here via the mediator)
+pins `affinidi-tdk = "0.8"`, so a minor bump breaks our own
+`[patch.crates-io]` redirect and drags duplicate registry copies of
+`affinidi-tdk` *and* this crate into the graph. See ADR 0003 point 3 and the
+`affinidi-tdk` 0.8.5 changelog.
+
+The practical consequence for rollout: `verifiable-trust-infrastructure` and
+`affinidi-webvh-service` will pick up the new `unpack` acceptance policy on a
+routine `cargo update`, with **no version signal that anything breaking
+happened**. Do not rely on the version number to gate this — schedule those
+upgrades deliberately, and pin `affinidi-tdk = "=0.8.4"` in any repo that is not
+ready. Unblocking a real `affinidi-tdk` 0.9.0 means releasing a `vta-sdk` that
+depends on `affinidi-tdk` 0.9 first.
+
+**Sequencing matters, not just the bumps.** Once `affinidi-tdk` pulls
+`affinidi-messaging-sdk` 0.19 while a `^0.18` direct pin resolves to 0.18.x, any
+graph holding both (e.g. `verifiable-trust-infrastructure`, which depends on
+`affinidi-tdk` *and* on `vta-sdk`) links **two copies of the SDK** and the
+`ATMConfig` / `UnpackMetadata` types stop unifying. Move `vta-sdk` and
+`affinidi-trust-registry-rs` in the same cascade as the facade, and re-resolve
+lockfiles afterwards — publishing an upgrade is not the same as consuming it.
+
+**Do senders pack authcrypt today?** Verified for the main path: `vta-sdk`'s
+session transport packs with `pack_encrypted(&msg, vta_did, Some(client_did), …)`
+(authcrypt), and the VTA has *required* authcrypt on `/auth/` and `/auth/refresh`
+since VTI #771, rejecting anoncrypt outright — so those senders already produce a
+wrapping the new default accepts. One caveat to confirm per deployment:
+`vta-sdk::didcomm_light` is an **anoncrypt** packer whose output is unpacked by
+`ATM::unpack`. It has no remaining in-tree caller (auth moved to `auth_di`), but
+the module is still `pub`, so any external caller still packing through it will
+start seeing `ATMError::UnexpectedEnvelope` after this upgrade. Such callers
+should move to authcrypt, or opt in explicitly with
+`with_unpack_policy(UnpackPolicy { expected: vec![MessageWrappingType::AnoncryptPlaintext, ..], .. })`.
+
+**Upgrade tip.** Pair the first deployment with
+`with_purge_policy_rejected_messages(false)` and
+`with_unprocessable_message_channel(..)` for a bounded window, so anything the
+stricter policy rejects is observable and recoverable rather than deleted from
+the mediator queue.
+
+### Changed
+
+- **`atm.unpack` is now secure by default (behavioural change).** Unpacking now
+  enforces an [`UnpackPolicy`](src/config.rs) whose default accepts only
+  authenticated encryption — `authcrypt(plaintext)`, `authcrypt(sign(plaintext))`
+  and `anoncrypt(authcrypt(plaintext))` (which additionally hides the sender key
+  id from intermediaries) — and enforces message-layer addressing
+  consistency: the inner `from` must equal the authcrypt sender key (`skid`)
+  DID (and a verified signer's DID when signed). This closes a forged-sender
+  authentication-bypass class where a message authcrypted by one key claims
+  another party's `from`. Apps that previously reconciled
+  `from`/`encrypted_from_kid` themselves can now trust `msg.from` on a returned
+  `Ok` and drop that logic.
+
+  Configure via `ATMConfigBuilder::with_unpack_policy(...)`. The policy is an
+  explicit allow-list of `MessageWrappingType` values (no `secure`/`permissive`
+  presets), so protocols expecting an unauthenticated wrapping (anoncrypt
+  receipts or signed-only notifications) list exactly what they accept. The
+  same policy governs the message-pickup delivery drain, so messages pulled via
+  pickup get the identical secure-by-default guarantees as a direct `unpack`.
+
+### Added
+
+- **Layered (double) envelope unpacking.** `unpack` now iteratively removes
+  nested cryptographic layers, so the DIDComm-defined two-layer wrappings —
+  `anoncrypt(authcrypt(plaintext))`, `authcrypt(sign(plaintext))` and
+  `anoncrypt(sign(plaintext))` — decrypt/verify end-to-end (previously only a
+  single encryption layer plus an optional inner signature was handled).
+- **Multi-signature verification.** All JWS signatures are now verified (not
+  just the first), across Ed25519 / P-256 / secp256k1 signers. Addressing
+  consistency requires a verified signer whose DID matches the inner `from`, and
+  — for an `authcrypt(sign(plaintext))` message — the authcrypt `skid` must
+  match it too, binding `from == signer == authcrypt sender`.
+- **Tolerate non-authoritative signatures (opt-in).** By default every
+  signature must verify, so a single co-signature you don't control (a missing
+  `kid`, an unresolvable signer DID, a curve this build can't handle — e.g.
+  P-384, or an invalid signature) makes the whole message undeliverable.
+  `ATMConfigBuilder::with_allow_invalid_signatures(true)` keeps unpacking such a
+  message and records the offending signers in the new
+  `UnpackMetadata::unverified_signers` list instead — the authoritative
+  (`from`-matching) signature must still verify under addressing consistency, so
+  only *supplementary* co-signatures are relaxed.
+- **`UnpackMetadata` additive fields + sealing.** New public fields —
+  `wrapping: MessageWrappingType` (the classified envelope combination),
+  `signers: Vec<String>` (every *verified* signer `kid`), and
+  `unverified_signers: Vec<String>` (signers tolerated by
+  `allow_invalid_signatures`; empty in the default strict mode). The struct is
+  now `#[non_exhaustive]`: it is a value the SDK *returns* (downstream reads it),
+  so sealing it makes future field additions non-breaking. Downstream code that
+  built it by struct literal must switch to reading it (or, if it must produce
+  one, `UnpackMetadata::default()` + field assignment).
+- **Opt-in unprocessable-message channel.**
+  `ATMConfigBuilder::with_unprocessable_message_channel(capacity)` enables a
+  broadcast channel (subscribe via `ATM::get_unprocessable_message_channel`)
+  that receives an `UnprocessableMessage { attachment_id, raw, reason }` for
+  every inbound message the SDK can't process. Concretely, a message is sent to
+  this channel when it fails to unpack for any reason — an unexpected/rejected
+  wrapping (`UnexpectedEnvelope`), an invalid signature (`VerificationFailed`),
+  an addressing mismatch (`AddressingMismatch`), too many signatures/recipients,
+  or malformed base64/UTF-8 — carrying the attachment id, the raw payload, and
+  the failure reason. All three inbound paths — the batch drain, the TSP-aware
+  `send_delivery_request_frames` drain, and live WebSocket delivery — report on
+  it *before* the message is deleted/dropped, so a consumer can observe or
+  quarantine it instead of losing it to a log line. Off by default (unchanged
+  behaviour when not configured).
+- **Configurable deletion of policy-rejected pickup messages
+  (`with_purge_policy_rejected_messages`).** The pickup drain decides deletion
+  by *recoverability*. Non-recoverable input — malformed base64/UTF-8, an
+  unsupported attachment type, or a cryptographically invalid signature
+  (`VerificationFailed`) — is **always** deleted so it can't be redelivered every
+  pickup and fill the queue. A message the *policy* rejected — a disallowed
+  wrapping (`UnexpectedEnvelope`) or an addressing mismatch
+  (`AddressingMismatch`) — is also **deleted by default**, because the mediator's
+  per-recipient queue is bounded (a fixed message limit) and a retained reject is
+  redelivered every pickup, so it would accumulate and eventually fill the queue,
+  blocking new inbound messages. Set
+  `ATMConfigBuilder::with_purge_policy_rejected_messages(false)` to *retain*
+  policy-rejected messages instead — e.g. for a bounded window during an
+  `unpack_policy` tightening/upgrade, so a message rejected only by the stricter
+  policy can be recovered by relaxing the policy (accepting that retained rejects
+  count against the queue limit). Pair with the channel above to observe what is
+  affected. (Review note: an opt-in *purge* was suggested, but the mediator's
+  bounded per-recipient queue makes delete-by-default the safe choice — so the
+  deletion stays the default and an opt-in *retain* is provided instead.)
+
+### Security
+
+- **Message pickup is now secure by default (no more `accept_all`).** The
+  delivery drain unpacks every pulled attachment under the *configured*
+  `UnpackPolicy` — the same authenticated-encryption default as `atm.unpack` —
+  instead of a permissive "accept every wrapping" policy. An unauthenticated or
+  forged-`from` message sitting in the mediator queue is no longer surfaced to
+  the application; it is rejected (and purged) exactly as a direct `unpack`
+  would reject it. This closes an authentication-bypass gap where the pickup
+  transport did not honour the app's secure policy.
+- **Unprocessable-message resistance on message pickup.** The delivery drain
+  removes messages it can never process so a crafted "poison" message can't be
+  redelivered every pickup cycle, fill the bounded queue, and stall it (or, under
+  backpressure, the mediator connection). Deletion is split by *recoverability*:
+  non-recoverable input — malformed base64/utf8, an unsupported attachment type,
+  or a cryptographically invalid signature (`VerificationFailed`) — is **always**
+  deleted; a *policy*-rejected message (a disallowed wrapping, too many
+  signatures/recipients, an addressing mismatch, a non-conformant envelope) is
+  also **deleted by default** — the mediator's per-recipient queue is bounded, so
+  a retained reject redelivered every pickup would accumulate and fill it — but
+  can be **retained** with `with_purge_policy_rejected_messages(false)` (see
+  *Added*) for a bounded window during an `unpack_policy` upgrade, so a message
+  rejected only by the stricter policy can be recovered by relaxing the policy.
+  Failures that might be *transient* (e.g. a temporarily unresolvable signer DID)
+  are always left queued for retry. All three inbound paths —
+  `send_delivery_request`, the TSP-aware `send_delivery_request_frames`, and live
+  WebSocket delivery — apply this policy and report to the opt-in
+  unprocessable-message channel before deleting/dropping.
+- **`UnpackPolicy::max_signatures` (default `5`) — bounded signature
+  verification.** The policy's signature cap is enforced *before* any signer
+  DID is resolved, so a crafted message stuffed with signature entries cannot
+  amplify (potentially networked) DID-resolution work: a JWS carrying more than
+  `max_signatures` entries is rejected with `ATMError::UnexpectedEnvelope`
+  without resolving a single key. The default accepts up to **5** signers; raise
+  it to any value your protocol expects (there is no absolute ceiling above your
+  policy) or lower it (e.g. `max_signatures: 1`) for single-signer only. Every
+  signature within the cap is fully verified.
+- **SSRF: an unprotected signer `kid` can no longer steer DID resolution.** The
+  signer `kid` selects which DID `unpack` resolves — an outbound HTTPS fetch for
+  `did:web` — and is read *before* the signature is verified. When that `kid`
+  comes from the per-signature **unprotected** header (`parse_jws`'s interop
+  fallback), it sits outside the signing input, so **any intermediary** — a
+  mediator, a relay — could rewrite it in transit without invalidating the
+  signature and redirect the fetch to a host of its choosing. That is an SSRF
+  primitive available to a party who cannot forge a signature at all, and the
+  per-message resolution budget bounded only the *count* of such fetches, not
+  their *targets*.
+
+  An unprotected `kid` is now resolved only when its DID matches the signed
+  payload's `from` — which *is* inside the signing input, so the binding cannot
+  be forged in transit. A rewritten `kid` now yields
+  `ATMError::UnexpectedEnvelope` **before any outbound request is made** (the
+  check runs ahead of the resolution-budget charge, so a refused `kid` costs zero
+  fetches). A payload with no readable `from` offers nothing to bind against, so
+  an unprotected `kid` is refused there too. A `kid` in the protected header is
+  unaffected: it is the original sender's own, integrity-protected choice, and
+  resolving a claimed sender's DID is inherent to DID messaging (authcrypt
+  resolves the `skid` identically).
+
+  This does not make `unpack` an SSRF sandbox — a sender naming its own
+  `did:web` still causes one fetch — so resolver-side host allow-listing remains
+  worthwhile as defence in depth.
+- **Per-message DID-resolution budget (DoS guard).** The wrapping allow-list is
+  necessarily enforced *after* layers are decrypted and signatures verified, and
+  each signer/sender key is a DID resolution (an outbound HTTPS fetch for
+  `did:web`). A single shared budget now spans every cryptographic layer **and**
+  every forward hop of one `unpack` (it is *not* reset per hop), so a frame that
+  is ultimately rejected can no longer drive
+  `MAX_CRYPTO_LAYERS × MAX_FORWARD_DEPTH × max_signatures` attacker-chosen
+  resolutions. The budget scales with `max_signatures` plus headroom for a
+  sender key per layer and one resolution per forward hop (default ceiling
+  `5 + 2 + 10 = 17` per frame); exceeding it fails with
+  `ATMError::UnexpectedEnvelope`.
+- **Bounded JWE recipients (DoS guard) + `UnpackPolicy::max_recipients`.** A JWE
+  layer addressing more than `max_recipients` (default `100`) recipients is
+  rejected before the recipient-matching loop — the same policy-driven bound as
+  `max_signatures`, with no separate absolute ceiling above your policy. The
+  default is deliberately permissive because a receiver is legitimately one of
+  many recipients; decryption runs the key agreement once (for the matched
+  recipient), so this bounds parse/allocation cost, not asymmetric-crypto work.
+  Lower it (e.g. `max_recipients: 1`) for stricter one-to-one deployments.
+- **Anonymous (`anoncrypt`) messages must not claim a `from`.** With addressing
+  consistency enabled (the default), a pure `anoncrypt(plaintext)` that declares
+  an inner `from` is rejected (`ATMError::AddressingMismatch`): anonymous
+  encryption carries no authenticated sender, so a `from` there is an unbacked,
+  spoofable claim. `anoncrypt(sign(plaintext))` is unaffected — the signature
+  authenticates the `from`, which is preserved under the anoncrypt wrapping.
+- **Removed the non-conformant `anoncrypt(authcrypt(sign(plaintext)))` wrapping.**
+  The DIDComm v2 spec (§IANA Media Types) explicitly states this combination
+  MUST NOT be used (`anoncrypt(sign(plaintext))` covers the same need). The
+  `MessageWrappingType::AnoncryptAuthcryptSignPlaintext` variant is removed, and
+  `unpack` now rejects the triple layering as `ATMError::UnexpectedEnvelope`.
+- **Cryptographic nesting capped at 2 layers.** No DIDComm-defined wrapping
+  nests more than two crypto layers, so `unpack` now rejects a third (or deeper)
+  JWE/JWS layer *before* removing it (`ATMError::UnexpectedEnvelope`), replacing
+  the previous depth-6 guard. This enforces the taxonomy structurally and bounds
+  decrypt/verify work against a nested-envelope DoS.
+- **Scope note — this hardens the SDK `unpack`, not the mediator's own unpack
+  path (follow-up).** The mediator authenticates callers through its separate
+  `didcomm_compat` unpack, which this release does not change, so it does *not*
+  yet enforce the new layer-ordering `UnpackPolicy` (e.g. rejecting
+  sign-outside-encrypt or repeated encryption layers). This is not a mediator
+  admin-auth bypass: mediator identity is anchored on the authcrypt sender key
+  (`skid`) proven by ECDH-1PU decryption and bound to the authenticated session
+  DID (`force_session_did_match`), with the `explicit_allow` gate rejecting
+  unknown DIDs — the plaintext `from` is only ever checked *against* that
+  cryptographic identity, never trusted on its own. Converging the mediator's
+  `didcomm_compat` path onto the same `UnpackPolicy` is a tracked follow-up so
+  both unpack paths enforce identical crypto-layer policy.
+
+## [0.18.65] - 2026-07-29
+
+### Changed
+
+- **BREAKING (`trust_tasks()` surface): the `messaging/*` Trust Task family is
+  rationalized 19 → 9 tasks** (affinidi/affinidi-tdk-rs#667, trust-tasks-rs
+  0.2.46), matching the mediator's clean cutover in 0.17.13 — the retired URIs
+  are no longer accepted server-side, so the superseded senders are removed
+  rather than deprecated:
+  - `account_update(profile, did_hash, account_type, acl, queue_limits)`
+    replaces `account_change_type`, `account_change_queue_limits`, `acl_set`,
+    `admin_add`, and `admin_strip` (one `account/update` per DID for the old
+    batched admin grant/strip).
+  - `access_list_update(profile, did_hash, clear, add, remove)` replaces
+    `access_list_add`, `access_list_remove`, and `access_list_clear`.
+  - `account_list` gains an `account_type: Option<AccountType>` role-filter
+    parameter, replacing `admin_list`.
+  - `access_list_list` gains an `entries: Option<Vec<String>>` membership-filter
+    parameter, replacing `access_list_get` (returned `entries` = the old
+    `present`; the remainder of the supplied set = the old `absent`).
+  - `audit_list(profile, cursor, page_size)` (generic `audit/list`) replaces
+    `admin_audit_log`; `config_show(profile, keys)` (generic `config/show`)
+    replaces `admin_config` (the mediator version is the `mediator.version`
+    key).
+
+## [0.18.64] - 2026-07-23
+
+### Fixed
+
+- **A slow consumer silently lost packed (TSP) frames.** The packed-frame queue
+  added in 0.18.62 sat outside the socket-read backpressure guard, so the only
+  way to honour its bound was to discard the oldest frame — and a discarded
+  packed frame is unrecoverable, because under delete-on-send the mediator drops
+  its copy the moment it writes it. A consumer that stopped polling long enough
+  lost messages outright, with a `warn!` as the only trace. Measured: 130 frames
+  sent while the consumer idled lost exactly 30 (the amount over the 100-frame
+  default limit), oldest first.
+
+  Both inbound caches now share one policy — **back-pressure, never discard**.
+  When either queue is full the select loop stops reading the socket; a consumer
+  that has stopped consuming stalls its own connection, a visible failure,
+  rather than silently losing messages. The packed queue is bounded by the same
+  count *and* byte limits as the DIDComm cache. (#655)
+
+## [0.18.63] - 2026-07-23
+
+### Added
+
+- **`connect_websocket_acked` — opt-in delete-to-ack for raw-TSP** (`tsp-ack`
+  subprotocol). The mediator sends and keeps; `TspWebSocket::ack` releases its
+  copy once you actually hold the frame. Anything un-acked when the connection
+  dies is redelivered on reconnect, so consumers **must be idempotent**. The
+  message id is derived, not transmitted — `sha256` of the stored body, which is
+  the base64url of exactly the bytes on the wire — so no protocol change was
+  needed. `is_acked()` reports what was really negotiated: a mediator predating
+  the mode echoes the client's subprotocol list unchanged, so a downgrade is
+  detected and warned about rather than silently leaving you at-most-once.
+  Plain `connect_websocket` is unchanged. (#651)
+
+### Changed
+
+- **`TspWebSocket::recv` surfaces the close reason.** A close frame is now an
+  `Err` carrying the mediator's RFC 6455 code and reason ("replaced by a newer
+  connection", "authentication token expired", "streaming task unavailable"),
+  instead of collapsing every one of them — and a socket that merely went quiet
+  — into a bare `Ok(None)`. A stream that ends with no close frame still returns
+  `Ok(None)`. (#651)
+
+## [0.18.62] - 2026-07-23
+
+### Fixed
+
+- **Packed (TSP) frames arriving between polls were dropped.** A TSP frame is
+  handed back packed and was delivered only if a `Next` request happened to be
+  outstanding at that instant or a direct channel was attached; otherwise it fell
+  off the end of the function. The DIDComm branch caches an unmatched message,
+  but the packed branch had nowhere to put one — `inbound_cache` is keyed by
+  unpacked DIDComm message id. A polling consumer always leaves a gap between one
+  poll returning and the next being registered, so this was a race it could only
+  lose. Packed frames now go to a queue that the next `Next` drains, and every
+  arm hands the frame onward rather than dropping it. (#646)
+
+## [0.18.61] - 2026-07-22
+
+### Fixed
+
+- **Reconnect backoff no longer resets on a connection that doesn't survive.**
+  `connect_delay` was zeroed the moment a socket connected and the
+  live-delivery frame was written; it only escalated on connect *failures*. A
+  socket that connects and is then closed by the mediator therefore never
+  backed off past the first step. Two clients authenticated as the same DID
+  duelling over the mediator's one-socket-per-DID slot each saw
+  "connect → success → evicted", pinning both at a ~1s reconnect loop
+  indefinitely (observed: ~40 connects/sec sustained against a production
+  mediator). A connection must now stay up for 30s — longer than the 20s
+  watchdog, so at least one ping/pong completed — before its loss earns an
+  immediate retry; anything shorter escalates 1→2→4→…→60s as a connect failure
+  always did.
+
+  **Behavioural change:** a client evicted by a duplicate session for its DID
+  now reconnects on the backoff ladder rather than instantly. Deployments
+  running a single session per DID are unaffected.
+
+- **`graceful_shutdown` now stops websockets first, and cannot hang.** The
+  Deletion Handler was stopped first, followed by an *unbounded* wait for its
+  `Exit`; the profiles' websocket transports were stopped only afterwards. A
+  handler that had already died sent no `Exit`, so shutdown could stall with
+  the websocket transports still running — and those auto-reconnect on their
+  own timer and hold the mediator's slot for the profile's DID. Callers that
+  open a session per refresh cycle accumulated orphaned, reconnecting sockets
+  this way. Websockets are now torn down first and the handler drain is bounded
+  at 5s.
+
+- **`ATMProfile::stop_websocket` clears the profile's channel slot.** It left
+  the stale `Sender` in place, so `profile_enable_websocket` saw a populated
+  slot, reported "already connected" and returned `Ok` — leaving a stopped
+  profile permanently unable to reconnect. Now idempotent, and a stopped
+  profile can be re-enabled.
+
+## [0.18.60] - 2026-07-19
+
+### Changed
+
+- Bumped the `affinidi-did-common` requirement from `"0.3"` to `"0.4"`.
+  No functional change to this crate: `Document` gained a typed
+  `also_known_as` field, which is additive.
+
+## [0.18.59] - 2026-07-18
+
+- **Fix: `DidCommTransport` dropped every inbound TSP frame** (regression in
+  0.18.58's TSP surfacing). The multiplexed pickup socket
+  (`live_stream_next_frame`) hands a TSP frame to `tsp_to_inbound` as the
+  **qb64** stored string (base64url of qb2 — `-E…` *text*), but the adapter called
+  `unpack_bytes(packed.as_bytes())`, which expects raw qb2 and so pushed the ASCII
+  `'-','E',…` bytes straight into the CESR parser — failing with `missing -E
+  envelope wrapper` and skipping the frame. Every inbound TSP message (e.g. a
+  trust-ping) was silently dropped and never answered. Now calls
+  `atm.tsp().unpack(profile, packed)`, which base64url-decodes first — matching the
+  framework listener's `dispatch_tsp`. TSP-only; the DIDComm path was unaffected.
+
+## [0.18.58] - 2026-07-17
+
+- **`DidCommTransport` now surfaces inbound TSP frames as well as DIDComm.**
+  `inbound()` polled `live_stream_next` (DIDComm-only), so a mediator that
+  multiplexes DIDComm **and** TSP to one DID (e.g. the VTA) had its inbound TSP
+  silently dropped once it moved to the delivery layer. It now polls
+  `live_stream_next_frame` and maps each `InboundFrame`: a DIDComm frame as
+  before, and a TSP frame (unpacked via `atm.tsp().unpack_bytes`, which
+  authenticates the sender VID) into a neutral `Inbound` with
+  `protocol = Protocol::TSP`, `sender` = the authenticated VID, `verified =
+  true`. The consumer routes by `message.protocol`. TSP unpacking is behind the
+  `tsp` feature (a DIDComm-only build skips a stray TSP frame rather than
+  dropping the stream). Additive; the DIDComm path and `SendReceipt`/ack
+  contract are unchanged. Unblocks the multi-protocol VTA cut-over.
+
+## [0.18.57] - 2026-07-17
+
+- **Fix `DidCommTransport::send` to actually deliver.** It called
+  `ATM::send_message`, which only pushes the packed bytes to our own mediator
+  without wrapping a DIDComm routing/2.0 `forward` envelope — so a standard
+  mediator never routes the message to the recipient and it is silently
+  undelivered. (A same-DID self-send happened to round-trip, which is why the
+  0.18.53 live check missed it.) `send` now uses `forward_and_send_message`,
+  forwarding the packed frame to `dest` (the recipient the delivery layer
+  passes) through the profile's mediator. The `SendReceipt`/`hop_id` contract is
+  unchanged, but the outbox-drain (§5a) correlation must be re-validated for a
+  forwarded frame before a `Guaranteed` flow relies on it. `dest` is no longer
+  ignored. Behavioural fix; no signature change.
+
+## [0.18.56] - 2026-07-17
+
+- **`DidCommTransport` now yields a cryptographically-authenticated sender.**
+  `to_inbound` set `ReceivedMessage.sender` from the **plaintext `from` header**
+  (sender-controlled) and `verified` from `meta.authenticated` alone — so a
+  message authcrypted with an attacker's own key but claiming a victim's `from`
+  surfaced as `sender = victim, verified = true`. Now `sender` is the DID of the
+  key that **actually** authcrypted the envelope (`encrypted_from_kid`), returned
+  only when the plaintext `from` matches it; anonymous / unauthenticated / spoofed
+  messages yield `sender = None, verified = false`. Consumers can trust
+  `sender` + `verified` for authorization without re-deriving the check.
+  **Behavioural change** (R3.6): a consumer that read `sender` off a spoofed or
+  anonymous message will now see `None`. Additive at the type level; 2 new tests
+  (spoof, anonymous) + the mapping test tightened.
+
+## [0.18.55] - 2026-07-17
+
+- **Fix a connect-path deadlock introduced by the truthful-send change in
+  0.18.52** (#611). The websocket transport's connection setup enables live
+  delivery *from the transport task itself*; since 0.18.52 that call — routed
+  through `ATM::send_message` — enqueued a `SendMessage` command into the
+  transport's **own** command channel and awaited the write-outcome reply that
+  only the (busy) transport task could produce. Every websocket connect
+  attempt therefore hung until the caller's timeout, deterministically:
+  `profile_add(_, true)` timed out at 10s, and the didcomm-service
+  `soft_restart_websocket` CI test failed on every run after 0.18.52 (it was
+  mis-filed as a flake). The live-delivery-change frame is now packed via the
+  new internal `MessagePickup::packed_live_delivery_change` and written
+  directly to the socket the setup code already holds — same message, same
+  packing, no round-trip through the command channel. `toggle_live_delivery`
+  is unchanged for external callers and still sends through the normal
+  (truthful) transport path.
+
+## [0.18.54] - 2026-07-16
+
+- `DidCommTransport` gains outbox-drain delivery evidence (D1 Phase 2, §5a):
+  `send` now returns the mediator queue-id — `sha256(packed)` — as
+  `SendReceipt::hop_id`, and `outbox_message_ids()` lists the sender's
+  `Folder::Outbox` message ids. Together they let the delivery layer confirm a
+  message `Delivered` once its hop-id **drains** from the outbox (the recipient
+  took pickup). The `hop_id = sha256(packed) = outbox msg_id` correlation and the
+  drain-on-pickup behaviour were verified live against a real mediator. Additive.
+
+## [0.18.53] - 2026-07-16
+
+- Add `DidCommTransport`, a `MessageTransport` (from `affinidi-messaging-core`)
+  implementation over the DIDComm ATM wire — the first step of the messaging
+  delivery layer (D1 Phase 2). It binds the now-conformant SDK to the
+  transport-agnostic contract:
+  - `send` maps to the truthful `ATM::send_message` (an untransmitted frame is
+    an `Err`, never a false `Ok`); the receipt is hop-acceptance, not
+    end-to-end delivery.
+  - `connection_state` hands out the profile's live `watch<ConnState>` (captured
+    at construction; tracks socket reconnects for the transport task's life).
+  - `inbound` yields undeleted messages (`live_stream_next(auto_delete = false)`)
+    as neutral `Inbound { message, thread_id, ack }`; `ack` deletes the message
+    from the mediator only after the caller's durable handoff.
+  Construct with `DidCommTransport::new(atm, profile).await` (errors if the
+  profile has no websocket transport). `async-trait` is now a normal dependency
+  (was `tsp`-feature-gated) so the trait can be implemented unconditionally.
+  Additive; no existing API changed.
+
+### Behaviour change (see note on versioning)
+
+- **Truthful websocket send (D1 conformance, R1.1).** On the websocket
+  transport, `ATM::send_message` previously returned `Ok(EmptyResponse)` for a
+  fire-and-forget send **the moment the command was enqueued to the transport
+  task** — before any byte reached the socket. During a reconnect the socket is
+  `None`, so the frame was silently discarded yet the caller saw success; a
+  failed socket write was likewise swallowed into a log line. Every downstream
+  "delivered" record was built on that false `Ok`.
+
+  `WebSocketCommands::SendMessage` now carries a `oneshot` reply; the transport
+  reports the **actual** write outcome, and `send_message` awaits it:
+  - socket write succeeds → `Ok` (as before);
+  - socket disconnected (reconnect window) or write fails → `Err`
+    (`ATMError::TransportError`) — **never** a false `Ok` for an untransmitted
+    frame.
+
+  This is a **behavioural break**: a caller that sent while the socket was down
+  now receives `Err` where it used to receive `Ok(EmptyResponse)`. The public
+  signature of `send_message` is unchanged; `WebSocketCommands` is `pub(crate)`.
+  Delivery-critical callers should treat the `Err` as "not sent" and retry /
+  queue (the delivery-layer outbox, landing separately, will absorb this for
+  `Guaranteed` sends). The REST path was already truthful and is unchanged.
+
+  **Versioning note:** the repo convention signals breaking changes with a minor
+  bump, but a minor bump here forces every in-workspace `affinidi-messaging-sdk
+  = "0.18"` consumer to update its pin in the same PR, which trips the
+  `publish-dry-run` guard (consumers would reference an unpublished 0.19). This
+  change therefore ships as a **patch with this explicit break note**; if the
+  maintainers prefer a coordinated `0.19.0` + consumer-pin cascade, that is a
+  mechanical follow-up.
+
+## [0.18.51] - 2026-07-16
+
+- Publish a re-falsifiable websocket connection-state signal (D1 conformance,
+  R6.2). The reconnect loop lives entirely inside the SDK's `WebSocketTransport`
+  task and previously emitted nothing on drop/reconnect, so every consumer's
+  connectivity view (`ListenerEvent`, health flags) was a boot-time latch. The
+  transport now owns a `tokio::sync::watch::<ConnState>` (from the new
+  `affinidi-messaging-core::ConnState`): it publishes `Connected` at the single
+  reconnect-success site and `Disconnected` from `fail_pending_requests` (the
+  one choke point every drop funnels through). Exposed additively via
+  `ATMProfile::connection_state() -> Option<watch::Receiver<ConnState>>`
+  (`None` for a REST-only profile). No existing API changed; the internal
+  `WebSocketTransport::start`/`start_with_options` now also return the receiver.
+
+- Footgun guard: `TspOps::connect_websocket` now warns when the profile already
+  has a live-stream pickup websocket. The mediator permits one websocket per DID,
+  so opening a second (raw-TSP) socket on the same DID makes it evict a duplicate
+  channel and the two flap. Combined DIDComm+TSP receivers should multiplex on the
+  single pickup socket via `MessagePickup::live_stream_next_frame` (or the
+  `affinidi-messaging-didcomm-service` crate) instead.
+
+## [0.18.49] - 2026-07-04
+
+- Route the DIDComm pack and unpack paths through the shared
+  `affinidi_crypto::KeyType::key_agreement_curve()` helper (single source of
+  truth for the `KeyType` → key-agreement `Curve` mapping) instead of two
+  local copies of the match.
+- Fix: the JWE unpack path previously handled only X25519/P-256/secp256k1
+  recipient keys and silently skipped P-384/P-521 (they fell through to
+  `_ => continue`), so a message encrypted to a local P-384/P-521 key failed
+  to decrypt with "no matching recipient". Consolidating onto the shared
+  helper restores P-384/P-521 recipient decryption, matching the pack path
+  and the mediator. Patch bump — see ADR 0003.
+
+## [0.18.47] - 2026-07-03
+
+- Add `MessagePickup::send_delivery_request_frames` (+ `MessagePickupOps` delegate), the
+  offline/backlog counterpart of `live_stream_next_frame`: it returns each queued message as
+  an `InboundFrame` (DIDComm or TSP) paired with its ack id, so an offline-sync consumer can
+  route TSP frames to a TSP handler instead of DIDComm-unpacking (and poison-looping on)
+  them. Undeliverable attachments (bad encoding, or a non-TSP frame that fails DIDComm
+  unpack) yield `(None, id)` so the caller still acks them. `tsp`-feature only; additive.
+
+## [0.18.45] - 2026-07-02
+
+- TSP capability learning (SDD phase 2): the per-peer TSP capability cache is now
+  populated automatically, so `atm.send_to` upgrades a peer from DIDComm to TSP once
+  we know their agent speaks it. A peer is marked `Supported` when a relationship
+  completes (`accept_relationship` / `record_incoming_control` reaching `Bidirectional`)
+  or when an authenticated inbound TSP message is observed (`unpack` / `unpack_bytes` /
+  `unpack_control`). Learning is a no-op under the default `TspPolicy::Off` (no extra
+  store writes) and skips redundant writes when a fresh `Supported` record already exists.
+
+## [0.18.44] - 2026-07-02
+
+- Fix a poison-message loop: `MessagePickup::live_stream_next` / `live_stream_get` errored
+  (without deleting) when a **packed** frame (e.g. a TSP/CESR message) arrived on a
+  DIDComm-only stream, so the mediator redelivered it every pickup cycle forever. They now
+  delete the undeliverable packed frame (when `auto_delete`) and skip it (`Ok(None)`) with a
+  warning, keeping the stream live. A consumer that wants packed frames should use
+  `live_stream_next_frame` (multiplexed) or `live_stream_next_packed`. Behaviour change:
+  these paths return `Ok(None)` instead of `Err(MsgReceiveError)` on an unexpected packed
+  frame.
+
+## [0.18.43] - 2026-07-02
+
+- TSP-preferred protocol selection (SDD phase 1). New `ATM::send_to(profile, message, to,
+  from, sign_by)` façade automatically picks TSP or DIDComm and returns the `SendProtocol`
+  used. Selection is governed by a new `TspPolicy` (`Off` default / `Preferred` / `Required`)
+  set via `ATMConfigBuilder::with_tsp_policy`; with the default `Off` nothing changes.
+- Per-peer TSP capability cache folded into `RelationshipStore` (new `get_capability` /
+  `set_capability` trait methods with default no-op impls, so existing stores keep
+  compiling; `InMemoryRelationshipStore` persists it). New `TspOps::select_protocol`,
+  `peer_capability`, `set_peer_capability`; `PeerCapability` / `TspSupport` /
+  `CapabilitySource` types; a configurable capability TTL via
+  `ATMConfigBuilder::with_tsp_capability_ttl` measured against the injected clock.
+- Selection precedence: a fresh cached capability, else a `Bidirectional` relationship
+  (→ TSP, cached), else a DID-doc `TSPTransport` service (→ TSP, tentative), else DIDComm
+  (or an error under `Required`). Additive/patch — no breaking changes.
+
+## [0.18.41] - 2026-06-29
+
+- TSP relationship methods follow affinidi-tsp 0.1.10's spec-compliant Control encoding:
+  `accept_relationship` / `cancel_relationship` now take the invite's thread digest (the
+  SHA-256 of the invite's payload frame) for cross-impl correlation, and a new
+  `TspOps::unpack_control` returns `(ControlMessage, sender, thread_digest)`.
+
+## [0.18.40] - 2026-06-29
+
+- Doc/comment updates for affinidi-tsp 0.1.8's new `-E` CESR wire framing. No functional
+  change — the SDK's TSP path already routes by envelope addressing and unpacks for the
+  message kind, so it is agnostic to the framing magic byte.
+
+## [0.18.39] - 2026-06-27
+
+SDK consumer for the mediator's raw-TSP WebSocket mode.
+
+- New `atm.tsp().connect_websocket(profile)` → `TspWebSocket`: opens a WebSocket to the
+  mediator offering the `tsp` subprotocol (alongside the bearer token), so the socket runs
+  in raw-TSP mode (flush-on-connect + delete-on-successful-send, server-side). `TspWebSocket`
+  has `recv()` (next raw qb2 TSP message, `None` on close — skips ping/pong), `send(&[u8])`
+  (send a raw TSP message inbound), and `close()`.
+- New `atm.tsp().unpack_bytes(profile, qb2)` — unpack a raw qb2 TSP message (what `recv`
+  returns) without the base64 round-trip; `unpack(stored)` now decodes then delegates to it
+  (its signature + behaviour are unchanged).
+- Re-exports `TspWebSocket`. Additive; no existing API changed.
+
+## [0.18.38] - 2026-06-26
+
+Formatting only (`cargo fmt --all`); no functional or API change. Patch bump
+required by the release guard because the crate source changed. Reconciles the
+version after the pure-TSP-auth `0.18.37` release landed on `main`.
+
+## [0.18.37] - 2026-06-26
+
+Pure-TSP client authentication: `TspAuthHandler` lets a TSP-only client (no DIDComm)
+authenticate to the mediator's `POST /tsp/authenticate` and obtain the same JWT session.
+
+- New `TspAuthHandler` (impl `affinidi_did_authentication::CustomAuthHandler`): resolves the
+  mediator's `#auth` service, `POST {base}/challenge`, signs the challenge with the profile's
+  Ed25519 VID key, then `POST {base}/tsp/authenticate {vid, session_id, signature}` and returns
+  the access/refresh `AuthorizationTokens`. Register it via
+  `CustomAuthHandlers::default().with_auth_handler(Arc::new(TspAuthHandler::new(secrets)))` when
+  building the TDK; the existing `atm.tsp()` / cache / `send_raw` path then authenticates over
+  TSP transparently.
+- Adds `affinidi-did-resolver-cache-sdk` + `reqwest` as optional deps behind the `tsp` feature
+  (named directly by the `CustomAuthHandler` trait signature). Additive; no existing API changed.
+
+## [0.18.36] - 2026-06-25
+
+TSP **relationship management** — drive the TSP relationship lifecycle (RFI/RFA: invite /
+accept / cancel) through `atm.tsp()`, backed by a pluggable store.
+
+- New `atm.tsp()` methods: `form_relationship`, `accept_relationship`,
+  `cancel_relationship`, `relationship_state`, and `record_incoming_control` (advance the
+  FSM for a received control message). Each drives the pure
+  `affinidi_tsp::relationship::RelationshipState` state machine
+  (None → Pending / InviteReceived → Bidirectional) and sends via the existing
+  `send_control`; outbound state is persisted only **after** the control message is sent.
+- New `RelationshipStore` trait — pluggable persistence (consumers implement it against
+  durable storage) — plus an ephemeral `InMemoryRelationshipStore` default. Select one via
+  `ATMConfigBuilder::with_relationship_store`; defaults to in-memory (wiped on restart).
+- Adds `async-trait` behind the `tsp` feature. Additive; no existing API changed.
+
+## [0.18.35] - 2026-06-25
+
+The `tsp` feature is no longer marked **experimental** — `atm.tsp()` (pack / send /
+send_routed / send_nested / send_control / unpack) is supported. Documentation/labelling
+only; no behaviour change. Caveat: pure-TSP client auth (`/tsp/authenticate`) is still
+pending, so `atm.tsp()` reuses the profile's DIDComm-authenticated session for now.
+
+## [0.18.34] - 2026-06-24
+
+New `atm.tsp().send_control(profile, to_did, control)`: send a TSP **`Control`** message
+— a relationship-management message (invite / accept / cancel) to a peer. Build `control`
+with `affinidi_tsp::message::control::ControlMessage`'s `invite` / `accept` / `cancel`; it
+is sealed to `to_did` and carried with message type `Control`, which the mediator relays
+to the recipient like a Direct message. Additive; no existing API changed.
+
+## [0.18.33] - 2026-06-24
+
+New `atm.tsp().send_nested(profile, intermediary, to_did, payload)` and
+`send_nested_opaque(profile, intermediary, inner)`: send a TSP message wrapped in a
+**`Nested`** metadata-privacy envelope. The payload is sealed end-to-end to `to_did`,
+then wrapped in an outer `Nested` message sealed to `intermediary` (typically the
+recipient's mediator), which unwraps the outer layer and forwards the inner — so only
+the intermediary learns `to_did`. The `_opaque` form takes a pre-built inner (which may
+be a DIDComm message — the TSP↔DIDComm bridge). Additive; no existing API changed.
+
+## [0.18.32] - 2026-06-24
+
+`atm.trust_tasks().acl_set` is no longer admin-only — a non-admin may set its own ACL
+(the self-manageable capabilities); docs updated. (Server-side change in the mediator;
+the SDK call is unchanged.)
+
+## [0.18.31] - 2026-06-24
+
+The legacy `atm.mediator()` management methods are now `#[deprecated]` in favour of the
+`atm.trust_tasks()` core: `account_get`/`account_add`/`account_remove`/`accounts_list`/
+`account_change_type`/`account_change_queue_limits`, `acls_get`/`acls_set`,
+`access_list_{list,add,remove,clear,get}`, and `get_config`/`add_admins`/`strip_admins`/
+`list_admins`/`list_audit_log` — each points to its `atm.trust_tasks().*` replacement.
+The methods still work (legacy DIDComm wire); they will be removed in a future major
+release (the breaking change). **Additive — patch bump, `0.18` pin stays valid.** (The
+deliberately-louder minor/major bump is reserved for the removal, per the workspace's
+patch-not-minor convention.)
+
+## [0.18.30] - 2026-06-24
+
+`atm.trust_tasks()` gains the admin family: `admin_add` / `admin_strip` / `admin_list` /
+`admin_audit_log` / `admin_config` (all admin only). Completes the messaging Trust Tasks
+client surface. Additive.
+
+## [0.18.29] - 2026-06-24
+
+`atm.trust_tasks()` gains the access-list family: `access_list_add` / `access_list_remove`
+/ `access_list_clear` / `access_list_get` / `access_list_list` (self-or-admin; `None` =
+own list). Completes the messaging Trust Tasks client surface. Additive.
+
+## [0.18.28] - 2026-06-24
+
+`atm.trust_tasks().account_add(profile, did_hash, account_type, acl)` — create an
+account and return its realized view. Completes the account-family client surface.
+Additive.
+
+## [0.18.27] - 2026-06-24
+
+`atm.trust_tasks()` gains `acl_get(profile, did_hashes)` (self-or-admin; batched ACL
+read → entries + unknown) and `acl_set(profile, did_hash, acl)` (admin only; partial
+ACL update → realized ACL). Additive.
+
+## [0.18.26] - 2026-06-24
+
+`atm.trust_tasks().account_change_type(profile, did_hash, account_type)` (admin only) —
+change an account's role and return its realized view. Only a root admin may assign the
+root-admin role or modify a root-admin account. Additive.
+
+## [0.18.25] - 2026-06-24
+
+`atm.trust_tasks().account_remove(profile, did_hash)` — remove an account (self-or-admin;
+`None` = self) and return whether a record was removed. The mediator's own and the
+root-admin accounts can't be removed. Additive.
+
+## [0.18.24] - 2026-06-24
+
+`atm.trust_tasks().account_change_queue_limits(profile, did_hash, send, receive)` —
+change an account's queued-message limits and return the updated view. `None` target
+= self; each limit is `Some(-1)` (unlimited) / `Some(n)` / `None` (unchanged). Additive.
+
+## [0.18.23] - 2026-06-24
+
+`atm.trust_tasks().account_list(profile, cursor, limit)` (admin only) — returns one
+page of accounts plus an opaque `next_cursor` (present only when more remain); pass
+it back to continue. Additive.
+
+## [0.18.22] - 2026-06-24
+
+`atm.trust_tasks().account_get(profile, did_hash)` — fetch the mediator's view of an
+account as a typed `account/get` response. `None` requests the caller's own account
+(self; no admin rights needed). Shares the binding-envelope send path with `ping`
+(refactored into an internal `exchange` helper). Additive.
+
+## [0.18.21] - 2026-06-23
+
+New `atm.trust_tasks()` accessor with `.ping(profile, nonce)` — sends a
+`messaging/ping` Trust Task to the mediator (over the DIDComm binding envelope) and
+returns the typed `ping` response (server time, status, supported protocols, echoed
+nonce). Additive — the first of the messaging Trust Tasks client surface; account /
+acl / access-list follow, and the legacy `atm.mediator()` / `atm.trust_ping()`
+methods will route through this core (the breaking change that lands then is
+signalled by a minor bump).
+
+## [0.18.20] - 2026-06-23
+
+`MessageType` gains a `TrustTaskEnvelope` variant (the Trust Tasks DIDComm binding
+envelope `type`), so the mediator can route Trust Task documents. Additive
+scaffolding for the messaging Trust Tasks migration; no API change. The deliberate
+minor bump that signals the migration's breaking client changes lands with
+`atm.trust_tasks()` (next).
+
+## [0.18.19] - 2026-06-23
+
+WebSocket live-stream is now TSP-safe. An inbound frame is sniffed (the frame is
+self-describing CESR qb64); a TSP message is delivered **packed** — so the
+consumer unpacks it via `atm.tsp()` — instead of being routed into the DIDComm
+`unpack`, where it previously failed and was silently dropped. DIDComm frames are
+unchanged, and the sniff is gated on the `tsp` feature (no-op without it).
+
+## [0.18.18] - 2026-06-23
+
+Re-exports `MessageProtocol` (from `affinidi-messaging-mediator-common`).
+Fetched messages now carry a `protocol` field (`Some(MessageProtocol::DidComm |
+Tsp | …)`), tagged server-side, so a client can route each message natively
+without inspecting it. Additive; patch bump.
+
+## [0.18.17] - 2026-06-23
+
+`atm.tsp().send_routed_opaque(profile, route, inner)` — route an **already-packed**
+inner message through TSP relay hops. The inner may be a **DIDComm** message (the
+TSP↔DIDComm bridge): pack it with `atm.pack_encrypted`, then route it over TSP to a
+recipient who unpacks it natively. `send_routed` now builds on this. Additive;
+patch bump.
+
+## [0.18.16] - 2026-06-23
+
+`atm.tsp()` gains routed send:
+- `send_routed(profile, route, payload)` — send a TSP message through one or more
+  relay hops. The payload is sealed end-to-end to the final recipient
+  (`route.last()`), wrapped in a routing layer sealed to the first hop
+  (`route[0]`, a TSP-routing mediator); each hop unwraps and forwards onward.
+- `send_raw(profile, bytes)` — POST an already-packed TSP message to `/inbound`
+  (the shared transport `send()` now builds on this).
+
+Verified end to end against a live mediator relay in
+`affinidi-messaging-test-mediator`. Additive; patch bump.
+
+## [0.18.15] - 2026-06-22
+
+Picks up the `affinidi-did-common` 0.3.8 fix for
+`DocumentExt::find_authentication`, which **fixes DIDComm signed-message
+verification when the signer's `kid` is a bare DID** (no fragment): the unpack
+path looked up the first authentication key via that method and previously got a
+keyAgreement (X25519) key, so verification failed. Fragment-qualified kids were
+unaffected. Also drops the local workaround in `atm.tsp()` (now that
+`find_authentication` is correct). No API change; patch bump.
+
+## [0.18.14] - 2026-06-22
+
+TSP send/receive — `atm.tsp()` can now pack, send, and unpack TSP **Direct**
+messages end to end:
+
+- `pack(profile, to_did, payload)` builds a TSP Direct message — extracting the
+  profile's Ed25519 signing key (from its `authentication`) and X25519 encryption
+  key (from its `keyAgreement`) via the secrets resolver, and resolving the
+  recipient's keys from its DID document.
+- `send(profile, to_did, payload)` packs and POSTs to the mediator `/inbound`,
+  reusing the profile's existing (DIDComm) authenticated session for the bearer
+  token; the mediator sniffs the TSP magic byte and stores it for pickup.
+- `unpack(profile, stored)` decodes a fetched message, resolves the sender, and
+  decrypts + verifies with the profile's key, returning `(payload, sender_vid)`.
+
+Verified end to end against a live mediator in
+`affinidi-messaging-test-mediator` (alice packs → mediator stores → bob unpacks).
+Additive (no `tsp` feature = no change); patch bump keeps the `0.18` pin valid.
+
+NB: works around a copy-paste bug in `affinidi-did-common`'s
+`DocumentExt::find_authentication(None)` (it returns `keyAgreement` ids) by
+reading `doc.authentication` directly.
+
+## [0.18.13] - 2026-06-22
+
+TSP client support — foundation. New optional `tsp` feature and an `atm.tsp()`
+ops accessor (the TSP sibling of `atm.routing()` etc.). This first slice adds the
+**storage-format codec** a client needs on pickup: a mediator stores a TSP message
+`base64url(qb2)` (its CESR qb64 text form, `1AAF…`), so `atm.tsp().is_tsp()`
+distinguishes it from a DIDComm JSON envelope and `decode()`/`encode()` convert
+to/from the raw qb2 bytes. Purely additive (no `tsp` feature = no change); patch
+bump keeps the `0.18` pin valid. The pack/send and fetch/unpack paths land next.
+
+## [0.18.12] - 2026-06-14
+
+`ATMError` is now `#[non_exhaustive]` (ADR-0003) so new variants land additively.
+Patch bump keeps the `0.18` pin valid; match it with a `_` wildcard arm. No
+behaviour change. (W7 sweep)
+
+## [0.18.11] - 2026-06-14
+
+Injectable clock for the SDK's expiry/TTL reads (TI4b-2).
+
+### Added
+
+- `ATMConfigBuilder::with_clock(Arc<dyn Clock>)` injects the clock the SDK uses
+  for its time reads (defaults to the real `SystemClock`). The `Clock` trait
+  comes from `affinidi-messaging-mediator-common` (shared with the mediator,
+  TI4b-1), so a test can drive both with one `TestClock`.
+
+### Changed
+
+- The SDK's expiry/TTL **decisions** now read the injected clock instead of the
+  wall clock directly: forwarded-message expiry (`extract_forward_payload`) and
+  the WebSocket token-refresh TTL (`refresh_deadline`). Additive — existing
+  callers are unaffected. The refresh deadline is still *scheduled* on tokio's
+  monotonic timer; only the TTL computation moved to the injected clock.
+- Outbound protocol-message `created_time`/`expires_time` stamps still read the
+  wall clock (a documented follow-up); the mediator's own injected clock governs
+  enforcement, so this does not affect expiry tests.
+
+## [0.18.10] - 2026-06-13
+
+WS resilience (W16, part 2 of 2).
+
+### Added
+
+- **Proactive WebSocket token refresh.** The mediator force-closes a WebSocket
+  at access-token expiry (it only checks the JWT at upgrade, and has no in-band
+  refresh). The transport now records the token's expiry and, at ~80% of its
+  lifetime, refreshes the token via the refresh-token flow
+  (`AuthenticationCache::refresh`, which has the mediator re-verify the DID is
+  still allowed to connect) and reconnects with the fresh token — *before* the
+  forced close — rather than waiting to be kicked and reconnecting reactively.
+
+### Changed
+
+- **The background deletion handler is now supervised** via the shared
+  `affinidi-task-utils` `TaskSupervisor`: a panic or error is detected and the
+  task restarted with capped backoff (it previously died silently, leaving
+  background deletions unprocessed for the life of the process). Shutdown now
+  flows through a `CancellationToken`. Public method signatures are unchanged.
+
+## [0.18.9] - 2026-06-13
+
+SDK request-path hardening (W16, part 1 of 2).
+
+### Added
+
+- **Configurable request timeout.** `ATMConfig::with_request_timeout(Duration)`
+  (default 15s) overrides the per-request timeout for mediator REST calls. The
+  previously hardcoded `MEDIATOR_REQUEST_TIMEOUT` constants (duplicated in
+  `delete.rs`/`list.rs`) are removed in favour of the config value.
+
+### Fixed
+
+- **No panic on a malformed mediator response.** `delete_messages_direct`,
+  `list_messages`, and `get_messages` parsed the response body with
+  `.ok().unwrap()`, panicking the caller (or the deletion-handler task) on any
+  non-JSON 2xx body. They now return `ATMError::TransportError` instead.
+- **`get_messages` had no request timeout** and could hang indefinitely on a
+  network stall; it is now bounded by the configured request timeout like the
+  other REST calls.
+
+### Changed
+
+- **WebSocket reconnect backoff is now jittered (±15%).** The exponential
+  backoff (1→2→4…→60s) previously reconnected in lock-step across clients;
+  jitter spreads reconnections so a recovering mediator isn't stampeded.
+  (`rand` promoted from dev- to normal dependency for non-cryptographic jitter.)
+
+## [0.18.8] - 2026-06-13
+
+### Added
+
+- **`Mediator::list_audit_log` (and `MediatorOps::list_audit_log`)** — admin
+  client method to page the mediator's privileged-change audit log (newest-first,
+  cursor-paginated), sending the new `audit_log_list` administration request.
+  Re-exports `AuditLogEntry`, `AuditAction`, and `MediatorAuditLogList` from
+  `affinidi-messaging-mediator-common`. Pairs with mediator 0.15.44 / simplification T25b.
+
+## [0.18.7] - 2026-06-06
+
+### Changed
+
+- **Robust key-agreement negotiation in `pack_encrypted` (#357).** The
+  authcrypt path now enumerates *all* of the sender's usable key-agreement
+  keys and negotiates the best shared curve with the recipient by a
+  documented preference order (`X25519 > P-256 > secp256k1`), rather than
+  deriving the curve from the sender's *first* key only — so a sender whose
+  first KA curve has no recipient match but whose second does now packs
+  successfully, and a no-common-curve failure names the curve set each side
+  offered. The anoncrypt path now selects the recipient's most-preferred
+  usable key-agreement curve using the **same** ordering as authcrypt
+  (skipping undecodable/unsupported entries) instead of blindly taking
+  `first()`, so the two paths never disagree on curve choice. The duplicated
+  negotiation/resolution helpers were removed in favour of
+  `affinidi-did-common`'s shared `key_negotiation` module (its new
+  `key-agreement` feature).
+- **P-384/P-521 key agreement + configurable curve preference (#357).**
+  `pack_encrypted` now supports the P-384 and P-521 key-agreement curves
+  (sender key-type → curve mapping), and `ATMConfigBuilder` gains
+  `with_curve_preference(Vec<Curve>)` to override the default curve ordering
+  (`X25519 > P-256 > P-384 > P-521 > secp256k1`) at runtime — e.g. P-256
+  first for a FIPS deployment. The override applies to both authcrypt and
+  anoncrypt.
+
+## [0.18.6] - 2026-06-01
+
+### Fixed
+
+- Fix `cargo test` compilation in the `ws_cache` unit tests: a `oneshot`
+  send was `.unwrap()`-ed, which requires `WebSocketResponses: Debug` (not
+  derived). Assert on `.is_ok()` instead. Test-only; no runtime change.
+
+## [0.18.5] - 2026-06-01
+
+### Changed
+
+- **In-flight websocket requests now fail fast on disconnect.** When the
+  connection to the mediator drops (server `Close`, reset, missed pong, or
+  any socket error), every pending `live_stream_get` / `live_stream_next`
+  waiter is notified immediately instead of blocking until its own timeout
+  elapses. Previously a request that was in flight when the socket dropped
+  (e.g. the mediator closing the socket on access-token expiry) sat idle for
+  up to the full wait window and then surfaced as a misleading
+  `MsgSendError("No response from API")`.
+  - New `WebSocketResponses::Disconnected` variant carries the signal to
+    waiters. `live_stream_next` / `live_stream_next_packed` map it to
+    `Ok(None)` (streaming callers quietly retry on reconnect);
+    `live_stream_get` maps it to the new `ATMError::Disconnected` so
+    request/response callers can distinguish a reconnect race from a genuine
+    no-response.
+
+## [0.18.4] - 2026-05-31
+
+### Security
+
+- **`unpack()` now verifies JWS signatures.** Previously a signed
+  (JWS) message was parsed *without* checking the signature and returned
+  with `non_repudiation: true` — i.e. a forged signature was accepted and
+  labelled non-repudiable. `unpack()` now resolves the signer's Ed25519
+  key from its `kid` (via the DID resolver) and verifies the signature;
+  an unresolvable signer or an invalid signature is an **error**. The
+  signer is attributed in `UnpackMetadata.sign_from`, read from the
+  protected header and falling back to the unprotected header (#323).
+  Behaviour change: flows that relied on the previous lax parsing of
+  unverified JWS will now receive an error instead of a message.
+
+### Added
+
+- **Sign-then-encrypt support (#324).** When a decrypted JWE wraps a JWS
+  (DIDComm v2.1 non-repudiation), `unpack()` verifies the inner signature
+  and reports `non_repudiation` + `sign_from` alongside the encryption
+  metadata, instead of failing to parse.
+
+### Changed
+
+- Bump `affinidi-messaging-didcomm` to 0.14 (corrected ECDH-1PU authcrypt
+  KDF + dual-KEK fallback, #322). The decrypt path picks these up
+  transparently.
+- Verification-material parsing now delegates to
+  `affinidi-did-common`'s `VerificationMethod::decode_public_key`,
+  removing the SDK's bespoke JWK/multibase branch (shared with the
+  DID-authentication layer).
+
+## [0.18.3] - 2026-05-24
+
+### Security
+
+- `OOBDiscovery::retrieve_invite` no longer panics on malformed
+  responses from the invitation endpoint. The four `.unwrap()` /
+  `.expect()` sites on the response envelope, base64url payload,
+  UTF-8 decode and inner `Message` parse now return
+  `ATMError::TransportError`. Previously a misbehaving or hostile
+  mediator could crash the SDK client.
+- `AuthorizationResponse` no longer derives `Debug`; a manual impl
+  redacts `access_token` and `refresh_token` while leaving the
+  `*_expires_at` fields visible. The derived impl printed both
+  tokens verbatim, so any `debug!`/`warn!("{:?}", resp)` or panic
+  dump leaked credentials granting a full authenticated session.
+  Matches the redaction already applied to the equivalent structs
+  in `affinidi-did-authentication`.
+
+## [0.18.1] - 2026-05-05
+
+### Changed
+
+- `From<ACLError> for ATMError` now includes a wildcard arm because
+  `mediator-common 0.15.0` marked `ACLError` as `#[non_exhaustive]`.
+  Future ACL variants surface as `ATMError::ACLConfigError` until
+  the SDK adds a more specific mapping. No behavior change for
+  existing `Config` and `Denied` variants.
+- Bumped `mediator-common` caret pin to `"0.15"` to pick up the
+  feature-gating rework. The SDK already takes
+  `default-features = false`, so this build no longer pulls
+  `axum`, `redis`, or `aes-gcm`/`argon2` via mediator-common.
+
+## [0.18.0] - 2026-05-05
+
+### Breaking
+
+- `MediatorACLSet::*` fallible methods now return `Result<_, ACLError>`
+  instead of `Result<_, ATMError>`. `ACLError` is a lightweight enum
+  (`Config(String)` / `Denied(String)`) that lives in
+  `affinidi-messaging-mediator-common::types::acls` so the mediator's
+  storage trait can describe its API without depending on this crate.
+  Callers using `?` against `ATMError` are unaffected — a
+  `From<ACLError> for ATMError` is provided. Callers that
+  match-arm on `ATMError::ACLDenied(_)` / `ATMError::ACLConfigError(_)`
+  need to convert via `.map_err(ATMError::from)` (or update to match on
+  `ACLError` directly).
+
+### Changed
+
+- The mediator protocol vocabulary moved out of this crate and into
+  `affinidi-messaging-mediator-common::types::*`. Affected types:
+  `MediatorACLSet`, `AccessListModeType`, `Account`, `AccountType`,
+  `MediatorAccountList`, `AdminAccount`, `MediatorAdminList`,
+  `Folder`, `MessageList`, `MessageListElement`, `GetMessagesResponse`,
+  `FetchDeletePolicy`, `FetchOptions`, `ProblemReport`, plus the
+  ACL-handler / admin request and response shapes. Each type is
+  re-exported from its original `affinidi_messaging_sdk::*` path so
+  existing imports keep working unchanged.
+- This crate now depends on `affinidi-messaging-mediator-common`
+  (was the other way around). Removes a circular-feeling layering
+  where the storage trait imported from the client SDK.
+
+## [0.17.0] - 2026-05-02
+
+### Breaking
+
+- Migrated to `affinidi-tdk-common` 0.6. The change is mechanical only —
+  `TDKSharedState` field accesses (`tdk_common.client`, `.did_resolver`,
+  `.secrets_resolver`, `.authentication`, `.environment`) replaced with
+  the corresponding accessor methods on every code path. No behavioural
+  changes within the SDK itself.
+- `ATMProfile::to_tdk_profile` now constructs the `TDKProfile` via
+  `TDKProfile::new(...)` instead of a struct literal — the `secrets`
+  field is `pub(crate)` in tdk-common 0.6 and only constructible through
+  the public API.
+
+### Tests
+
+- `unpack` test helpers (`create_atm_with_secrets`, `create_atm`,
+  `create_atm_no_unpack_forwards`) updated to build a `TDKSharedState`
+  via `TDKConfig::builder().with_load_environment(false)
+  .with_use_atm(false).build()?` + `TDKSharedState::new`, replacing the
+  removed `TDKSharedState::default().await`.
+
+## [0.16.5] - 2026-04-25
+
+### Fixed
+
+- `ATM::list_messages` and `ATM::delete_messages_direct` now apply a 15-second per-request HTTP timeout. Previously the calls were unbounded and would block for the OS-level TCP RTO (~30–60s on macOS) when the mediator was unreachable, contributing to slow shutdowns in downstream consumers that wrap them in their own connect path.
+
+## [0.16.3] - 2026-04-15
+
+### Fixed
+
+- Add exponential backoff (1s-60s cap) on WebSocket reconnection after server-initiated disconnects. Previously, server-initiated Close frames (including mediator `duplicate-channel` rejections), protocol resets, and connection errors triggered immediate reconnection with zero delay, causing an infinite reconnect loop between two profiles sharing the same DID.
+- Missed pong timeout now immediately drops the WebSocket and applies backoff, instead of leaving a half-closed connection.
+
+## [0.16.2] - 2026-03-28
+
+### Fixed
+
+- Handle inbound WebSocket Ping frames from the mediator by responding with a Pong, instead of logging them as unknown message types.

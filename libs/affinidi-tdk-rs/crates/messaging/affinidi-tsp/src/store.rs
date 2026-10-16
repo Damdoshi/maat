@@ -1,0 +1,342 @@
+//! VID and relationship store.
+//!
+//! Manages local private VIDs, known remote VIDs, and relationship state
+//! between VID pairs.
+
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+use crate::error::TspError;
+use crate::relationship::{RelationshipEvent, RelationshipState};
+use crate::vid::{PrivateVid, ResolvedVid};
+
+/// Build a compact relationship key from two VID strings.
+/// Format: "{our_vid}\0{their_vid}" — null byte separator is safe since VIDs can't contain it.
+fn relationship_key(our_vid: &str, their_vid: &str) -> String {
+    let mut key = String::with_capacity(our_vid.len() + 1 + their_vid.len());
+    key.push_str(our_vid);
+    key.push('\0');
+    key.push_str(their_vid);
+    key
+}
+
+/// Extract their_vid from a relationship key (everything after the null separator).
+fn their_vid_from_key(key: &str) -> &str {
+    key.split_once('\0').map_or(key, |(_, their)| their)
+}
+
+/// Check if a relationship key belongs to the given our_vid.
+fn key_belongs_to(key: &str, our_vid: &str) -> bool {
+    key.starts_with(our_vid) && key.as_bytes().get(our_vid.len()) == Some(&b'\0')
+}
+
+/// In-memory store for VIDs and relationships.
+pub struct TspStore {
+    /// Our private VIDs (identities we control).
+    private_vids: RwLock<HashMap<String, PrivateVid>>,
+    /// Known remote VIDs (resolved public identities).
+    remote_vids: RwLock<HashMap<String, ResolvedVid>>,
+    /// Relationship states between VID pairs. Key format: "{our_vid}\0{their_vid}".
+    relationships: RwLock<HashMap<String, RelationshipState>>,
+    /// The thread digest (`SHA256` of the relationship-forming message's
+    /// plaintext frame) outstanding for each VID pair. The inviter stores its
+    /// invite digest here; the accepter stores the received invite's digest.
+    /// Used to correlate a later accept/cancel back to the forming message.
+    /// Key format: "{our_vid}\0{their_vid}".
+    thread_digests: RwLock<HashMap<String, [u8; 32]>>,
+    /// The other half's thread id — see [`TspStore::set_reply_thread_digest`].
+    reply_thread_digests: RwLock<HashMap<String, [u8; 32]>>,
+}
+
+impl TspStore {
+    pub fn new() -> Self {
+        Self {
+            private_vids: RwLock::new(HashMap::new()),
+            remote_vids: RwLock::new(HashMap::new()),
+            relationships: RwLock::new(HashMap::new()),
+            thread_digests: RwLock::new(HashMap::new()),
+            reply_thread_digests: RwLock::new(HashMap::new()),
+        }
+    }
+
+    // --- Thread-digest correlation ---
+
+    /// Remember the thread digest of the relationship-forming message for a pair.
+    /// Record the *reply* thread id — the accept's own self-addressing digest,
+    /// which identifies the relationship in the other direction.
+    ///
+    /// Rev 3 §7.2.1: a bidirectional relationship has two digests, one per
+    /// uni-directional half. The invite's identifies `<VID_a, VID_b>` and the
+    /// accept's identifies `<VID_b, VID_a>`. A cancellation may name either, so
+    /// both must be recognizable.
+    pub fn set_reply_thread_digest(&self, our_vid: &str, their_vid: &str, digest: [u8; 32]) {
+        let key = relationship_key(our_vid, their_vid);
+        self.reply_thread_digests
+            .write()
+            .unwrap()
+            .insert(key, digest);
+    }
+
+    /// The reply thread id, if one has been recorded.
+    pub fn reply_thread_digest(&self, our_vid: &str, their_vid: &str) -> Option<[u8; 32]> {
+        let key = relationship_key(our_vid, their_vid);
+        self.reply_thread_digests.read().unwrap().get(&key).copied()
+    }
+
+    /// Does `digest` name this relationship? True if it matches either half's
+    /// thread id, or if we hold no digest at all to compare against.
+    pub fn recognizes_digest(&self, our_vid: &str, their_vid: &str, digest: &[u8; 32]) -> bool {
+        let held = [
+            self.thread_digest(our_vid, their_vid),
+            self.reply_thread_digest(our_vid, their_vid),
+        ];
+        if held.iter().all(Option::is_none) {
+            return true;
+        }
+        held.iter().flatten().any(|d| d == digest)
+    }
+
+    pub fn set_thread_digest(&self, our_vid: &str, their_vid: &str, digest: [u8; 32]) {
+        let key = relationship_key(our_vid, their_vid);
+        self.thread_digests.write().unwrap().insert(key, digest);
+    }
+
+    /// Get the remembered thread digest for a pair, if any.
+    pub fn thread_digest(&self, our_vid: &str, their_vid: &str) -> Option<[u8; 32]> {
+        let key = relationship_key(our_vid, their_vid);
+        self.thread_digests.read().unwrap().get(&key).copied()
+    }
+
+    /// Forget the remembered thread digest for a pair (on cancel / teardown).
+    pub fn clear_thread_digest(&self, our_vid: &str, their_vid: &str) {
+        let key = relationship_key(our_vid, their_vid);
+        self.thread_digests.write().unwrap().remove(&key);
+        self.reply_thread_digests.write().unwrap().remove(&key);
+    }
+
+    // --- Private VID management ---
+
+    /// Register a private VID (an identity we control).
+    pub fn add_private_vid(&self, vid: PrivateVid) {
+        // Also store the public part as a remote VID so it can be resolved
+        let resolved = vid.to_resolved();
+        self.remote_vids
+            .write()
+            .unwrap()
+            .insert(resolved.id.clone(), resolved);
+        self.private_vids
+            .write()
+            .unwrap()
+            .insert(vid.id.clone(), vid);
+    }
+
+    /// Get a private VID by identifier.
+    pub fn get_private_vid(&self, id: &str) -> Result<PrivateVid, TspError> {
+        self.private_vids
+            .read()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| TspError::NoSigningKey(id.to_string()))
+    }
+
+    /// List all private VID identifiers.
+    pub fn list_private_vids(&self) -> Vec<String> {
+        self.private_vids.read().unwrap().keys().cloned().collect()
+    }
+
+    // --- Remote VID management ---
+
+    /// Register a known remote VID.
+    pub fn add_remote_vid(&self, vid: ResolvedVid) {
+        self.remote_vids
+            .write()
+            .unwrap()
+            .insert(vid.id.clone(), vid);
+    }
+
+    /// Get a remote VID by identifier.
+    pub fn get_remote_vid(&self, id: &str) -> Result<ResolvedVid, TspError> {
+        self.remote_vids
+            .read()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| TspError::VidNotFound(id.to_string()))
+    }
+
+    // --- Relationship management ---
+
+    /// Get the relationship state between two VIDs.
+    pub fn relationship_state(&self, our_vid: &str, their_vid: &str) -> RelationshipState {
+        let key = relationship_key(our_vid, their_vid);
+        self.relationships
+            .read()
+            .unwrap()
+            .get(&key)
+            .copied()
+            .unwrap_or(RelationshipState::None)
+    }
+
+    /// Apply a relationship event, transitioning the state.
+    pub fn transition_relationship(
+        &self,
+        our_vid: &str,
+        their_vid: &str,
+        event: RelationshipEvent,
+    ) -> Result<RelationshipState, TspError> {
+        let key = relationship_key(our_vid, their_vid);
+
+        let mut relationships = self.relationships.write().unwrap();
+        let current = relationships
+            .get(&key)
+            .copied()
+            .unwrap_or(RelationshipState::None);
+
+        let new_state = current.transition(event).map_err(|e| {
+            TspError::Relationship(format!("{our_vid} → {their_vid} via {event:?}: {e}"))
+        })?;
+
+        if new_state == RelationshipState::None {
+            relationships.remove(&key);
+        } else {
+            relationships.insert(key, new_state);
+        }
+
+        Ok(new_state)
+    }
+
+    /// Set a relationship's state directly, bypassing the transition table.
+    ///
+    /// Used where the protocol replaces one relationship with another rather
+    /// than advancing the existing one — resolving the §7.2.3 invite race,
+    /// where the losing invite is discarded and the winning one adopted in its
+    /// place. Prefer [`TspStore::transition_relationship`] everywhere else, so
+    /// that illegal transitions stay illegal.
+    pub fn set_relationship_state(&self, our_vid: &str, their_vid: &str, state: RelationshipState) {
+        let key = relationship_key(our_vid, their_vid);
+        let mut relationships = self.relationships.write().unwrap();
+        if state == RelationshipState::None {
+            relationships.remove(&key);
+        } else {
+            relationships.insert(key, state);
+        }
+    }
+
+    /// List all relationships for a given VID.
+    pub fn list_relationships(&self, our_vid: &str) -> Vec<(String, RelationshipState)> {
+        self.relationships
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| key_belongs_to(k, our_vid))
+            .map(|(k, &v)| (their_vid_from_key(k).to_string(), v))
+            .collect()
+    }
+}
+
+impl Default for TspStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relationship::RelationshipEvent;
+
+    #[test]
+    fn store_private_vid() {
+        let store = TspStore::new();
+        let vid = PrivateVid::generate("did:example:alice");
+        store.add_private_vid(vid);
+
+        assert!(store.get_private_vid("did:example:alice").is_ok());
+        assert!(store.get_private_vid("did:example:bob").is_err());
+
+        // Private VID should also be resolvable as remote
+        assert!(store.get_remote_vid("did:example:alice").is_ok());
+    }
+
+    #[test]
+    fn store_remote_vid() {
+        let store = TspStore::new();
+        store.add_remote_vid(ResolvedVid {
+            id: "did:example:bob".to_string(),
+            signing_key: [1u8; 32],
+            encryption_key: [2u8; 32],
+            endpoints: vec![],
+            mediators: vec![],
+        });
+
+        let resolved = store.get_remote_vid("did:example:bob").unwrap();
+        assert_eq!(resolved.signing_key, [1u8; 32]);
+    }
+
+    #[test]
+    fn relationship_lifecycle() {
+        let store = TspStore::new();
+
+        // Initially none
+        assert_eq!(
+            store.relationship_state("alice", "bob"),
+            RelationshipState::None
+        );
+
+        // Send invite
+        let state = store
+            .transition_relationship("alice", "bob", RelationshipEvent::SendInvite)
+            .unwrap();
+        assert_eq!(state, RelationshipState::Pending);
+
+        // Receive accept
+        let state = store
+            .transition_relationship("alice", "bob", RelationshipEvent::ReceiveAccept)
+            .unwrap();
+        assert_eq!(state, RelationshipState::Bidirectional);
+    }
+
+    #[test]
+    fn relationship_cancel_removes_entry() {
+        let store = TspStore::new();
+
+        store
+            .transition_relationship("alice", "bob", RelationshipEvent::SendInvite)
+            .unwrap();
+        store
+            .transition_relationship("alice", "bob", RelationshipEvent::SendCancel)
+            .unwrap();
+
+        assert_eq!(
+            store.relationship_state("alice", "bob"),
+            RelationshipState::None
+        );
+    }
+
+    #[test]
+    fn list_private_vids() {
+        let store = TspStore::new();
+        store.add_private_vid(PrivateVid::generate("alice"));
+        store.add_private_vid(PrivateVid::generate("bob"));
+
+        let vids = store.list_private_vids();
+        assert_eq!(vids.len(), 2);
+        assert!(vids.contains(&"alice".to_string()));
+        assert!(vids.contains(&"bob".to_string()));
+    }
+
+    #[test]
+    fn list_relationships() {
+        let store = TspStore::new();
+        store
+            .transition_relationship("alice", "bob", RelationshipEvent::SendInvite)
+            .unwrap();
+        store
+            .transition_relationship("alice", "carol", RelationshipEvent::SendInvite)
+            .unwrap();
+
+        let rels = store.list_relationships("alice");
+        assert_eq!(rels.len(), 2);
+    }
+}

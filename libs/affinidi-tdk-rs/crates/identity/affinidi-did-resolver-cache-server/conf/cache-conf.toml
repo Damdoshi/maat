@@ -1,0 +1,100 @@
+### log_level: trace debug info warn error
+### default: info
+log_level = "info"
+
+### listen_address: <ip_address>:<tcp_port> that this service will listen on.
+### Default: 0.0.0.0:8080
+listen_address = "${LISTEN_ADDRESS:0.0.0.0:8080}"
+
+### statistics_interval: # of seconds between statistics logging
+### Default: 60 second
+statistics_interval = "${STATISTICS_INTERVAL:10}"
+
+### resolve_timeout: max seconds a single upstream DID resolution may take
+### before the request path gives up and returns an error (rather than
+### blocking the HTTP request / WebSocket connection on a hung upstream).
+### Default: 30 seconds
+resolve_timeout = "${RESOLVE_TIMEOUT:30}"
+
+### max_did_size: maximum accepted DID length in bytes. Longer DIDs are
+### rejected before resolution (HTTP 400 / WebSocket error) so a crafted
+### request can't drive unbounded work. Also bounds the WebSocket frame size.
+### Default: 1024 bytes
+max_did_size = "${MAX_DID_SIZE:1024}"
+
+### enable_http_endpoint: true/false
+### Default: true
+### If true, the server will make available /resolve endpoint for HTTP GET requests
+### that will resolve a DID Document from the cache.
+enable_http_endpoint = "${ENABLE_HTTP_ENDPOINT:true}"
+
+### enable_websocket_endpoint: true/false
+### Default: true
+### If true, the server will make available /resolve endpoint for websocket requests
+### that will resolve a DID Document from the cache.
+# Agent name (DID shortcut) lookup: GET /did/v1/resolve-name/{*name}
+#
+# OFF BY DEFAULT. Enabling it lets callers make this server issue HTTP requests
+# to hosts of their choosing. The resolver refuses non-public addresses
+# (loopback, private, link-local, cloud metadata) on every redirect hop, but
+# that is not complete SSRF protection: DNS rebinding remains possible, and this
+# server has no rate limiting. Enable only if you accept that.
+enable_agent_names = "${ENABLE_AGENT_NAMES:false}"
+
+# Ceiling on agent name lookups fetching upstream at once.
+#
+# Agent name resolution turns one cheap inbound request into one outbound
+# request to a host the CALLER chose. Without a ceiling that is an amplification
+# primitive: this server can be driven to fan out traffic at third parties, or
+# to scan them, at a cost of one request each. The cap bounds that fan-out
+# however many source addresses the load arrives from. Requests over it are shed
+# with 503 rather than queued, so a saturated server does not accumulate an
+# unbounded backlog of pending fetches.
+agent_name_concurrency = "${AGENT_NAME_CONCURRENCY:16}"
+
+enable_websocket_endpoint = "${ENABLE_WEBSOCKET_ENDPOINT:true}"
+
+[cache]
+### capacity_count: Approx how many items to cache in memory
+### Default: ~1,000 cached DID Documents
+capacity_count = "${CACHE_CAPACITY_COUNT:1000}"
+
+### expire: Cache Time To Live (TTL) for a cached entry in seconds
+### Default: 300 (5 minutes)
+expire = "${EXPIRE:300}"
+
+### webvh_log_expire: TTL in seconds for cached raw did:webvh logs
+### (did.jsonl / did-witness.json). 0 disables the cache.
+### Default: 0 (disabled)
+###
+### These files are otherwise re-fetched from the DID's own host on EVERY
+### resolution, including cache hits, so a hot did:webvh DID generates
+### continuous upstream traffic and can be rate-limited by its host.
+### Caching them makes a document cache hit cost zero upstream requests, at
+### the cost of taking up to this long to observe a newly-published log entry.
+### Set to 0 when tests must observe DID document updates immediately.
+###
+### A cached log is only served alongside a document that was itself a cache
+### hit; a document cache miss always re-fetches the log fresh, so the log and
+### the document it is attached to never disagree. For that reason keep this
+### <= `expire` (the document TTL): a larger value buys nothing (a document
+### refresh already refreshes the log) and the server clamps it to `expire`.
+###
+### The cache is bounded by ENTRY COUNT (`capacity_count`), not by bytes; a log
+### is capped at 1 MiB on fetch, so worst-case memory is ~capacity_count MiB.
+webvh_log_expire = "${WEBVH_LOG_EXPIRE:0}"
+
+# Sustained requests per second per client IP. 0 disables rate limiting.
+#
+# ⚠ RAISE OR DISABLE THIS BEHIND A LOAD BALANCER OR NAT. The limiter keys on the
+# peer address, so every client behind a proxy shares one bucket and legitimate
+# traffic gets throttled. If you terminate TLS or route through a CDN, the only
+# address this server sees is the proxy's.
+#
+# An unparseable value falls back to the default rather than to 0, so a typo
+# cannot silently disable limiting. Set "0" explicitly to disable.
+rate_limit_per_ip = "${RATE_LIMIT_PER_IP:100}"
+
+# Token-bucket depth above the sustained per-IP rate — how large a burst is
+# tolerated before 429s begin.
+rate_limit_burst = "${RATE_LIMIT_BURST:50}"

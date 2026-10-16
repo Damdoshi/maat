@@ -1,0 +1,12 @@
+# Example only: enable on each node after manual provisioning and validation.
+[Unit]
+Description=Periodic Maât signed public trust synchronization
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+Unit=maat-trust-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,63 @@
+# Docker E2E: copy portable sources, not host build state.
+.git
+**/.git
+build/
+dist/
+*.img
+*.qcow2
+*.iso
+*.vmdk
+traces*
+*.log
+*.raw
+
+# Generic native and autotools outputs.
+**/.libs/
+**/autom4te.cache/
+**/*.o
+**/*.lo
+**/*.la
+**/*.slo
+**/*.a
+**/*.dep
+
+# Preserve Rust source, local patched BBS dependency, and vendor/.
+libs/maat-bbs/target/
+
+# OpenSSH host-specific configuration and generated outputs.
+libs/openssh-portable/Makefile
+libs/openssh-portable/config.h
+libs/openssh-portable/config.status
+libs/openssh-portable/config.cache
+libs/openssh-portable/config.log
+libs/openssh-portable/openbsd-compat/Makefile
+libs/openssh-portable/openbsd-compat/regress/Makefile
+libs/openssh-portable/buildpkg.sh
+libs/openssh-portable/opensshd.init
+libs/openssh-portable/openssh.xml
+libs/openssh-portable/survey.sh
+libs/openssh-portable/ssh
+libs/openssh-portable/sshd
+libs/openssh-portable/sshd-auth
+libs/openssh-portable/sshd-session
+libs/openssh-portable/ssh-keygen
+
+# PHPize-generated host-specific files. Preserve maat.c, config.m4,
+# configure and *.in source templates required by the clean archive.
+php-ext/modules/
+php-ext/Makefile
+php-ext/config.status
+php-ext/config.log
+php-ext/config.cache
+php-ext/config.h
+php-ext/libtool
+php-ext/maat.dep
+php-ext/maat.lo
+php-ext/maat.la
+php-ext/.deps/
+
+# Apache apxs2 outputs.
+modules/mod_maat/mod_maat.la
+modules/mod_maat/mod_maat.lo
+modules/mod_maat/maat_broker_client.lo
+modules/mod_maat/ingress_policy.lo

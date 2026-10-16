@@ -1,0 +1,14 @@
+[package]
+name = "maat-bbs-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# Source already in the Maât tree. Cargo still needs its transitive crates,
+# pinned and downloaded separately; a Git clone is not a complete vendor.
+affinidi-bbs = { path = "../affinidi-tdk-rs/crates/core/affinidi-bbs" }
+bls12_381_plus = "=0.9.0"

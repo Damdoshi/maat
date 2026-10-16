@@ -1,0 +1,116 @@
+name: checks-features
+# Feature-surface checks that the main `checks.yaml` (which builds the
+# workspace with default features through the shared pipeline-rust workflow)
+# does not reach:
+#
+#   - `facade-features`  — the `affinidi-tdk` facade across its feature
+#     combinations.
+#   - `didcomm-service (tsp)` — `affinidi-messaging-didcomm-service`'s
+#     non-default `tsp` feature.
+#
+# The mediator's secrets-backend feature matrix moved with the mediator to
+# affinidi/affinidi-messaging-mediator.
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+    paths:
+      - "crates/tdk/affinidi-tdk/**"
+      - "crates/messaging/affinidi-messaging-didcomm-service/**"
+      - "crates/messaging/affinidi-messaging-sdk/**"
+      - "crates/messaging/affinidi-tsp/**"
+      - ".github/workflows/checks-features.yaml"
+
+jobs:
+  # Build the affinidi-tdk facade across its feature surface so a new feature
+  # (or a broken re-export) can't silently fail to compile in some combination.
+  facade-features:
+    name: facade / ${{ matrix.combo.short }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        combo:
+          - short: default
+            flags: ""
+          - short: no-default
+            flags: "--no-default-features"
+          - short: credentials
+            flags: "--no-default-features --features credentials"
+          - short: protocols
+            flags: "--no-default-features --features protocols"
+          - short: did-methods
+            flags: "--no-default-features --features did-methods"
+          - short: trust+tsp
+            flags: "--no-default-features --features trust,tsp"
+          - short: all-features
+            flags: "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native deps for aws_lc_rs + keyring
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev libdbus-1-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: facade-${{ matrix.combo.short }}
+
+      - name: cargo check -p affinidi-tdk ${{ matrix.combo.flags }}
+        run: cargo check -p affinidi-tdk ${{ matrix.combo.flags }}
+
+      # The facade examples must stay facade-first and keep compiling.
+      - name: cargo build -p affinidi-tdk --examples
+        if: matrix.combo.short == 'default'
+        run: cargo build -p affinidi-tdk --examples
+
+  didcomm-service-tsp:
+    # `affinidi-messaging-didcomm-service` multiplexes TSP alongside DIDComm on
+    # one websocket, behind its own `tsp` feature — off by default, so the
+    # default workspace build never compiles it. What it gates is the inbound
+    # TSP dispatch: the relationship-lifecycle handling that admits application
+    # traffic under Rev 3 §7.2.2 gating, and the arms that discard a padding
+    # message and route an upper-layer control one.
+    #
+    # Its end-to-end tests run against the embedded test mediator, so they
+    # moved with the mediator to affinidi/affinidi-messaging-mediator. This job
+    # keeps the feature compiling (and lint-clean) here, where the code lives.
+    name: didcomm-service (tsp)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: didcomm-service-tsp
+
+      - name: cargo clippy -p affinidi-messaging-didcomm-service --features tsp
+        env:
+          RUSTFLAGS: "--cfg tracing_unstable"
+        run: |
+          cargo clippy \
+            -p affinidi-messaging-didcomm-service \
+            --features tsp \
+            --all-targets \
+            -- -D warnings

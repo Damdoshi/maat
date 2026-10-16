@@ -1,0 +1,475 @@
+# Affinidi TSP Changelog
+
+## Unreleased (0.2.2) — `salsa20` 0.11, drop `rand_core` 0.6
+
+No behaviour change and no public API change. Sealed-box and control-nonce
+randomness now come from `rand` 0.10 instead of `rand_core` 0.6's `OsRng`
+(both are the OS CSPRNG), and HSalsa20 takes salsa20 0.11's key type. The
+TSP Rev 3 spec vectors pass unchanged.
+
+## Unreleased (0.2.1) — relationship re-establishment (recovery)
+
+- **Relationship re-establishment (recovery).** `RelationshipState::transition`
+  now accepts `ReceiveInvite` from the established states instead of raising
+  `InvalidTransition`: `Bidirectional + ReceiveInvite → InviteReceived` (a peer
+  that lost its half re-invites, and the side that kept the relationship
+  re-accepts to repair it), and a re-sent invite while `InviteReceived` is
+  idempotent. There is no new control message — a re-invite over a live
+  relationship *is* the reconcile signal. Strictly more permissive: a transition
+  that used to error now succeeds. See the design note
+  `tsp-relationship-recovery.md` (D2).
+
+- **Test: the Appendix A vectors re-pack byte for byte.** A new non-default
+  `test-vectors` feature adds `message::direct::insecure_deterministic`
+  (hidden from the docs): `pack_insecure_deterministic` takes the vector's
+  ephemeral material — `ikmE` for HPKE-Base, via RFC 9180 `DeriveKeyPair`, or
+  `skEm` for the sealed box — plus an `XPAD` nonce and a NULL ESSR sender
+  field, which the vectors use and every public packing function still never
+  writes. Reusing an ephemeral key destroys confidentiality, so the module is
+  for regenerating vectors and nothing else. This crate's tests enable the
+  feature through a dev-dependency on itself, and every vector except the
+  post-quantum one, which publishes no ephemeral material, now re-packs to
+  the published bytes.
+- **Test: the Appendix A vectors are the merged specification's.**
+  `tests/vectors/rev3.json` moves from the pre-merge `YTSP-ABA` vectors to
+  those of trustoverip/tswg-tsp-specification@`f5b8668`, at `YTSP-AAC`, which
+  changed every message and the control vectors' SAIDs. Checked value by value
+  against tsp_sdk 0.11.0's own `test_vectors/rev3.json`. No library change:
+  the crate already emitted `AAC`, and still reads `ABA` since MINOR does not
+  gate processing.
+- **Fix: `MAX_HOPS` is 64 (was 16).** The specification sets no maximum, and
+  17-hop routes packed by the ToIP reference, Go and Dart implementations were
+  refused on decode. The same bound applies when packing a route and when
+  decoding any hop list or reply path.
+- **Fix: an XSCS/XCTL body holding anything but exactly one Bytes primitive is
+  refused.** It was read as its first primitive, silently dropping the rest of
+  the `-A##` stream, and data after the stream was ignored. The body is now
+  held to the form the specification's vectors and the ToIP reference use: an
+  `-A##` stream that ends the payload frame and holds one Bytes primitive. See
+  [tswg-tsp-specification#77](https://github.com/trustoverip/tswg-tsp-specification/issues/77).
+- **Fix: the accepting endpoint recognises a cancellation that names its own
+  accept.** `send_relationship_accept` now records the accept's digest, which
+  identifies the other half of the relationship (§7.2.1). A peer that names
+  that half, as the Go and Dart implementations do, was refused as naming
+  "an unrecognised relationship".
+
+## Unreleased (0.2.0) — Trust Spanning Protocol specification Rev 3
+
+Carries the 0.1.16 dependency move below as well: this branch merged it in,
+so if 0.2.0 ships first there is no separate 0.1.16 release and the section
+under it describes work that is in this one.
+
+**Breaking: nothing this crate packs can be unpacked by a Rev 2 peer, and
+nothing a Rev 2 peer packs can be unpacked here.** There is no compatibility
+mode and no negotiation. Rev 3 changed the crypto mode, the version byte, the
+long count-code prefix and every payload type code at once, so the two revisions
+share no frame either side can even classify — the failure is a decode error,
+not a downgrade. See `docs/tsp/rev3-migration.html`.
+
+Wire format:
+
+- **HPKE-Auth → HPKE-Base** (RFC 9180 mode `0x02` → `0x00`). The sender's static
+  key no longer enters the KEM; sender authenticity comes from the ESSR
+  signature alone, which is where Rev 3 puts it. The ciphertext primitive code
+  changes with it, `G` (6) → `F` (5). Suite is unchanged:
+  DHKEM(X25519, HKDF-SHA256) with ChaCha20Poly1305. `info` is now `YTSP-`.
+- **The version marker is `YTSP-AAC` (0.2)**, was Rev 2's `YTSP-AAB` (0.1), and
+  the field is **MAJOR.MINOR — two components, not three**.
+
+  Rev 3 as proposed kept Rev 2's constant across a revision that changes the
+  crypto mode, the ciphertext code, the long count-code prefix and every payload
+  layout, leaving the two revisions advertising the same version and a structural
+  probe on a field Rev 3 *deletes* as the only discriminator. Raised on
+  [spec PR #63][pr63]; upstream changed it to `ABA`, reading the three characters
+  as MAJOR, MINOR, PATCH.
+
+  We do not follow that reading. PATCH has no role in a wire version — semver
+  defines it as a backward-compatible bug fix, a change that by definition cannot
+  alter what goes over the wire, so a receiver can never act on it. The two
+  readings also disagree about the value: the trailing 12 bits are one number
+  under MAJOR.MINOR, so Rev 2 is 1, `ABA` is **64**, and the next version is
+  `AAC` = 2. The jump to 64 is an artifact of splitting the field. Raised
+  upstream by Sam Smith; this anticipates that resolution rather than waiting
+  for it.
+
+  **Nothing about interoperating depends on the choice.** Only MAJOR gates
+  processability, MAJOR is the same first character either way, and neither
+  implementation refuses a message on MINOR — the reference discards it entirely.
+  The published Appendix A vectors carry `ABA` and still verify here, because a
+  message's digest and signature cover the version bytes *it* carries, not ours;
+  the vector suite and the 14/14 interop run both confirm it.
+
+  A parse that fails against a frame whose version is not ours is re-reported as
+  `TspError::RevisionMismatch`, naming both revisions and carrying the underlying
+  error — a Rev 2 frame otherwise dies at the ciphertext selector with "missing F
+  ciphertext field", which points at the crypto layer for a problem that is
+  nothing of the sort.
+
+[pr63]: https://github.com/trustoverip/tswg-tsp-specification/pull/63
+- **Long count codes are `--X#####`**, were Rev 2's `-0X#####`.
+- **Payload type codes replaced**: `XSCS`, `XHOP`, `XRFI`, `XRFA`, `XRFD`, and
+  the new `XCTL` and `XPAD`. Rev 2's `XAAA` / `TSP_TMP` is gone.
+- **Rev 2's `-S` signed-only wrapper is gone.** §3.5 makes a message "entirely
+  confidential, or entirely non-confidential (signed only), but never mixed": a
+  signed-only message is now an `-E` frame whose payload sits where the
+  ciphertext would be.
+- **A nested message's inner frame is carried raw**, without Rev 2's enclosing
+  `B` variable-data field.
+- **The nonce is 128-bit**, was 256-bit.
+- **An accept's two digests swapped order.** §7 puts the echoed invite digest in
+  `Digest` and the accept's own SAID in `Reply_Digest`; we had it the other way
+  round. `ControlMessage::reply` holds the echoed one and
+  `ControlMessage::digest` the self-addressing one — note which is which, the
+  field names read backwards against the spec.
+- Digests are §7.2.1 SAIDs: derived over the whole message with the digest slot
+  filled by 33 dummy `0x23` bytes, with the padding field excluded.
+
+Protocol behaviour, all new:
+
+- **Application messages are gated on a relationship** (§7.2.2). Default is
+  `RelationshipPolicy::Gated`; `Ungated` restores the old accept-anything
+  behaviour for deployments that want it. Any recorded relationship admits an
+  application message, not only a completed one — §3.6 lets a sender pack user
+  data with its invite.
+- **The §7.2.3 invite race is broken by digest comparison.** Both endpoints keep
+  the invite with the lexicographically lower digest, so simultaneous invites
+  converge instead of forming two half-relationships.
+- **Cancellation follows §7.3's three cases**, including answering a cancel that
+  names a digest belonging to neither half of the relationship we hold.
+- **Key state is re-resolved on failure and after silence** (§7.4.2), behind a
+  `KeyStatePolicy` with a re-verification threshold and a resolution rate limit,
+  and an injectable `Clock` so the timing is testable.
+- **`Reply_Path`** (§7.2.4): an invite can ask for its accept over a route.
+- **`Referral_Field`** (§7.2.5): a VID can be introduced over an existing
+  relationship, carrying that VID's own signature. `verify_referral` checks it,
+  and needs the introduced VID's key, so resolution — and therefore the caller —
+  supplies it.
+- **The padding field is fillable** (§7.5), and `XPAD` sends padding alone.
+  Padding is excluded from the digest derivation, so filling it cannot change
+  what was signed.
+- **`XCTL`** carries an upper-layer control payload.
+
+Bug fixes found on the way, both latent on `main`:
+
+- `decode_count` returned long-form counts with the identifier bits still in
+  them. Every long-framed message decoded to a wrong length.
+- `is_tsp` and the ingress classifiers in the SDK, mediator and mediator-common
+  knew only the short count code `0xF8`, so a long-framed TSP message was not
+  recognised as TSP at all. The *constants* had never drifted; the predicates
+  had.
+
+- **The libsodium sealed box (§8.3) is implemented**, so a message from a peer
+  that has not migrated can be read. `PkaeScheme` names the two schemes,
+  `pack_sealed_box` sends under the old one, and `unpack` accepts either — the
+  ciphertext field's code (`C` against HPKE-Base's `F`) is the only thing on the
+  wire that says which, so nothing is negotiated.
+
+  §8 tells new implementations not to use it: "implementors SHOULD consider
+  migrating to the HPKE option specified in this document. We MAY remove this
+  option in the future." It is here for reading, not for choosing.
+
+  Two payload rules come with the scheme and are handled by the packing code
+  rather than the caller. The sender VID travels *inside* the encrypted payload,
+  because a sealed box is anonymous and has no AAD to bind it to — §3.7 step 7
+  has the receiver check it against the envelope. And control messages carry a
+  Blake2b-256 digest under CESR code `F` rather than SHA-256 under `I`; both are
+  32 bytes, so the code is the only thing separating them, and a mismatch is
+  refused at the field rather than later at the digest comparison where it would
+  read as tampering.
+
+  Built on the same primitives as `affinidi-messaging-didcomm-v1` and for the
+  same reason: the RustCrypto `crypto_box` crate would be a drop-in but depends
+  on curve25519-dalek 4, which would reintroduce a second dalek generation into a
+  workspace that is on 5.
+
+Conformance:
+
+- **The specification's own test vectors now run as a test suite**
+  (`tests/spec_vectors.rs`, fixture extracted from spec commit `66a1580` and
+  checked value by value against `tsp_sdk` 0.10.0's own
+  `tsp_sdk/test_vectors/rev3.json`, which is the file the appendix was rendered
+  from). **All ten pass**, including the post-quantum vector.
+
+  The two sealed-box vectors are the reason that scheme is worth having tested
+  rather than merely written: a sealed box is non-deterministic, so it cannot be
+  checked by re-packing and comparing bytes, and three details of the
+  construction are invisible to a round-trip test because an implementation that
+  gets them wrong agrees with itself perfectly — the HSalsa20 key-derivation
+  step, libsodium's MAC-before-ciphertext layout, and the nonce being derived
+  from both public keys rather than random.
+
+  These check something interop cannot. The harness packs with one
+  implementation and unpacks with the other, so a *shared* misreading passes it.
+  The vectors are fixed and external, and because `unpack` recomputes an invite's
+  or accept's SAID and refuses the message on a mismatch, every control vector
+  validates the whole §7.2.1 derivation — version, both VIDs, payload fields,
+  digest slot dummied — against a value this crate had no part in producing.
+
+- **Found five defects in the published appendix, and all five are now fixed
+  upstream.** `control-rfd`'s message was 393 characters, a length base64 cannot
+  produce; the scan that followed found the same three-character loss in
+  `pq_alice`'s ML-DSA signing key, in the post-quantum vector, and in two long
+  forms whose `did:peer:4` self-certifying hash no longer matched the document
+  they carried. Every TSP message is its `-E` count code, the content that count
+  declares, and a signature group that declares its own length the same way;
+  every intact vector satisfies that identity exactly.
+
+  Reported against [spec PR #63][pr63] and repaired there. The suite now asserts
+  the identity across all ten vectors rather than the eight that decoded, and
+  `control-rfd` carries its real check: a cancel names the relationship-forming
+  message it ends by that message's digest, and carries no nonce.
+
+- **Post-quantum is implemented, behind the `pq` feature** (§8.1, §8.2.1):
+  HPKE-Base over the `MLKEM768-X25519` hybrid KEM (`crypto::hpke_pq`) and
+  ML-DSA-65 signatures under the code `1AAQ` (`crypto::ml_dsa`), with
+  `direct::pack_pq` and a key-typed `direct::unpack_with`. `unpack` is unchanged
+  and still means Ed25519 and X25519.
+
+  It was held back until now for want of anything to check it against, and that
+  is what changed: three of the four things missing were the truncated values
+  above, and the fourth was whether the published 32-byte encryption key was a
+  whole key. Rev 3 gained a sentence on 8 September saying it is — a seed
+  `DeriveKeyPair` expands — and the suite now verifies that expansion reproduces
+  each identity's published 1216-byte public key.
+
+  Three choices here are invisible to a round-trip test and each is a plausible
+  way to be wrong on the wire: which hybrid (X-Wing and `MLKEM768-X25519` share
+  every size, so building the wrong one fails decapsulation with no length
+  mismatch to point at), which ML-DSA (pure, prehash and `sign_internal` all
+  produce a 3309-byte signature that verifies against itself), and which key
+  expansion. The vector settles all three.
+
+  **The VID model does not carry these keys** — `ResolvedVid`'s are `[u8; 32]`
+  and an ML-DSA-65 verifying key is 1952 bytes — so nothing above this crate can
+  send or receive one yet, and `1AAQ` is still provisional pending CESR issue
+  #14. See `docs/tsp/post-quantum.md`. Off by default for both reasons.
+
+Interop: **19/19 against the released `tsp_sdk` 0.10.0**, the reference's first
+Rev 3 release — both directions across direct, routed, nested, 2 MiB, the sealed
+box, invite, accept, cancel and post-quantum, plus a negative case asserting that
+a post-quantum ciphertext offered classical keys is refused rather than misread.
+The harness no longer needs a local checkout of the reference or any patches to
+it; see `docs/tsp/interop.md`.
+
+## Unreleased (0.1.16) — `sha2` 0.11, `hkdf` 0.13, `blake2` 0.11, `chacha20poly1305` 0.11
+
+No behaviour change and no public API change: these are private dependencies
+here, which is what lets each crate move on its own schedule. Verified by
+`cargo tree`/grep that no RustCrypto type appears in a public signature anywhere
+in the workspace.
+
+One import changed, in the HPKE path: `aead` 0.6 renamed `AeadInPlace` to
+`AeadInOut` (the in-place helpers remain provided methods on it) and replaced
+generic-array with hybrid-array, so `aead::generic_array::GenericArray` became
+`aead::array::Array`.
+
+99 tests green, including the HPKE seal/open round-trips.
+
+## 31st August 2026 (0.1.15)
+
+**Bug fix: a DID-valued `TSPTransport` endpoint was returned as a transport URL.**
+
+`did:` is a valid URL scheme, so `Url::parse("did:webvh:…")` succeeds. The
+`TSPTransport` service endpoints were collected with a bare `Url::parse(..).ok()`
+and no scheme test, and a `serviceEndpoint` naming a *mediator's DID* — the
+"I am mediated" shape a persona document publishes — arrived in
+`ResolvedVid::endpoints` indistinguishable from a real endpoint. On a live
+mediator it travelled all the way to the HTTP client, which could not build a
+request from it (`builder error for url (did:webvh:…/inbound)`) and abandoned
+the message after five retries.
+
+- `ResolvedVid::endpoints` now holds **only HTTP-family transport URLs**
+  (`http`/`https`/`ws`/`wss`). Anything else with no delivery rule is dropped.
+- New `ResolvedVid::mediators: Vec<String>` holds the DID-valued endpoints. The
+  advertisement is kept, not discarded: it says who carries this VID's traffic,
+  and the transport URL is one resolve away in *that* DID's document. Dropping
+  it silently would be its own bug — a mediated peer would read as "does not
+  speak TSP".
+- New `ResolvedVid::advertises_tsp()` — "advertises TSP transport at all, by URL
+  or by mediator DID". Callers testing `!endpoints.is_empty()` as a TSP-capable
+  signal want this instead.
+
+**Semver.** `ResolvedVid` is a public struct with public fields and is not
+`#[non_exhaustive]`, so adding `mediators` is technically breaking for an
+external consumer that builds one with a struct literal (in-workspace, all four
+such sites are updated). Released as a **patch** per
+[ADR 0003](../../../docs/adr/0003-public-api-semver-policy.md) point 3: `vta-sdk`
+pins this crate through `[patch.crates-io]`, and a minor bump would break the
+redirect and pull a second copy from crates.io. Deserialization is unaffected —
+the new field is `#[serde(default)]`.
+
+## 31st July 2026 (0.1.14)
+
+Moves to **curve25519-dalek 5** (`ed25519-dalek` 2 -> 3, `x25519-dalek` 2 -> 3),
+which brings rand_core 0.10 and signature 3 with it. rand 0.10 renamed `OsRng`
+to `SysRng` *and* made it fallible (`TryRng<Error = SysError>`), so it no longer
+satisfies dalek's `CryptoRng` bound; key generation moves to `rand::rng()`.
+
+Patch bump, per [ADR 0003](../../../docs/adr/0003-public-api-semver-policy.md) point 3: `vta-sdk` pins this crate through
+`[patch.crates-io]`, and a minor bump would break the redirect and pull a second
+copy from crates.io.
+
+## 19th July 2026
+
+### 0.1.13 — affinidi-did-common 0.4
+
+- Bumped the `affinidi-did-common` requirement from `"0.3"` to `"0.4"`.
+  No functional change to this crate: `Document` gained a typed
+  `also_known_as` field, which is additive.
+
+## 30th June 2026
+
+### 0.1.12 — rustfmt-only
+
+- Pure `cargo fmt` reformatting (use-statement, function-signature and call wrapping in
+  `lib.rs`, `message/envelope.rs`, `message/wire.rs` and the `alice_and_bob` example).
+  No code or behaviour change. Restores a clean `cargo fmt --all --check` for the workspace.
+
+## 29th June 2026 (docs)
+
+### 0.1.11 — README: reflect full reference interop
+
+- README now states that `affinidi-tsp` wire-interoperates with the ToIP reference
+  (`tsp-sdk`) for all message types (replacing the stale "does not interoperate" note).
+  Docs-only; no code change.
+
+## 29th June 2026 (control)
+
+### 0.1.10 — spec-compliant relationship Control (full tsp_sdk wire parity)
+
+- **Relationship Control (invite / accept / cancel) now matches the ToIP reference and
+  interoperates both directions** — completing full TSP wire parity (Direct/Routed/Nested/
+  Control all interop with `tsp_sdk`). Control payloads are now CESR-coded per the spec:
+  invite → `XRFI` + hop list + 32-byte `TSP_NONCE` + empty VID; accept → `XRFA` + 32-byte
+  SHA-256 `reply`; cancel → `XRFD` + 32-byte SHA-256 `reply`. Replaces the previous
+  serde-serialized `ACT` marker and 16-byte nonce.
+- **Correlation digest = `SHA256(plaintext payload frame)`** (`thread_digest`), computed at
+  `pack` (before sealing) and `unpack` (after decrypt), byte-identical to the reference's
+  `thread_id`. The accept/cancel `reply` references the invite's `thread_digest`. (BLAKE2s
+  `message_digest` is retained only as an opaque message id.)
+- `ControlMessage` is now `{ control_type, nonce: Option<[u8;32]>, reply: Option<[u8;32]>,
+  route }`; `PackedMessage`/`UnpackedMessage` expose `thread_digest`. The relationship FSM
+  records the invite digest per `(our, their)` and verifies an accept's `reply` against the
+  invite it sent. States/transitions unchanged.
+- Wire-breaking for Control (Direct/Routed/Nested unchanged); accept/cancel APIs now take the
+  thread digest.
+
+## 29th June 2026 (later)
+
+### 0.1.9 — spec-compliant Routed/Nested payloads + reference-aligned size cap
+
+- **Routed and Nested payloads now match the ToIP reference (`tsp_sdk`) and interoperate
+  both directions.** The payload frame inside `-Z` is now kind-encoded per the spec:
+  Direct=`XSCS`+`B(body)`, Nested=`XHOP`+empty-hop-list+`B(body)`, Routed=`XHOP`+hop-list+
+  `B(body)` (hops as `-J<count>` + a `B` field per VID). Replaces the previous
+  affinidi-private `ANS`/`ART` markers and the bespoke `encode_route` (the route is now the
+  CESR hop list, not baked into the plaintext). `UnpackedMessage` gains `hops`. New
+  `direct::pack_with_hops`; `routed::next_hop(&UnpackedMessage)` (was `next_hop(&[u8])`).
+  Control stays on its `ACT` marker (relationship interop is a separate follow-up).
+- **Size cap aligned with the reference:** `MAX_FIELD_SIZE` is now `3 * (1 << 24)` (~48 MiB,
+  the reference's `DATA_LIMIT`) instead of 1 MiB, so affinidi accepts any field the reference
+  can validly send; `MAX_MESSAGE_SIZE` (the ciphertext guard) tracks it. `decode_hops` is
+  bounded by `MAX_HOPS` so the larger cap can't let a hostile hop count over-allocate.
+  Verified by a 2 MiB Direct round-trip in the interop harness (exercises the large CESR
+  variable-data code).
+- Wire-breaking for Routed/Nested (Direct unchanged/byte-exact); API: `next_hop` signature
+  changed, `pack_with_hops` added, `pack_routed`/`pack_nested` public signatures unchanged.
+
+## 29th June 2026
+
+### 0.1.8 — spec conformance (2/2): CESR wire framing + RFC-9180 HPKE (tsp-sdk interop)
+
+- Rewrote the Direct-message wire format to the TSP spec's CESR framing (the `-E` envelope
+  frame, `YTSP` version, var-data VID codes, `G` ciphertext code, `-Z`/`XSCS` payload frame,
+  `-C`/`-K` signature framing). The magic byte is now `0xF8` (the `-E` count code), was
+  `0xD4`. The message kind (Direct/Routed/Nested/Control) now travels in the *encrypted*
+  payload, not the cleartext envelope (`MetaEnvelope` reports a Direct placeholder).
+- Corrected four RFC 9180 deviations in the hand-rolled HPKE — DHKEM KEM context order
+  (`enc‖pkR‖pkS`), `LabeledExtract` returning the real PRK, and the DHKEM `eae_prk` /
+  `shared_secret` labels. These were latent correctness bugs (the prior output was
+  non-standard, only self-consistent).
+- With both, a Direct message now round-trips **both directions** against the ToIP reference
+  `tsp_sdk` 0.9.0-alpha2 (verified by the `interop/` harness). Routed/Nested/Control build on
+  the same framing.
+- Wire-breaking but API-stable (`pack`/`unpack`/`pack_routed`/`pack_nested` signatures
+  unchanged), so consumers need no code changes beyond rebuilding.
+
+## 28th June 2026
+
+### 0.1.7 — spec conformance (1/2): ChaCha20Poly1305 HPKE AEAD + empty HPKE info
+
+- The HPKE AEAD is now **ChaCha20Poly1305** (was AES-128-GCM) and the HPKE `info` is
+  now empty/`NULL` (was `"TSP-v1-direct"`), matching the TSP spec (v1.0 Implementor's
+  Draft Rev 2), which mandates ChaCha20Poly1305 and `info = NULL`. The HPKE suite ID's
+  AEAD code is updated `0x0001 → 0x0003` accordingly.
+- **Wire-breaking:** the ciphertext format changed; messages packed by 0.1.6 (or any
+  AES-GCM build) will not decrypt under 0.1.7. TSP is pre-adoption / experimental, so
+  no migration is provided. The public API is unchanged (`seal`/`open`/`pack`/`unpack`
+  signatures identical), so consumers need no code changes.
+- This is the first of two spec-conformance steps. The CESR envelope / payload /
+  signature **framing** is still being brought to spec (a follow-up); full interop with
+  the reference (`tsp-sdk`) lands once both are done. See
+  [`docs/tsp/interop.md`](../../../docs/tsp/interop.md).
+
+## 22nd June 2026
+
+### 0.1.6 — ingress sniff + keys-free envelope metadata
+
+- New `message::meta` module for relays/mediators that must route a message
+  without holding keys: `is_tsp` (cheap first-byte classifier — every TSP
+  message starts with the CESR `1AAF` magic byte `0xD4`, vs DIDComm's `{`/`ey`),
+  the `TSP_MAGIC_BYTE` constant, and `MetaEnvelope::parse` which reads the
+  cleartext sender/receiver VIDs + message type and computes the SHA-256 message
+  id without decrypting the payload.
+- Re-exported at the crate root (`is_tsp`, `MetaEnvelope`, `TSP_MAGIC_BYTE`).
+- Purely additive; patch bump 0.1.5 → 0.1.6.
+
+### 0.1.5 — routed & nested message modes (§5.3 / §5.5)
+
+- New `message::routed` module implementing TSP routed mode (multi-hop relay
+  through intermediaries, with the remaining route carried inside each
+  HPKE-sealed routing layer and re-sealed/re-authenticated at every hop) and the
+  nested metadata-privacy wrapper. The inner message stays opaque to every
+  intermediary. Replaces the previous `MessageType::Nested`/`Routed`
+  recognized-but-unimplemented stubs.
+- Public primitives `pack_routed`, `pack_nested`, `next_hop`, and the `RouteStep`
+  / `MAX_HOPS` exports.
+- New high-level `TspAgent` methods `send_routed`, `send_nested`, and
+  `forward_routed` (returning `ForwardOutcome::{Relay, Deliver}`), which resolve
+  each hop's keys via the agent resolver.
+- `TspAdapter::wrap_for_relay` (messaging-core) now implemented (was
+  `NotSupported`): relays an opaque packed message to the next hop toward the
+  final recipient, as the adapter's default VID.
+- Purely additive; patch bump 0.1.4 → 0.1.5. 84 tests incl. a full multi-hop
+  crypto round-trip and a two-intermediary agent-level relay.
+
+### 0.1.4 — DID-document VID resolver
+
+- New `DidVidResolver` (behind the existing `did-resolver` feature): resolves a
+  DID (`did:web` / `did:webvh` / `did:peer` / `did:key`) to a `ResolvedVid` via
+  `DIDCacheClient`, reading the Ed25519 signing key from `authentication`, the
+  X25519 encryption key from `keyAgreement`, and TSP transport endpoint(s) from a
+  `TSPTransport` service entry. DID resolution is async (`resolve_did`) and cached;
+  the synchronous `VidResolver` trait serves from that cache.
+- New `TspError::DidResolution` variant (additive — `TspError` is already
+  `#[non_exhaustive]`) and a new optional `affinidi-encoding` dependency pulled in
+  only by the `did-resolver` feature.
+- Purely additive; patch bump keeps the `0.1` pin valid. No behaviour change to
+  existing APIs.
+
+## 14th June 2026
+
+### 0.1.3 — non_exhaustive TspError (W7 sweep)
+
+- `TspError` is now `#[non_exhaustive]` (ADR-0003) so new variants land
+  additively. Patch bump keeps the `0.1` pin valid; consumers that `match` it
+  must add a `_` wildcard arm. No behaviour change.
+
+### 0.1.2 — build fix: drop deprecated `GenericArray::from_slice`
+
+- The HPKE module (`crypto/hpke.rs`) no longer calls the now-deprecated
+  `GenericArray::from_slice` for the AES-128-GCM key/nonce — the key is built via
+  `KeyInit::new_from_slice` and the nonce via `GenericArray::from([u8; 12])`.
+  Keeps the crate compiling under `-D warnings` against `generic-array` 0.14.9+,
+  which deprecated `from_slice`. Behaviour-identical (seal/open round-trip tests
+  unchanged).

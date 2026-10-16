@@ -14,14 +14,6 @@ public:
     explicit SessionIdentifier(const std::string& hex);
     const std::vector<uint8_t>& bytes() const { return id_; }
 };
-class RequestTicket {
-    std::array<uint8_t,32> value_{};
-public:
-    RequestTicket();
-    explicit RequestTicket(const std::string& hex);
-    std::string hex() const;
-    const std::array<uint8_t,32>& bytes() const { return value_; }
-};
 // Host-reserved, never-reused UIDs for SSH-to-HTTP session isolation.
 // UIDs must not be shared with other services; configuration must explicitly
 // reserve this range at the host/system administration level.
@@ -48,23 +40,41 @@ public:
     explicit EphemeralUID(uint64_t value, const UIDRange& range=UIDRange());
     uid_t value() const { return value_; }
 };
+// Dependency-inverted host-side UID collision policy. Implementations must
+// fail closed if the host account directory cannot be queried reliably.
+class UIDCollisionPolicy {
+public:
+    virtual ~UIDCollisionPolicy() = default;
+    virtual bool isFree(uid_t uid) const = 0;
+};
+class NSSUIDCollisionPolicy final : public UIDCollisionPolicy {
+public:
+    bool isFree(uid_t uid) const override;
+};
+const UIDCollisionPolicy& systemUIDCollisionPolicy();
+
 class IdentityRepository {
     sqlite3* db_=nullptr;
     UIDRange range_;
+    const UIDCollisionPolicy& uidPolicy_;
 public:
-    explicit IdentityRepository(const std::string& path, const UIDRange& range=UIDRange());
+    explicit IdentityRepository(const std::string& path,
+                                const UIDRange& range=UIDRange(),
+                                const UIDCollisionPolicy& uidPolicy=systemUIDCollisionPolicy());
     ~IdentityRepository();
     IdentityRepository(const IdentityRepository&)=delete;
     IdentityRepository& operator=(const IdentityRepository&)=delete;
     bool bind(const SessionIdentifier& session, uid_t& bridgeUID);
-    bool issue(const SessionIdentifier& session, const RequestTicket& ticket);
-    bool consume(const RequestTicket& ticket, std::string& user, std::vector<uint8_t>& key);
+    bool identityForBoundSession(const SessionIdentifier& sid,std::string& user,std::vector<uint8_t>& key);
 };
 class HTTPRequest {
     std::string header_, body_;
 public:
     static HTTPRequest read(int fd, size_t maxBody=1048576);
-    std::string forwarded(const std::string& ticket) const;
+    static size_t expectedBodyLength(const std::string& header, size_t maxBody=1048576);
+    static HTTPRequest fromFrame(const std::string& header, const std::string& body,
+                                 size_t maxBody=1048576);
+    std::string forwarded() const;
 };
 std::vector<uint8_t> requestMessage(const std::string& magic, const std::string& hex);
 std::string readString(const std::vector<uint8_t>& packet, size_t& offset, size_t max);

@@ -1,4 +1,5 @@
 #include "identity_broker.hpp"
+#include "session_registration_budget.hpp"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -49,15 +50,18 @@ int main(int argc,char** argv) {
             argc==4 ? argv[3] : "/etc/maat/uid_range.dab");
         maat::IdentityRepository repo(argv[2],range);
         maat::RootSessionBinder binder(repo);
-        maat::TicketVerifier verifier(repo,php);
+        maat::PendingHTTPConnections pending;
+        maat::AcceptedConnectionVerifier verifier(pending,repo,php);
         int incoming=createSocket("/run/maat-http/bind.sock",0);
         int checking=createSocket("/run/maat-http/check.sock",php);
         struct BoundSession {
             int fd;
             maat::SessionIdentifier id;
+            maat::SessionRegistrationBudget budget;
         };
         std::vector<BoundSession> sessions;
         while(!stop) {
+            pending.expire();
             std::vector<pollfd> fds={{incoming,POLLIN,0},{checking,POLLIN,0}};
             for(const auto& session:sessions) fds.push_back({session.fd,POLLIN,0});
             int ready=poll(fds.data(),fds.size(),500);
@@ -74,7 +78,7 @@ int main(int argc,char** argv) {
                     close(client);
                     if(bound>=0) {
                         if(sessions.size()>=256) close(bound);
-                        else sessions.push_back({bound,sid});
+                        else sessions.push_back({bound,sid,maat::SessionRegistrationBudget()});
                     }
                 }
             }
@@ -88,11 +92,18 @@ int main(int argc,char** argv) {
             }
             for(size_t i=sessions.size();i>0;--i) {
                 auto& item=sessions[i-1];
-                // Registration this iteration happens after poll: process on next pass.
+                // Retain the root-attested session capability for a bounded
+                // sequence of one-use descriptor proofs. Never cache the
+                // resulting Apache identity, and fail closed on bad packets.
                 if(i+1>=fds.size()) continue;
-                if(fds[i+1].revents&(POLLIN|POLLERR|POLLHUP|POLLNVAL)) {
-                    maat::SessionTicketChannel channel(repo,item.id);
-                    (void)channel.serve(item.fd);
+                const short event=fds[i+1].revents;
+                bool keep=item.budget.canGrant();
+                if(event&(POLLERR|POLLNVAL)) keep=false;
+                if(keep && (event&POLLIN)) {
+                    maat::SessionConnectionChannel channel(pending,repo,item.id);
+                    keep=channel.serve(item.fd) && item.budget.recordGrant();
+                } else if(event&POLLHUP) keep=false;
+                if(!keep) {
                     close(item.fd);
                     sessions.erase(sessions.begin()+(i-1));
                 }

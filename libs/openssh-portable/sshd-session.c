@@ -29,6 +29,8 @@
 
 #include "includes.h"
 
+#include "maat_uid_guard.h"
+
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -411,8 +413,7 @@ privsep_postauth(struct ssh *ssh, Authctxt *authctxt)
             strcmp(authctxt->pw->pw_name,"maatweb") != 0)
             fatal("Maât only accepts the configured system account");
         session_fd=mm_maat_bind(&session_uid);
-        if (session_fd < 0 || session_uid < 1800000000U ||
-            session_uid > 1899999999U)
+        if (session_fd < 0 || !maat_uid_plausible(session_uid))
             fatal("Maât could not allocate an isolated session UID");
         maat_session_init(session_fd,session_uid);
         authctxt->pw->pw_uid=session_uid;

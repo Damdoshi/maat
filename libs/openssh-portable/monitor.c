@@ -27,6 +27,8 @@
 
 #include "includes.h"
 
+#include "maat_uid_guard.h"
+
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -2257,7 +2259,7 @@ maat_bind_session(uid_t *assigned_uid)
         memcmp(ack,"MAATBOUND3",10) != 0) goto done;
     memcpy(&netuid,ack+10,sizeof(netuid));
     *assigned_uid=ntohl(netuid);
-    if (*assigned_uid < 1800000000U || *assigned_uid > 1899999999U)
+    if (!maat_uid_plausible(*assigned_uid))
         goto done;
     result=pair[0];pair[0]=-1;
  done:

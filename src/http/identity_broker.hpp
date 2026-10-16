@@ -1,5 +1,6 @@
 #pragma once
 #include "http_domain.hpp"
+#include "connection_proof.hpp"
 #include <sys/types.h>
 namespace maat {
 class RootSessionBinder {
@@ -10,18 +11,23 @@ public:
     // On success, caller owns the returned descriptor and closes it on EOF.
     int receive(int peerSocket, SessionIdentifier& session, uid_t& bridgeUID);
 };
-class SessionTicketChannel {
+class SessionConnectionChannel {
+    PendingHTTPConnections& registry_;
     IdentityRepository& repository_;
     SessionIdentifier session_;
 public:
-    SessionTicketChannel(IdentityRepository& r, const SessionIdentifier& s):repository_(r),session_(s){}
-    bool serve(int sessionFd);
+    SessionConnectionChannel(PendingHTTPConnections& registry,IdentityRepository& repository,
+                             const SessionIdentifier& session)
+        :registry_(registry),repository_(repository),session_(session){}
+    bool serve(int capabilityFD);
 };
-class TicketVerifier {
+class AcceptedConnectionVerifier {
+    PendingHTTPConnections& registry_;
     IdentityRepository& repository_;
-    uid_t phpUID_;
+    uid_t apacheUID_;
 public:
-    TicketVerifier(IdentityRepository& r,uid_t uid):repository_(r),phpUID_(uid){}
-    bool serve(int fd);
+    AcceptedConnectionVerifier(PendingHTTPConnections& registry,IdentityRepository& repository,uid_t apacheUID)
+        :registry_(registry),repository_(repository),apacheUID_(apacheUID){}
+    bool serve(int brokerFD);
 };
 }

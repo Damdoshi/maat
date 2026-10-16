@@ -1,0 +1,69 @@
+libapache2-mod-maat (0.20.0~alpha3-1) unstable; urgency=low
+
+  * Add isolated Ed25519 issuer-mediated, service-scoped 5-minute credentials.
+  * Require citizen-key possession, default-deny anonymous rights and one-use proofs.
+  * Pin issuer/HMAC anchors to keep nullifiers stable across key renewals and bans.
+  * Not zero-knowledge anonymous; issuer sees citizen and scope, no live SSH bridge trust.
+
+ -- Maât contributors <maat-developers@localhost>  Fri, 16 Oct 2026 15:00:00 +0200
+
+libapache2-mod-maat (0.20.0~alpha2-1) unstable; urgency=low
+
+  * Authenticate administrative registry commands using pinned Ed25519 authority.
+  * Add persistent counter/registry-domain replay protection and transactional audit.
+  * Preserve fail-closed anonymous-default policy; no anonymous proofs enabled.
+  * Still an integration prototype; Docker/QEMU alpha2 tests not yet run.
+
+ -- Maât contributors <maat-developers@localhost>  Fri, 16 Oct 2026 13:00:00 +0200
+
+libapache2-mod-maat (0.20.0~alpha1-1) unstable; urgency=low
+
+  * Begin administrative citizen registry with unique subject commitments.
+  * Add default-deny anonymous permissions and durable scoped ban ledger.
+  * No anonymous credentials or civil identity verification enabled.
+  * Non-production prototype; integration tests pending for this alpha.
+
+ -- Maât contributors <maat-developers@localhost>  Fri, 16 Oct 2026 11:00:00 +0200
+
+libapache2-mod-maat (0.19.0~rc1-1) unstable; urgency=low
+
+  * Validate SSH-bound PHP request identity in Docker and independent QEMU E2E.
+  * Add bounded reusable SSH session capacity, fresh TCP proof per HTTP request.
+  * Support pipelined and sequential HTTP/1.1 with strict framing.
+  * Harden SQLite contention and adversarial integration tests.
+  * Not approved for public production, services stay disabled by default.
+
+ -- Maât contributors <maat-developers@localhost>  Tue, 13 Oct 2026 17:30:00 +0200
+
+libapache2-mod-maat (0.18.0-1) unstable; urgency=medium
+
+  * Bind Apache requests to SSH-authenticated live TCP descriptors via broker.
+  * Remove bearer tickets from the HTTP transport and PHP application layer.
+  * Reject unmatched requests on the dedicated Maât listener.
+
+ -- Maât contributors <maat-developers@localhost>  Tue, 13 Oct 2026 12:00:00 +0200
+
+libapache2-mod-maat (0.17.0-1) unstable; urgency=medium
+
+  * Make direct broker verification the sole private-ingress mode.
+  * Remove legacy MaatDirectVerify switch and PHP bearer revalidation.
+  * Expose only request-scoped verified identity via Apache optional function.
+
+ -- Maât contributors <maat-developers@localhost>  Tue, 13 Oct 2026 08:00:00 +0200
+
+libapache2-mod-maat (0.16.0-1) unstable; urgency=low
+
+  * Add opt-in broker verification within Apache request hook.
+  * Provide request-local optional native API; fail closed without broker.
+  * Keep the old PHP ticket path as the default and require explicit opt-in.
+  * Direct mode is experimental and is not enabled by packaging.
+
+ -- Maât contributors <maat-developers@localhost>  Mon, 12 Oct 2026 22:00:00 +0200
+
+libapache2-mod-maat (0.15.0-1) unstable; urgency=low
+
+  * Add experimental opt-in Apache 2.4 Maât ingress filter.
+  * Reject spoofable or malformed identity headers by default.
+  * This package does not enable the module automatically.
+
+ -- Maât contributors <maat-developers@localhost>  Mon, 12 Oct 2026 21:00:00 +0200

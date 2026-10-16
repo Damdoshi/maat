@@ -1,0 +1,92 @@
+[package]
+name = "affinidi-tdk-test-support"
+version = "0.8.6"
+description = "Shared in-process test fixtures and harnesses for the Affinidi TDK workspace"
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+# Published so external consumers can pull it in as a `dev-dependency`. The
+# fixture API stabilised with the TI-series; it is a `0.x` testing crate (see
+# the crate docs' Stability note).
+publish = true
+
+[dependencies]
+# ── TI2: did:web/webvh mock server + StaticResolver ──────────────────────
+## `DID`/`Document` types and the resolver traits the StaticResolver implements.
+## Path + explicit version so the crate stays publishable once the API settles.
+affinidi-did-common = { version = "0.4", path = "../../identity/affinidi-did-common" }
+affinidi-did-resolver-traits = { version = "0.1", path = "../../identity/affinidi-did-resolver-traits" }
+## In-process HTTP server backing MockDidWebServer.
+axum = "0.8"
+tokio = { workspace = true, features = [
+  "rt",
+  "rt-multi-thread",
+  "net",
+  "time",
+  "sync",
+  "macros",
+] }
+serde_json = "1"
+tracing = "0.1"
+thiserror = "2"
+
+# ── TI5: CredentialScenario (sd-jwt-vc issue/present/verify + status list) ─
+## sd-jwt-vc lives at `affinidi_vc::sd_jwt_vc`; sd-jwt provides the holder
+## present / verifier APIs + the SdHasher; status-list backs revocation.
+affinidi-vc = { version = "0.2", path = "../../credentials/affinidi-vc" }
+affinidi-sd-jwt = { version = "0.1", path = "../../credentials/affinidi-sd-jwt" }
+affinidi-status-list = { version = "0.1", path = "../../credentials/affinidi-status-list" }
+## `ed25519_pub_to_did_key` for deterministic issuer/holder/verifier DIDs;
+## `jose::key_agreement` backs the didcomm_fuzz deterministic keypairs.
+affinidi-crypto = { version = "0.2", path = "../../core/affinidi-crypto" }
+
+# ── #477: deterministic DIDComm envelope fixtures for fuzzing ──────────────
+## pack/unpack + Message types the didcomm_fuzz seed corpus packs against. A
+## dev-only edge — didcomm does not depend on test-support, so this is acyclic.
+affinidi-messaging-didcomm = { version = "0.15.9", path = "../../messaging/affinidi-messaging-didcomm" }
+
+# ── TI4a: seeded did:peer generation (determinism module) ─────────────────
+## Seeded `Secret` constructors (generate_ed25519(.., Some(seed)) etc.) +
+## KeyType; did-common's generate_peer / PeerCreateKey assemble the did:peer.
+affinidi-secrets-resolver = { version = "0.5", path = "../../core/affinidi-secrets-resolver" }
+## EdDSA signer/verifier backing the scenario's JWS signing (the workspace
+## sd-jwt crate ships only an HMAC test signer).
+ed25519-dalek = { version = "3" }
+base64 = "0.23"
+
+# ── TI5b: mdoc (COSE sign_mso/verify_issuer_auth) + OID4VP present/verify ──
+## mdoc issue/present/verify on the EdDSA COSE path; default-features off drops
+## the ES256/P-256 path the scenario's Ed25519 identities don't use.
+affinidi-mdoc = { version = "0.3", path = "../../credentials/affinidi-mdoc", default-features = false, features = [
+  "eddsa",
+] }
+## OID4VP authorization request/response + presentation-submission envelope.
+affinidi-openid4vp = { version = "0.1", path = "../../protocols/affinidi-openid4vp" }
+## CBOR for mdoc attribute values + the fixture's DeviceResponse transport;
+## coset for the COSE_Sign1 (de)serialisation that transport round-trips.
+ciborium = "0.2"
+coset = "0.4"
+## `derive` backs the DeviceResponseTransport (de)serialisation.
+serde = { version = "1", features = ["derive"] }
+
+# Later tasks add their own deps as each harness lands:
+#   TI4  seeded did:peer + clock      → affinidi-tdk, secrets-resolver
+#   TI7  shared vectors/ loader       → serde
+
+[dev-dependencies]
+## Drives the mock server over HTTP in the crate's own tests.
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+  "json",
+] }
+## `test-util` enables `#[tokio::test(start_paused = true)]` for the
+## virtual-clock delay/hang tests.
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

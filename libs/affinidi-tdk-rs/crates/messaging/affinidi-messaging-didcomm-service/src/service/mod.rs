@@ -1,0 +1,728 @@
+mod listener;
+mod mediator;
+mod restart;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::broadcast;
+
+use affinidi_messaging_didcomm::Message;
+use tokio::sync::{RwLock, watch};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::{DIDCommServiceConfig, ListenerConfig};
+use crate::error::DIDCommServiceError;
+use crate::handler::{DIDCommHandler, TspHandler};
+
+use listener::ConnectionHandle;
+
+const EVENT_CHANNEL_CAPACITY: usize = 64;
+const SHUTDOWN_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Lifecycle events emitted by listeners.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListenerEvent {
+    /// The listener has connected to its mediator.
+    Connected { listener_id: String },
+    /// The listener has disconnected from its mediator.
+    Disconnected {
+        listener_id: String,
+        error: Option<String>,
+    },
+    /// The listener is restarting after a failure.
+    Restarting {
+        listener_id: String,
+        attempt: u32,
+        delay: Duration,
+    },
+}
+
+/// Always-online message service over a single per-DID mediator websocket.
+///
+/// Multiplexes DIDComm and TSP on that one socket (a second socket for the same
+/// DID is evicted by the mediator as `duplicate-channel`): DIDComm frames go to
+/// the [`DIDCommHandler`] router, TSP frames to a [`TspHandler`]. Which protocols
+/// a listener handles is set by its [`Protocols`](crate::Protocols) config.
+///
+/// `DIDCommService` is a retained compatibility alias for this type.
+#[derive(Clone)]
+pub struct AffinidiMessageService {
+    listeners: Arc<RwLock<HashMap<String, ListenerHandle>>>,
+    handler: Arc<dyn DIDCommHandler>,
+    /// Optional TSP handler, attached via [`AffinidiMessageService::start_with_tsp`].
+    /// Used by listeners whose `protocols.tsp` is enabled to route inbound TSP
+    /// frames off the shared websocket.
+    tsp_handler: Option<Arc<dyn TspHandler>>,
+    shutdown: CancellationToken,
+    events_tx: broadcast::Sender<ListenerEvent>,
+}
+
+struct ListenerHandle {
+    id: String,
+    did: String,
+    task: JoinHandle<()>,
+    token: CancellationToken,
+    started_at: Instant,
+    restart_count: Arc<std::sync::atomic::AtomicU32>,
+    connection_rx: watch::Receiver<Option<ConnectionHandle>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListenerStatus {
+    pub id: String,
+    pub state: ListenerState,
+    pub restart_count: u32,
+    pub uptime: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListenerState {
+    Running,
+    Stopped,
+    Failed,
+}
+
+/// Retained compatibility alias for [`AffinidiMessageService`]. The service
+/// handled DIDComm only when first published; it now multiplexes DIDComm + TSP,
+/// hence the rename. Existing consumers keep compiling under this name.
+pub type DIDCommService = AffinidiMessageService;
+
+impl AffinidiMessageService {
+    pub async fn start(
+        config: DIDCommServiceConfig,
+        handler: impl DIDCommHandler,
+        shutdown: CancellationToken,
+    ) -> Result<DIDCommService, DIDCommServiceError> {
+        Self::start_inner(
+            config,
+            Arc::new(handler) as Arc<dyn DIDCommHandler>,
+            None,
+            shutdown,
+        )
+        .await
+    }
+
+    /// Like [`start`](Self::start), but also routes inbound **TSP** frames to
+    /// `tsp_handler` on listeners whose `protocols.tsp` is enabled. The TSP
+    /// frames ride the same single per-DID websocket as DIDComm (no second
+    /// socket). Routing only takes effect when this crate is built with the
+    /// `tsp` feature; without it the handler is stored but never invoked.
+    pub async fn start_with_tsp(
+        config: DIDCommServiceConfig,
+        handler: impl DIDCommHandler,
+        tsp_handler: impl TspHandler,
+        shutdown: CancellationToken,
+    ) -> Result<DIDCommService, DIDCommServiceError> {
+        Self::start_inner(
+            config,
+            Arc::new(handler) as Arc<dyn DIDCommHandler>,
+            Some(Arc::new(tsp_handler) as Arc<dyn TspHandler>),
+            shutdown,
+        )
+        .await
+    }
+
+    async fn start_inner(
+        config: DIDCommServiceConfig,
+        handler: Arc<dyn DIDCommHandler>,
+        tsp_handler: Option<Arc<dyn TspHandler>>,
+        shutdown: CancellationToken,
+    ) -> Result<DIDCommService, DIDCommServiceError> {
+        let listeners = Arc::new(RwLock::new(HashMap::new()));
+        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+        let service = AffinidiMessageService {
+            listeners: listeners.clone(),
+            handler: handler.clone(),
+            tsp_handler,
+            shutdown: shutdown.clone(),
+            events_tx,
+        };
+
+        // Validate no duplicate listener IDs or DIDs in initial config
+        {
+            let mut seen_ids = HashSet::new();
+            let mut seen_dids: HashMap<&str, &str> = HashMap::new();
+            for cfg in &config.listeners {
+                if !seen_ids.insert(cfg.id.as_str()) {
+                    return Err(DIDCommServiceError::ListenerAlreadyExists(cfg.id.clone()));
+                }
+                if let Some(existing) = seen_dids.get(cfg.profile.did.as_str()) {
+                    return Err(DIDCommServiceError::DuplicateDid {
+                        did: cfg.profile.did.clone(),
+                        existing_listener: existing.to_string(),
+                    });
+                }
+                seen_dids.insert(&cfg.profile.did, &cfg.id);
+            }
+        }
+
+        for listener_config in config.listeners {
+            service.spawn_listener(listener_config).await?;
+        }
+
+        Ok(service)
+    }
+
+    /// Subscribe to listener lifecycle events.
+    ///
+    /// Returns a receiver that yields [`ListenerEvent`]s as listeners
+    /// connect, disconnect, or restart. Multiple subscribers are supported.
+    pub fn subscribe(&self) -> broadcast::Receiver<ListenerEvent> {
+        self.events_tx.subscribe()
+    }
+
+    pub async fn add_listener(&self, config: ListenerConfig) -> Result<(), DIDCommServiceError> {
+        let listeners = self.listeners.read().await;
+        if listeners.contains_key(&config.id) {
+            return Err(DIDCommServiceError::ListenerAlreadyExists(
+                config.id.clone(),
+            ));
+        }
+        if let Some(handle) = listeners.values().find(|h| h.did == config.profile.did) {
+            return Err(DIDCommServiceError::DuplicateDid {
+                did: config.profile.did.clone(),
+                existing_listener: handle.id.clone(),
+            });
+        }
+        drop(listeners);
+
+        self.spawn_listener(config).await
+    }
+
+    pub async fn remove_listener(&self, listener_id: &str) -> Result<(), DIDCommServiceError> {
+        let mut listeners = self.listeners.write().await;
+        let handle = listeners
+            .remove(listener_id)
+            .ok_or_else(|| DIDCommServiceError::ListenerNotFound(listener_id.to_string()))?;
+
+        handle.token.cancel();
+        drop(listeners);
+        let _ = handle.task.await;
+        Ok(())
+    }
+
+    /// Cancels the service-wide shutdown token and awaits each listener
+    /// task's `JoinHandle` so callers know all per-listener work has
+    /// actually returned (not merely been signalled to stop).
+    ///
+    /// Each task is awaited with a bounded outer timeout so a misbehaving
+    /// listener can't deadlock shutdown — if the timeout fires, the task is
+    /// detached and the runtime drops it on process exit.
+    pub async fn shutdown(&self) {
+        self.shutdown.cancel();
+        // Drain the map under the write lock so we can join tasks without
+        // holding it (joining requires owning the JoinHandle).
+        let handles: Vec<JoinHandle<()>> = {
+            let mut listeners = self.listeners.write().await;
+            listeners.drain().map(|(_, h)| h.task).collect()
+        };
+        for task in handles {
+            let _ = tokio::time::timeout(SHUTDOWN_TASK_JOIN_TIMEOUT, task).await;
+        }
+    }
+
+    pub async fn list_listeners(&self) -> Vec<ListenerStatus> {
+        let listeners = self.listeners.read().await;
+        listeners
+            .values()
+            .map(|handle| {
+                let state = if handle.task.is_finished() {
+                    ListenerState::Stopped
+                } else {
+                    ListenerState::Running
+                };
+                ListenerStatus {
+                    id: handle.id.clone(),
+                    state,
+                    restart_count: handle
+                        .restart_count
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    uptime: handle.started_at.elapsed(),
+                }
+            })
+            .collect()
+    }
+
+    /// Returns the DID associated with a listener.
+    pub async fn listener_did(&self, listener_id: &str) -> Option<String> {
+        let listeners = self.listeners.read().await;
+        listeners.get(listener_id).map(|h| h.did.clone())
+    }
+
+    /// Waits until the specified listener has established a connection to
+    /// its mediator, or until the timeout expires. Also returns early with
+    /// `NotConnected` if the service's internal shutdown token is
+    /// cancelled while waiting — keeps callers from being parked through
+    /// the full timeout window during process shutdown.
+    pub async fn wait_connected(
+        &self,
+        listener_id: &str,
+        timeout: Duration,
+    ) -> Result<(), DIDCommServiceError> {
+        self.wait_connected_with_cancel(listener_id, timeout, &self.shutdown)
+            .await
+    }
+
+    /// Like [`wait_connected`](Self::wait_connected) but races the wait
+    /// against a caller-supplied [`CancellationToken`] in addition to the
+    /// timeout. Returns `NotConnected` if the token fires before the
+    /// connection is established.
+    pub async fn wait_connected_with_cancel(
+        &self,
+        listener_id: &str,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<(), DIDCommServiceError> {
+        let listeners = self.listeners.read().await;
+        let handle = listeners
+            .get(listener_id)
+            .ok_or_else(|| DIDCommServiceError::ListenerNotFound(listener_id.to_string()))?;
+        let mut rx = handle.connection_rx.clone();
+        drop(listeners);
+
+        tokio::select! {
+            res = tokio::time::timeout(timeout, rx.wait_for(|v| v.is_some())) => {
+                res.map_err(DIDCommServiceError::Timeout)?
+                    .map_err(|_| DIDCommServiceError::NotConnected(listener_id.to_string()))?;
+                Ok(())
+            }
+            _ = cancel.cancelled() => Err(DIDCommServiceError::NotConnected(listener_id.to_string())),
+        }
+    }
+
+    /// Send a proactive DIDComm message through an existing listener's
+    /// mediator connection.
+    ///
+    /// The message is packed (encrypted) and forwarded through the mediator
+    /// to the recipient. Uses the same ATM connection as the listener,
+    /// avoiding duplicate websocket sessions.
+    ///
+    /// # Arguments
+    /// * `listener_id` — which listener's connection to use
+    /// * `message` — the plaintext DIDComm `Message` to send
+    /// * `recipient_did` — the recipient's DID
+    pub async fn send_message(
+        &self,
+        listener_id: &str,
+        message: Message,
+        recipient_did: &str,
+    ) -> Result<(), DIDCommServiceError> {
+        let listeners = self.listeners.read().await;
+        let handle = listeners
+            .get(listener_id)
+            .ok_or_else(|| DIDCommServiceError::ListenerNotFound(listener_id.to_string()))?;
+
+        let conn = handle
+            .connection_rx
+            .borrow()
+            .clone()
+            .ok_or_else(|| DIDCommServiceError::NotConnected(listener_id.to_string()))?;
+
+        drop(listeners);
+
+        crate::transport::send_message(&conn.atm, &conn.profile, message, recipient_did).await
+    }
+
+    /// Send a **TSP** message over the listener's shared mediator websocket —
+    /// the TSP counterpart of [`send_message`](Self::send_message).
+    ///
+    /// Resolves the listener's connection and packs+sends via `atm.tsp()`,
+    /// reusing the one per-DID socket (no second connection). Requires the
+    /// `tsp` feature.
+    ///
+    /// This is a TSP **Direct** send sealed to `recipient_did`. For a recipient
+    /// reached through a TSP-routing mediator, use
+    /// [`send_tsp_routed`](Self::send_tsp_routed).
+    #[cfg(feature = "tsp")]
+    pub async fn send_tsp(
+        &self,
+        listener_id: &str,
+        recipient_did: &str,
+        payload: &[u8],
+    ) -> Result<(), DIDCommServiceError> {
+        let conn = {
+            let listeners = self.listeners.read().await;
+            let handle = listeners
+                .get(listener_id)
+                .ok_or_else(|| DIDCommServiceError::ListenerNotFound(listener_id.to_string()))?;
+            handle
+                .connection_rx
+                .borrow()
+                .clone()
+                .ok_or_else(|| DIDCommServiceError::NotConnected(listener_id.to_string()))?
+        };
+
+        conn.atm
+            .tsp()
+            .send(&conn.profile, recipient_did, payload)
+            .await?;
+        Ok(())
+    }
+
+    /// Send a **TSP routed** message through one or more relay hops — metadata-
+    /// private delivery via a TSP-routing mediator. `route` is the ordered hop
+    /// list ending at the final recipient (e.g. `[recipient_mediator, recipient]`).
+    /// Requires the `tsp` feature.
+    #[cfg(feature = "tsp")]
+    pub async fn send_tsp_routed(
+        &self,
+        listener_id: &str,
+        route: &[String],
+        payload: &[u8],
+    ) -> Result<(), DIDCommServiceError> {
+        let conn = {
+            let listeners = self.listeners.read().await;
+            let handle = listeners
+                .get(listener_id)
+                .ok_or_else(|| DIDCommServiceError::ListenerNotFound(listener_id.to_string()))?;
+            handle
+                .connection_rx
+                .borrow()
+                .clone()
+                .ok_or_else(|| DIDCommServiceError::NotConnected(listener_id.to_string()))?
+        };
+
+        conn.atm
+            .tsp()
+            .send_routed(&conn.profile, route, payload)
+            .await?;
+        Ok(())
+    }
+
+    /// Ensure a TSP relationship exists from `listener_id` to `peer_did`,
+    /// forming one if absent (spec Rev 3 §7.2.2).
+    ///
+    /// An application send ([`send_tsp`](Self::send_tsp)) to a peer this endpoint
+    /// holds no relationship with is dropped by the peer's §7.2.2 gate. Call this
+    /// first — for an ephemeral node, at every (re)connect — so the peer admits
+    /// the traffic that follows. It is **idempotent by state read**: when a
+    /// relationship already admits application messages it returns `Ok(())`
+    /// without sending, which matters once a durable
+    /// [`relationship_store`](crate::ListenerConfig::with_relationship_store)
+    /// makes a reconnect start from a non-`None` state — an unconditional
+    /// re-invite would otherwise be an invalid `SendInvite` transition.
+    ///
+    /// The invite is **routed** (§7.2.4): `form_relationship_routed` carries a
+    /// `Reply_Path` through the profile's mediator, so the peer's accept routes
+    /// back. Kept separate from [`send_tsp`](Self::send_tsp), which stays a pure
+    /// application send.
+    #[cfg(feature = "tsp")]
+    pub async fn tsp_ensure_relationship(
+        &self,
+        listener_id: &str,
+        peer_did: &str,
+    ) -> Result<(), DIDCommServiceError> {
+        let conn = {
+            let listeners = self.listeners.read().await;
+            let handle = listeners
+                .get(listener_id)
+                .ok_or_else(|| DIDCommServiceError::ListenerNotFound(listener_id.to_string()))?;
+            handle
+                .connection_rx
+                .borrow()
+                .clone()
+                .ok_or_else(|| DIDCommServiceError::NotConnected(listener_id.to_string()))?
+        };
+
+        let state = conn
+            .atm
+            .tsp()
+            .relationship_state(&conn.profile, peer_did)
+            .await?;
+        if state.admits_application_message() {
+            return Ok(());
+        }
+        conn.atm
+            .tsp()
+            .form_relationship_routed(&conn.profile, peer_did)
+            .await?;
+        Ok(())
+    }
+
+    /// Like [`send_message`](Self::send_message), but retries on
+    /// [`NotConnected`](DIDCommServiceError::NotConnected) errors using
+    /// exponential backoff.
+    ///
+    /// Waits for the listener's connection to become available between
+    /// retries rather than busy-looping.
+    pub async fn send_message_with_retry(
+        &self,
+        listener_id: &str,
+        message: Message,
+        recipient_did: &str,
+        max_retries: u32,
+        initial_backoff: Duration,
+    ) -> Result<(), DIDCommServiceError> {
+        let mut attempt = 0u32;
+        loop {
+            match self
+                .send_message(listener_id, message.clone(), recipient_did)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(DIDCommServiceError::NotConnected(_)) if attempt < max_retries => {
+                    attempt += 1;
+                    let backoff = initial_backoff
+                        .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)));
+                    // Wait for connection or backoff timeout, whichever comes first
+                    let _ = self.wait_connected(listener_id, backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    async fn spawn_listener(&self, config: ListenerConfig) -> Result<(), DIDCommServiceError> {
+        let listener_id = config.id.clone();
+        let listener_did = config.profile.did.clone();
+        let listener_token = self.shutdown.child_token();
+        let handler = self.handler.clone();
+        let tsp_handler = self.tsp_handler.clone();
+        let restart_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let restart_count_clone = restart_count.clone();
+        let token_clone = listener_token.clone();
+        let events_tx = self.events_tx.clone();
+
+        let (connection_tx, connection_rx) = watch::channel(None);
+
+        let task = tokio::spawn(async move {
+            let mut listener = listener::Listener::new(
+                config,
+                handler,
+                tsp_handler,
+                token_clone,
+                connection_tx,
+                events_tx,
+            );
+            listener.run_with_restart(restart_count_clone).await;
+        });
+
+        let handle = ListenerHandle {
+            id: listener_id.clone(),
+            did: listener_did,
+            task,
+            token: listener_token,
+            started_at: Instant::now(),
+            restart_count,
+            connection_rx,
+        };
+
+        self.listeners.write().await.insert(listener_id, handle);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ListenerConfig, Protocols, RestartPolicy};
+    use affinidi_messaging_didcomm::Message;
+    use affinidi_tdk_common::profiles::TDKProfile;
+    use serde_json::json;
+
+    fn make_service() -> AffinidiMessageService {
+        use crate::handler::ignore_handler;
+        use crate::router::{Router, handler_fn};
+
+        let handler = Router::new()
+            .route("test", handler_fn(ignore_handler))
+            .expect("valid route");
+        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        AffinidiMessageService {
+            listeners: Arc::new(RwLock::new(HashMap::new())),
+            handler: Arc::new(handler),
+            tsp_handler: None,
+            shutdown: CancellationToken::new(),
+            events_tx,
+        }
+    }
+
+    fn make_message() -> Message {
+        Message::build(
+            "test-id".to_string(),
+            "https://example.com/test".to_string(),
+            json!({}),
+        )
+        .from("did:example:sender".to_string())
+        .to("did:example:recipient".to_string())
+        .finalize()
+    }
+
+    #[tokio::test]
+    async fn send_message_listener_not_found() {
+        let service = make_service();
+        let msg = make_message();
+
+        let result = service
+            .send_message("nonexistent", msg, "did:example:recipient")
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DIDCommServiceError::ListenerNotFound(ref id) if id == "nonexistent"),
+            "expected ListenerNotFound, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_not_connected() {
+        let service = make_service();
+        let msg = make_message();
+
+        // Insert a listener handle with a watch channel that holds None
+        // (simulating a listener that hasn't connected yet)
+        let (_tx, rx) = watch::channel(None);
+        let handle = ListenerHandle {
+            id: "test-listener".to_string(),
+            did: "did:example:test".to_string(),
+            task: tokio::spawn(async {}),
+            token: CancellationToken::new(),
+            started_at: Instant::now(),
+            restart_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            connection_rx: rx,
+        };
+        service
+            .listeners
+            .write()
+            .await
+            .insert("test-listener".to_string(), handle);
+
+        let result = service
+            .send_message("test-listener", msg, "did:example:recipient")
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DIDCommServiceError::NotConnected(ref id) if id == "test-listener"),
+            "expected NotConnected, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_listener_rejects_duplicate_did() {
+        let service = make_service();
+
+        // Pre-insert a listener handle with did:example:alice
+        let (_tx, rx) = watch::channel(None);
+        let handle = ListenerHandle {
+            id: "listener-1".to_string(),
+            did: "did:example:alice".to_string(),
+            task: tokio::spawn(async {}),
+            token: CancellationToken::new(),
+            started_at: Instant::now(),
+            restart_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            connection_rx: rx,
+        };
+        service
+            .listeners
+            .write()
+            .await
+            .insert("listener-1".to_string(), handle);
+
+        // Try to add a new listener with a different ID but the same DID
+        let config = ListenerConfig {
+            id: "listener-2".to_string(),
+            profile: TDKProfile::new("alice-duplicate", "did:example:alice", None, vec![]),
+            acl_mode: None,
+            restart_policy: RestartPolicy::Never,
+            message_wait_duration_secs: 5,
+            auto_delete: true,
+            tdk_config: None,
+            protocols: Protocols::default(),
+            #[cfg(feature = "tsp")]
+            relationship_store: None,
+        };
+
+        let result = service.add_listener(config).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DIDCommServiceError::DuplicateDid {
+                    ref did,
+                    ref existing_listener,
+                } if did == "did:example:alice" && existing_listener == "listener-1"
+            ),
+            "expected DuplicateDid, got: {err}"
+        );
+    }
+
+    /// Regression for the 30s shutdown hang: `wait_connected` must observe
+    /// the service's internal shutdown token and return promptly when
+    /// `shutdown()` is called, rather than parking the caller for the full
+    /// timeout window.
+    #[tokio::test]
+    async fn wait_connected_aborts_when_service_shutdown() {
+        let service = make_service();
+
+        // Listener handle whose connection_rx never publishes Some — i.e. a
+        // listener whose mediator is unreachable.
+        let (_tx, rx) = watch::channel::<Option<ConnectionHandle>>(None);
+        let listener_token = service.shutdown.child_token();
+        let task = tokio::spawn({
+            let token = listener_token.clone();
+            async move { token.cancelled().await }
+        });
+        let handle = ListenerHandle {
+            id: "stuck".to_string(),
+            did: "did:example:stuck".to_string(),
+            task,
+            token: listener_token,
+            started_at: Instant::now(),
+            restart_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            connection_rx: rx,
+        };
+        service
+            .listeners
+            .write()
+            .await
+            .insert("stuck".to_string(), handle);
+
+        let svc = service.clone();
+        let waiter =
+            tokio::spawn(async move { svc.wait_connected("stuck", Duration::from_secs(60)).await });
+
+        // Simulate Ctrl-C arriving 100ms after wait_connected starts.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let shutdown_started = tokio::time::Instant::now();
+        service.shutdown().await;
+        let shutdown_elapsed = shutdown_started.elapsed();
+
+        let waiter_result = waiter.await.expect("waiter task panicked");
+        assert!(
+            matches!(waiter_result, Err(DIDCommServiceError::NotConnected(ref id)) if id == "stuck"),
+            "wait_connected should return NotConnected on shutdown, got: {waiter_result:?}"
+        );
+        assert!(
+            shutdown_elapsed < Duration::from_secs(1),
+            "shutdown() should return promptly, took: {shutdown_elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_handle_lifecycle() {
+        // Verify the watch channel correctly transitions between
+        // None (disconnected) and Some (connected)
+        let (tx, rx) = watch::channel::<Option<ConnectionHandle>>(None);
+
+        // Initially not connected
+        assert!(rx.borrow().is_none());
+
+        // Simulate connect by sending a None → stays None
+        let _ = tx.send(None);
+        assert!(rx.borrow().is_none());
+
+        // We can't construct a real ConnectionHandle without ATM,
+        // but we can verify the channel mechanics by dropping the sender
+        drop(tx);
+        // Receiver still holds the last value
+        assert!(rx.borrow().is_none());
+    }
+}

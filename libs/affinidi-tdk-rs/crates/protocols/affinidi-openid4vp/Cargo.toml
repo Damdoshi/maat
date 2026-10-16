@@ -1,0 +1,32 @@
+[package]
+name = "affinidi-openid4vp"
+description = "OpenID for Verifiable Presentations (OpenID4VP) implementation."
+version = "0.1.4"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords = ["ssi", "affinidi", "openid4vp", "presentations"]
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[features]
+# Receive an encrypted `direct_post.jwt` authorization response (JWE with
+# ECDH-ES direct, A128GCM / A256GCM).
+direct-post-jwt = ["affinidi-oid4vc-core/jwe"]
+
+[dependencies]
+# >= 0.1.10 for the `jwe` module behind `direct-post-jwt`.
+affinidi-oid4vc-core = { version = "0.1.10", path = "../affinidi-oid4vc-core" }
+base64 = "0.23"
+sha2 = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

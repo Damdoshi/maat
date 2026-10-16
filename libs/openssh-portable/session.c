@@ -35,6 +35,8 @@
 
 #include "includes.h"
 
+#include "maat_uid_guard.h"
+
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/un.h>
@@ -134,7 +136,7 @@ void
 maat_session_init(int fd, uid_t session_uid)
 {
     if (maat_session_fd >= 0 || fd < 0 ||
-        session_uid < 1800000000U || session_uid > 1899999999U ||
+        !maat_uid_plausible(session_uid) ||
         geteuid() != 0)
         fatal("Maât cannot initialize post-auth session binding");
     maat_session_fd=fd;
@@ -446,8 +448,7 @@ do_exec_no_pty(struct ssh *ssh, Session *s, const char *command)
 #ifdef MAAT_MONITOR_SOCKET
     // The monitor allocated this descriptor AND the ephemeral UID before
     // the post-auth process dropped privileges. Fail closed if absent.
-    if (maat_session_fd < 0 || maat_session_uid < 1800000000U ||
-        maat_session_uid > 1899999999U)
+    if (maat_session_fd < 0 || !maat_uid_plausible(maat_session_uid))
         fatal("Maât post-auth binding unavailable");
 #endif
 
@@ -1545,7 +1546,7 @@ do_child(struct ssh *ssh, Session *s, const char *command)
     // We are already running with the unique per-session kernel UID.
     // Post-auth privilege drop occurs in sshd-session.c, never here.
     if (maat_session_fd < 0 ||
-        maat_session_uid<1800000000U || maat_session_uid>1899999999U ||
+        !maat_uid_plausible(maat_session_uid) ||
         geteuid()!=maat_session_uid || strcmp(pw->pw_name,"maatweb")!=0)
         fatal("Maât session privilege isolation failed closed");
 #endif

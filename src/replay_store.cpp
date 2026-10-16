@@ -1,6 +1,7 @@
 #include "replay_store.hpp"
 #include <stdexcept>
 #include <ctime>
+#include <cstdio>
 
 namespace maat {
 namespace {
@@ -13,6 +14,12 @@ ReplayStore::ReplayStore(const std::string& path) {
     if (sqlite3_open_v2(path.c_str(),&db_, SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|
                          SQLITE_OPEN_FULLMUTEX,nullptr)!=SQLITE_OK)
         throw std::runtime_error("could not open replay store");
+    // The broker writes to this same SQLite database during SSH session binding.
+    // Without a busy handler, concurrent verified logins can be rejected on
+    // transient SQLITE_BUSY rather than waiting for the broker to commit.
+    // Keep this below the OpenSSH monitor's 2 s acknowledgement timeout.
+    if(sqlite3_busy_timeout(db_,1200)!=SQLITE_OK)
+        throw std::runtime_error("cannot configure replay-store SQLite timeout");
     run(db_,"PRAGMA journal_mode=WAL;");
     run(db_,"PRAGMA synchronous=FULL;");
     run(db_,"CREATE TABLE IF NOT EXISTS verified_ssh_sessions ("
@@ -34,6 +41,10 @@ bool ReplayStore::record(const AuthenticatedSession& session) {
     if(rc==SQLITE_OK) rc=sqlite3_bind_blob(stmt,3,blob.data(),int(blob.size()),SQLITE_TRANSIENT);
     if(rc==SQLITE_OK) rc=sqlite3_bind_int64(stmt,4,std::time(nullptr));
     if(rc==SQLITE_OK) rc=sqlite3_step(stmt);
+    // No key, username or session identifier is logged. Distinguish database
+    // write contention from rejected replays during test diagnosis.
+    if(rc==SQLITE_BUSY || rc==SQLITE_LOCKED)
+        std::fprintf(stderr,"Maât replay-store: SQLite write contention (%d)\n",rc);
     sqlite3_finalize(stmt);
     return rc==SQLITE_DONE;
 }

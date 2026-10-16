@@ -11,6 +11,9 @@
 #include <stdexcept>
 #include <vector>
 #include <random>
+#include <thread>
+#include <chrono>
+#include <atomic>
 
 static int checks=0;
 static void check(bool b, const char* msg) {
@@ -34,7 +37,7 @@ static std::vector<uint8_t> key() {
 static maat::AuthenticatedSession identity(uint8_t marker=1) {
     return maat::AuthenticatedSession("maatuser",std::vector<uint8_t>(32,marker),maat::PublicKey(key()));
 }
-static bool exchange(maat::MonitorReceiver& r,const std::vector<uint8_t>& packet) {
+static bool monitor_exchange(maat::MonitorReceiver& r,const std::vector<uint8_t>& packet) {
     int fd[2]; check(socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0,fd)==0,"socketpair");
     check(send(fd[0],packet.data(),packet.size(),0)==ssize_t(packet.size()),"send packet");
     bool result=r.receive(fd[1]);
@@ -68,12 +71,53 @@ int main() {
     {
         maat::ReplayStore store(filename);
         maat::MonitorReceiver receiver(store,getuid());
-        check(exchange(receiver,valid),"real socket accepted");
-        check(!exchange(receiver,valid),"duplicate rejected");
-        check(!exchange(receiver,corrupted),"truncated packet rejected");
-        check(exchange(receiver,maat::MonitorMessage::encode(identity(2))),"distinct session accepted");
+        check(monitor_exchange(receiver,valid),"real socket accepted");
+        check(!monitor_exchange(receiver,valid),"duplicate rejected");
+        check(!monitor_exchange(receiver,corrupted),"truncated packet rejected");
+        check(monitor_exchange(receiver,maat::MonitorMessage::encode(identity(2))),"distinct session accepted");
+        // Reproduce a broker writer holding BEGIN IMMEDIATE while OpenSSH
+        // submits another valid assertion. Before the busy-timeout fix,
+        // ReplayStore::record() fails instantly with SQLITE_BUSY.
+        sqlite3* broker=nullptr;
+        check(sqlite3_open_v2(filename,&broker,SQLITE_OPEN_READWRITE|SQLITE_OPEN_FULLMUTEX,
+                              nullptr)==SQLITE_OK,"second SQLite writer opened");
+        check(sqlite3_exec(broker,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr)==SQLITE_OK,
+              "simulate broker write transaction");
+        std::atomic<bool> committed{false};
+        std::thread release([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(180));
+            committed.store(sqlite3_exec(broker,"COMMIT",nullptr,nullptr,nullptr)==SQLITE_OK);
+        });
+        const auto start=std::chrono::steady_clock::now();
+        const bool accepted=monitor_exchange(receiver,maat::MonitorMessage::encode(identity(4)));
+        const auto waited=std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now()-start).count();
+        release.join();
+        sqlite3_close(broker);
+        check(committed.load(),"broker transaction completed");
+        check(accepted,"valid SSH assertion waited for SQLite writer and was accepted");
+        check(waited>=100,"concurrent SQLite assertion did not fail immediately");
+        check(!monitor_exchange(receiver,maat::MonitorMessage::encode(identity(4))),
+              "replay rejected after SQLite contention");
+        // A writer that does not release its lock must NOT cause OpenSSH to
+        // acknowledge authentication. Bound waiting is not infinite retry.
+        check(sqlite3_open_v2(filename,&broker,SQLITE_OPEN_READWRITE|SQLITE_OPEN_FULLMUTEX,
+                              nullptr)==SQLITE_OK,"locked-writer SQLite opened");
+        check(sqlite3_exec(broker,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr)==SQLITE_OK,
+              "simulate stalled broker transaction");
+        const auto blockedAt=std::chrono::steady_clock::now();
+        const bool incorrectlyAccepted=monitor_exchange(receiver,maat::MonitorMessage::encode(identity(5)));
+        const auto blockedMs=std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now()-blockedAt).count();
+        check(!incorrectlyAccepted,"stalled SQLite writer must fail closed");
+        check(blockedMs>=950 && blockedMs<1900,"SQLite busy wait remains bounded");
+        check(sqlite3_exec(broker,"COMMIT",nullptr,nullptr,nullptr)==SQLITE_OK,
+              "release stalled broker lock");
+        sqlite3_close(broker);
+        check(monitor_exchange(receiver,maat::MonitorMessage::encode(identity(5))),
+              "previously unacknowledged assertion can be submitted after lock releases");
         maat::MonitorReceiver otherUid(store,getuid()+1);
-        check(!exchange(otherUid,maat::MonitorMessage::encode(identity(3))),"untrusted peer UID rejected");
+        check(!monitor_exchange(otherUid,maat::MonitorMessage::encode(identity(3))),"untrusted peer UID rejected");
     }
     {
         maat::ReplayStore reopened(filename);

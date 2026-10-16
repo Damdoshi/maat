@@ -1,0 +1,160 @@
+# Changelog
+
+## Unreleased (0.4.3) — a service endpoint's URI is a URI
+
+`Endpoint::get_uri` and `get_uris` return the `uri` member's **value** for the
+map and array forms of `serviceEndpoint`, as they already did for the plain
+URL form. Before, those forms returned its JSON encoding, quotes included
+(`"\"did:example:mediator\""`). A caller that checked the result (a
+`starts_with("did:")` to tell a mediator DID from a URL, say) silently found
+nothing. A non-string `uri` is now skipped rather than returned as JSON text.
+
+The fix was merged in #785 but never released: that change left the version
+at 0.4.2, which was already published, so crates.io kept serving the old
+code. Callers that stripped the quotes themselves are unaffected, because
+trimming an unquoted string changes nothing.
+
+## Unreleased (0.4.2) — dependency refresh
+
+- Bumps `base64` 0.22 → 0.23.
+- No source or API change; the bumps are declaration-only and the crate
+  compiles unmodified against them. Bumped workspace-wide in the same
+  change so no two versions of these crates are compiled side by side.
+
+## 31st July 2026 (0.4.1)
+
+Moves to **curve25519-dalek 5** (`ed25519-dalek` 2 -> 3, `x25519-dalek` 2 -> 3),
+which brings rand_core 0.10 and signature 3 with it. rand 0.10 renamed `OsRng`
+to `SysRng` *and* made it fallible (`TryRng<Error = SysError>`), so it no longer
+satisfies dalek's `CryptoRng` bound; key generation moves to `rand::rng()`.
+
+Patch bump, per [ADR 0003](../../../docs/adr/0003-public-api-semver-policy.md) point 3: `vta-sdk` pins this crate through
+`[patch.crates-io]`, and a minor bump would break the redirect and pull a second
+copy from crates.io.
+
+All notable changes to `affinidi-did-common` are documented here. The
+format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this crate follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.4.0] - 2026-07-19
+
+### Added
+
+- `Document::also_known_as` (`alsoKnownAs`) is now a **typed field** (`Vec<String>`)
+  rather than an untyped entry in the flattened `parameters_set` map, plus
+  `DocumentBuilder::also_known_as` / `also_known_as_many` to set it.
+
+  The DID specification defines `alsoKnownAs` as a set, so it always *serializes*
+  as a JSON array and is omitted entirely when empty. Deserialization is
+  deliberately lenient and also accepts a **bare string**, because documents in
+  the wild emit that form; a bare string normalizes to a single-element array on
+  the next serialization.
+
+  This is groundwork for agent-name (DID shortcut) resolution, where the
+  mandatory anti-spoofing check is that a resolved DID Document's `alsoKnownAs`
+  contains the agent name that was used to reach it.
+
+  The change itself is additive: `Document` is `#[non_exhaustive]`, so consumers
+  already construct it via `Document::new` / `DocumentBuilder` / deserialization
+  rather than struct literals, and no consumer code needs to change.
+
+  Note for anyone who previously read the value out of the untyped map:
+  `parameters_set["alsoKnownAs"]` is now absent — read `doc.also_known_as`.
+
+### Changed
+
+- **Minor version bump to `0.4.0`.** Although the API change above is additive,
+  this is released as a minor rather than a patch, which means every consumer
+  must move its requirement from `"0.3"` to `"0.4"`. Per ADR 0003 §3 a minor bump
+  of this crate breaks any `[patch.crates-io]` redirect held by an external
+  crates.io consumer still pinning `"0.3"`, so those consumers must be released
+  first. The one such consumer, `didwebvh-rs`, is updated in lockstep
+  (`0.5.8`, requiring `affinidi-did-common "0.4"`); it needed only the dependency
+  bump, no code changes.
+
+## [0.3.9] - 2026-06-23
+
+### Fixed
+
+- `did:peer` resolution dropped **non-DIDComm service types**:
+  `PeerService::to_did_service` hardcoded the resolved service type to
+  `DIDCommMessaging` regardless of the encoded `t` value, so a `did:peer` that
+  published e.g. a TSP transport endpoint resolved to a `DIDCommMessaging` service
+  and the original type was lost. The service type is now expanded properly: `dm`
+  → `DIDCommMessaging`, `tsp` → `TSPTransport`, and any other type is preserved
+  verbatim. Existing `dm` services are unchanged.
+
+## [0.3.8] - 2026-06-22
+
+### Fixed
+
+- `DocumentExt::find_authentication(None)` returned the document's **`keyAgreement`**
+  ids instead of its **`authentication`** ids (a copy-paste of `find_key_agreement`).
+  Callers asking for the default authentication keys got key-agreement (X25519)
+  keys. Fixed to return `authentication`, and the regression test now asserts the
+  returned ids rather than only their count (the old count-only assertion passed
+  coincidentally because the test document had equal numbers of each). This also
+  fixes `affinidi-messaging-sdk`'s DIDComm signed-message verification for the
+  bare-DID `kid` case, which depends on this method.
+
+## [0.3.7] - 2026-06-14
+
+### Changed
+
+- `DIDError`, `KeyError`, `KeyNegotiationError`, and `PeerError` are now
+  `#[non_exhaustive]` (ADR-0003) so future variants are additive. Patch bump to
+  keep the `0.3` pin — including the `didwebvh-rs` `[patch.crates-io]` redirect —
+  valid; consumers that `match` these must add a `_` arm. No behaviour change.
+
+## [0.3.6] - 2026-06-13
+
+### Changed
+
+- Sealed the public API for future-proofing (semver wave W9, released W11):
+  `DocumentError`, `Endpoint`, `VerificationRelationship`, and `OneOrMany` are
+  now `#[non_exhaustive]` (match with a wildcard arm); `Document`, `Service`, and
+  `VerificationMethod` are `#[non_exhaustive]` (construct via the existing
+  builders / `Document::new`; fields stay public for reads). Patch bump preserves
+  the `didwebvh-rs` `[patch.crates-io]` coupling — see ADR 0003 and
+  `docs/migration/2026-06-semver-wave.md`.
+
+## [0.3.5] - 2026-06-06
+
+### Added
+
+- `key_negotiation` module (behind the new opt-in `key-agreement` feature)
+  — the single home for sender/recipient key-agreement curve negotiation,
+  shared by the messaging SDK and the DID-authentication layer (#357). It
+  exposes `negotiate_authcrypt` (bidirectional best-curve match over the
+  cross-product of sender×recipient keys, by a documented preference order
+  `X25519 > P-256 > secp256k1`), `select_anoncrypt_key` (first recipient KA
+  key that resolves to a supported curve, skipping undecodable codecs),
+  `resolve_public_key_agreement`, the `DEFAULT_CURVE_PREFERENCE` constant,
+  and a neutral `KeyNegotiationError` (whose `NoCommonCurve` names the curve
+  set each side offered). The curve-preference policy is overridable at
+  runtime: both `negotiate_authcrypt` and `select_anoncrypt_key` take a
+  `preference: &[Curve]` argument (pass `DEFAULT_CURVE_PREFERENCE` for the
+  standard policy, or a custom order to force e.g. P-256 first). The default
+  policy and key resolution now span all five key-agreement curves —
+  `X25519 > P-256 > P-384 > P-521 > secp256k1` (#357) — including JWK
+  decoding of `crv: "P-521"`. Anoncrypt
+  uses the **same** preference-ordered selection as authcrypt — it picks the
+  recipient's most-preferred usable curve rather than the document-first
+  key — so signed and anonymous encryption never diverge. The feature gates
+  an `affinidi-crypto/jose` dependency, so the default build of this crate is
+  unchanged. This replaces the byte-for-byte-duplicated negotiation helpers
+  that previously lived in both call-site crates.
+
+## [0.3.4] - 2026-05-31
+
+### Added
+
+- `VerificationMethod::decode_public_key() -> (multicodec, bytes)` —
+  a single decoder for verification material that handles both
+  `publicKeyMultibase` (Multikey) and `publicKeyJwk` (via
+  `affinidi-crypto`), returning the multicodec + raw key bytes (32 octets
+  for Ed25519/X25519, uncompressed SEC1 for the EC curves). This is the
+  shared source of truth used by the messaging SDK and the
+  DID-authentication layer, replacing their previously-duplicated
+  JWK/multibase parsing (which had drifted — see the ECDH-1PU interop
+  work in `affinidi-messaging-didcomm` 0.14).

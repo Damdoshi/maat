@@ -1,0 +1,9 @@
+-include maat.dep
+maat.lo: /home/damdoshi/maat/php-ext/maat.c
+	$(LIBTOOL) --mode=compile $(CC) -I. -I/home/damdoshi/maat/php-ext $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS)   -DZEND_COMPILE_DL_EXT=1 -c /home/damdoshi/maat/php-ext/maat.c -o maat.lo  -MMD -MF maat.dep -MT maat.lo
+$(phplibdir)/maat.la: ./maat.la
+	$(LIBTOOL) --mode=install cp ./maat.la $(phplibdir)
+
+./maat.la: $(shared_objects_maat) $(MAAT_SHARED_DEPENDENCIES)
+	$(LIBTOOL) --mode=link $(CC) -shared $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS) $(LDFLAGS)  -o $@ -export-dynamic -avoid-version -prefer-pic -module -rpath $(phplibdir) $(EXTRA_LDFLAGS) $(shared_objects_maat) $(MAAT_SHARED_LIBADD)
+

@@ -1,0 +1,124 @@
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum PolicyViolation {
+    #[error("Message must be encrypted")]
+    NotEncrypted,
+
+    #[error("Message must be authenticated")]
+    NotAuthenticated,
+
+    #[error("Message must provide non-repudiation (signed)")]
+    NoNonRepudiation,
+
+    #[error("Anonymous sender not allowed")]
+    AnonymousSender,
+
+    #[error("Message must have a sender DID")]
+    MissingSenderDid,
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum TransportError {
+    #[error("Message has no sender DID")]
+    MissingSenderDid,
+
+    #[error("Failed to forward message via mediator")]
+    Send(#[source] affinidi_messaging_sdk::errors::ATMError),
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum StartupError {
+    #[error("Failed to build ATM config")]
+    Config(#[source] affinidi_messaging_sdk::errors::ATMError),
+
+    #[error("Failed to initialize ATM")]
+    Init(#[source] affinidi_messaging_sdk::errors::ATMError),
+
+    #[error("Failed to get mediator account info")]
+    AccountInfo(#[source] affinidi_messaging_sdk::errors::ATMError),
+
+    #[error("No account info returned")]
+    NoAccountInfo,
+
+    #[error("Failed to set ACL mode")]
+    AclMode(#[source] affinidi_messaging_sdk::errors::ATMError),
+
+    #[error("Failed to apply ACL settings")]
+    AclApply(#[source] affinidi_messaging_sdk::errors::ATMError),
+}
+
+/// Errors constructing service configuration.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// A message service must handle at least one transport. An empty
+    /// `Protocols` (neither DIDComm nor TSP) is a no-op and almost certainly a
+    /// config bug — the service-level analogue of "advertise at least one
+    /// transport".
+    #[error("at least one protocol (DIDComm or TSP) must be enabled")]
+    NoProtocolEnabled,
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum DIDCommServiceError {
+    #[error("ATM error: {0}")]
+    ATM(#[from] affinidi_messaging_sdk::errors::ATMError),
+
+    #[error("Mediator not configured for listener '{0}'")]
+    MissingMediator(String),
+
+    #[error("Timeout: {0}")]
+    Timeout(#[from] tokio::time::error::Elapsed),
+
+    #[error("TDK error: {0}")]
+    TDK(#[from] affinidi_tdk_common::errors::TDKError),
+
+    #[error("Missing ATM instance after TDK initialization")]
+    MissingATM,
+
+    #[error("Listener '{0}' already exists")]
+    ListenerAlreadyExists(String),
+
+    #[error("DID '{did}' is already registered by listener '{existing_listener}'")]
+    DuplicateDid {
+        did: String,
+        existing_listener: String,
+    },
+
+    #[error("Listener '{0}' not found")]
+    ListenerNotFound(String),
+
+    #[error("Listener '{0}' is not connected")]
+    NotConnected(String),
+
+    #[error("Service startup failed: {0}")]
+    StartupFailed(#[from] StartupError),
+
+    #[error("Handler error: {0}")]
+    Handler(String),
+
+    #[error("Message body has already been extracted by another argument")]
+    MessageAlreadyExtracted,
+
+    #[error("UnpackMetadata has already been extracted by another argument")]
+    MetadataAlreadyExtracted,
+
+    #[error("Extension not found: {0}")]
+    ExtensionNotFound(String),
+
+    #[error("Invalid route pattern '{pattern}': {reason}")]
+    InvalidRoutePattern { pattern: String, reason: String },
+
+    #[error("Policy violation: {0}")]
+    Policy(#[from] PolicyViolation),
+
+    #[error("Transport error: {0}")]
+    Transport(#[from] TransportError),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
+}

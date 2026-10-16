@@ -1,0 +1,1380 @@
+/*!
+ * DID Authentication Library
+ *
+ * **DID Authentication steps:**
+ * Step 1. Get the challenge from a authentication service
+ * Step 2. Create a DIDComm message with the challenge in the body
+ * Step 3. Sign and Encrypt the DIDComm message, send to the authentication service
+ * Step 4. Receive the tokens from the authentication service
+ *
+ * NOTE: This library currently supports two different implementations of DID Auth
+ * 1. Affinidi Messaging
+ * 2. MeetingPlace
+ *
+ * This needs to be refactored in the future when the services align on implementation
+ */
+
+use affinidi_crypto::jose::key_agreement::{Curve, PrivateKeyAgreement};
+use affinidi_did_common::{
+    Document,
+    document::DocumentExt,
+    key_negotiation::{DEFAULT_CURVE_PREFERENCE, negotiate_authcrypt},
+};
+use affinidi_did_resolver_cache_sdk::DIDCacheClient;
+use affinidi_messaging_didcomm::message::{Message, pack};
+use affinidi_secrets_resolver::SecretsResolver;
+use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+use chrono::DateTime;
+use errors::{DIDAuthError, HttpStatusError, Result};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::time::{Duration, SystemTime};
+use tracing::{Instrument, Level, debug, error, info, span, trace, warn};
+use uuid::Uuid;
+
+pub mod custom_auth;
+pub mod errors;
+
+pub use custom_auth::{CustomAuthHandler, CustomAuthHandlers, CustomRefreshHandler};
+
+/// The authorization tokens received in the fourth step of the DID authentication process
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct AuthorizationTokens {
+    pub access_token: String,
+    pub access_expires_at: u64,
+    pub refresh_token: String,
+    pub refresh_expires_at: u64,
+}
+
+impl std::fmt::Debug for AuthorizationTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationTokens")
+            .field("access_token", &"[REDACTED]")
+            .field("access_expires_at", &self.access_expires_at)
+            .field("refresh_token", &"[REDACTED]")
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum DidChallenges {
+    /// Affinidi Messaging Challenge
+    Complex(HTTPResponse<DidChallenge>),
+
+    /// Affinidi MeetingPlace Challenge
+    Simple(DidChallenge),
+}
+
+impl DidChallenges {
+    pub fn challenge(&self) -> &str {
+        match self {
+            DidChallenges::Simple(s) => &s.challenge,
+            DidChallenges::Complex(c) => &c.data.challenge,
+        }
+    }
+}
+
+/// Authentication Challenge
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+struct DidChallenge {
+    /// Challenge string from the authentication service
+    pub challenge: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum TokensType {
+    AffinidiMessaging(HTTPResponse<AuthorizationTokens>),
+    MeetingPlace(MPAuthorizationTokens),
+}
+
+impl TokensType {
+    pub fn tokens(&self) -> Result<AuthorizationTokens> {
+        match self {
+            TokensType::AffinidiMessaging(c) => Ok(c.data.clone()),
+            TokensType::MeetingPlace(m) => {
+                let tokens = AuthorizationTokens {
+                    access_token: m.access_token.clone(),
+                    access_expires_at: DateTime::parse_from_rfc3339(&m.access_expires_at)
+                        .map_err(|err| {
+                            DIDAuthError::Authentication(format!(
+                                "Invalid access_expires_at timestamp ({}): {}",
+                                m.access_expires_at, err
+                            ))
+                        })?
+                        .timestamp() as u64,
+                    refresh_token: m.refresh_token.clone(),
+                    refresh_expires_at: DateTime::parse_from_rfc3339(&m.refresh_expires_at)
+                        .map_err(|err| {
+                            DIDAuthError::Authentication(format!(
+                                "Invalid refresh_expires_at timestamp ({}): {}",
+                                m.access_expires_at, err
+                            ))
+                        })?
+                        .timestamp() as u64,
+                };
+                Ok(tokens)
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct HTTPResponse<T> {
+    #[serde(alias = "sessionId")]
+    pub session_id: String,
+    pub data: T,
+}
+
+/// The authorization tokens received in the fourth step of the DID authentication process
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct MPAuthorizationTokens {
+    pub access_token: String,
+    pub access_expires_at: String,
+    pub refresh_token: String,
+    pub refresh_expires_at: String,
+}
+
+impl std::fmt::Debug for MPAuthorizationTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MPAuthorizationTokens")
+            .field("access_token", &"[REDACTED]")
+            .field("access_expires_at", &self.access_expires_at)
+            .field("refresh_token", &"[REDACTED]")
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .finish()
+    }
+}
+
+/// Refresh tokens response from the authentication service.
+/// Includes rotated refresh token (one-time use).
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct AuthRefreshResponse {
+    pub access_token: String,
+    pub access_expires_at: u64,
+    #[serde(default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub refresh_expires_at: u64,
+}
+
+impl std::fmt::Debug for AuthRefreshResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthRefreshResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("access_expires_at", &self.access_expires_at)
+            .field("refresh_token", &"[REDACTED]")
+            .field("refresh_expires_at", &self.refresh_expires_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum AuthenticationType {
+    AffinidiMessaging,
+    MeetingPlace,
+    Unknown,
+}
+
+impl AuthenticationType {
+    fn is_affinidi_messaging(&self) -> bool {
+        matches!(self, AuthenticationType::AffinidiMessaging)
+    }
+}
+
+/// The DID Authentication struct
+#[derive(Clone)]
+pub struct DIDAuthentication {
+    /// There are two different DID authentication methods that need to be supported for now
+    /// Set to true if
+    pub type_: AuthenticationType,
+
+    /// Authorization tokens received from the authentication service
+    pub tokens: Option<AuthorizationTokens>,
+
+    /// true if authenticated, false otherwise
+    pub authenticated: bool,
+
+    /// Custom authentication handlers
+    pub custom_handlers: Option<CustomAuthHandlers>,
+}
+
+impl std::fmt::Debug for DIDAuthentication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DIDAuthentication")
+            .field("type_", &self.type_)
+            .field("tokens", &self.tokens)
+            .field("authenticated", &self.authenticated)
+            .field("custom_handlers", &self.custom_handlers.is_some())
+            .finish()
+    }
+}
+
+impl Default for DIDAuthentication {
+    fn default() -> Self {
+        Self {
+            type_: AuthenticationType::Unknown,
+            tokens: None,
+            authenticated: false,
+            custom_handlers: None,
+        }
+    }
+}
+
+impl DIDAuthentication {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set custom authentication handlers
+    pub fn with_custom_handlers(mut self, handlers: Option<CustomAuthHandlers>) -> Self {
+        self.custom_handlers = handlers;
+        self
+    }
+
+    /// Find the [serviceEndpoint](https://www.w3.org/TR/did-1.0/#services) with type `Authentication` from a DID Document
+    /// # Arguments
+    /// * `doc` - The DID Document to search
+    ///
+    /// # Returns
+    /// URI of the service endpoint if it exists
+    pub fn find_service_endpoint(doc: &Document) -> Option<String> {
+        if let Some(service) = doc.service.iter().find(|s| {
+            if let Some(id) = &s.id {
+                id.as_str().ends_with("#auth")
+            } else {
+                false
+            }
+        }) {
+            service.service_endpoint.get_uri()
+        } else {
+            None
+        }
+    }
+
+    /// Authenticate with the Affinidi services
+    /// This will retry authentication if it fails
+    /// If already authenticated, short-circuits and returns immediately
+    ///
+    /// # Arguments
+    /// * `profile_did` - The DID of the profile to authenticate
+    /// * `endpoint_did` - The DID of the service endpoint to authenticate against
+    /// * `did_resolver` - The DID Resolver Cache Client
+    /// * `secrets_resolver` - The Secrets Resolver
+    /// * `client` - The HTTP Client to use for requests
+    /// * `retry_limit` - The number of times to retry authentication (-1 = unlimited)
+    ///
+    /// # Returns
+    /// Ok if successful, Err if failed
+    /// AuthorizationTokens are contained in self
+    pub async fn authenticate<S>(
+        &mut self,
+        profile_did: &str,
+        endpoint_did: &str,
+        did_resolver: &DIDCacheClient,
+        secrets_resolver: &S,
+        client: &Client,
+        retry_limit: i32,
+    ) -> Result<()>
+    where
+        S: SecretsResolver,
+    {
+        // Check if custom authentication handler is provided
+        // If so, use it to authenticate
+        if let Some(handlers) = &self.custom_handlers
+            && let Some(auth_handler) = &handlers.auth_handler
+        {
+            debug!("Using custom authentication handler");
+            let tokens = auth_handler
+                .authenticate(profile_did, endpoint_did, did_resolver, client)
+                .await?;
+
+            self.authenticated = true;
+            self.tokens = Some(tokens);
+            self.type_ = AuthenticationType::AffinidiMessaging;
+            return Ok(());
+        }
+
+        // Authenticate using default logic
+        let mut retry_count: u32 = 0;
+        let mut timer = 1;
+        let mut rate_limit_waited = Duration::ZERO;
+        loop {
+            match self
+                ._authenticate(
+                    profile_did,
+                    endpoint_did,
+                    did_resolver,
+                    secrets_resolver,
+                    client,
+                )
+                .await
+            {
+                Ok(_) => {
+                    return Ok(());
+                }
+                Err(DIDAuthError::ACLDenied(err)) => {
+                    return Err(DIDAuthError::ACLDenied(err));
+                }
+                Err(err) => {
+                    retry_count += 1;
+                    // Keep the last attempt's error: a caller told only "retries
+                    // reached" cannot tell a rate limiter from a broken service.
+                    let exhausted = |last| DIDAuthError::RetriesExhausted {
+                        attempts: retry_count,
+                        last: Box::new(last),
+                    };
+                    // `-1` is unlimited; any other negative stops after one
+                    // attempt, as it always has.
+                    if retry_limit != -1 && i64::from(retry_count) >= i64::from(retry_limit) {
+                        return Err(exhausted(err));
+                    }
+
+                    let Some(delay) = retry_delay(&err, timer, &mut rate_limit_waited) else {
+                        warn!(
+                            "DID ({}): Attempt #{}. Rate limited beyond the retry budget, giving up: {}",
+                            profile_did, retry_count, err
+                        );
+                        return Err(exhausted(err));
+                    };
+
+                    error!(
+                        "DID ({}): Attempt #{}. Error authenticating: {:?} :: Sleeping for ({:?})",
+                        profile_did, retry_count, err, delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    if timer < 10 {
+                        timer += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn _authenticate<S>(
+        &mut self,
+        profile_did: &str,
+        endpoint_did: &str,
+        did_resolver: &DIDCacheClient,
+        secrets_resolver: &S,
+        client: &Client,
+    ) -> Result<()>
+    where
+        S: SecretsResolver,
+    {
+        let _span = span!(Level::DEBUG, "authenticate",);
+        async move {
+            if self.authenticated && self.type_.is_affinidi_messaging() {
+                // Check if we need to refresh the token
+                match self
+                    ._refresh_authentication(
+                        profile_did,
+                        endpoint_did,
+                        did_resolver,
+                        secrets_resolver,
+                        client,
+                        false,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        error!("Error refreshing token: {:?}", err);
+                        info!("Attempting to re-authenticate");
+                    }
+                }
+            }
+
+            let endpoint = self
+                ._get_endpoint_address(endpoint_did, did_resolver)
+                .await?;
+
+            debug!("Retrieving authentication challenge...");
+
+            // Step 1. Get the challenge
+            let step1_response = _http_post::<DidChallenges>(
+                client,
+                &[&endpoint, "/challenge"].concat(),
+                &format!("{{\"did\": \"{profile_did}\"}}").to_string(),
+            )
+            .await?;
+
+            match step1_response {
+                DidChallenges::Simple(_) => {
+                    self.type_ = AuthenticationType::MeetingPlace;
+                }
+                DidChallenges::Complex(_) => {
+                    self.type_ = AuthenticationType::AffinidiMessaging;
+                }
+            }
+
+            debug!("Challenge received");
+            trace_sensitive("Challenge received", &format!("{step1_response:#?}"));
+
+            // Step 2. Sign the challenge
+
+            let auth_response =
+                self._create_auth_challenge_response(profile_did, endpoint_did, &step1_response)?;
+            trace_sensitive(
+                "Auth response message",
+                &serde_json::to_string_pretty(&auth_response).unwrap_or_default(),
+            );
+
+            let auth_msg = _pack_encrypted_for_did(
+                &auth_response,
+                profile_did,
+                endpoint_did,
+                did_resolver,
+                secrets_resolver,
+            )
+            .await?;
+
+            trace_sensitive("Packed auth message", &format!("{auth_msg:#?}"));
+
+            let step2_body = if let DidChallenges::Complex(_) = step1_response {
+                auth_msg
+            } else {
+                json!({"challenge_response":
+                    BASE64_URL_SAFE_NO_PAD.encode(&auth_msg)
+                })
+                .to_string()
+            };
+
+            let step2_response =
+                _http_post::<TokensType>(client, &[&endpoint, ""].concat(), &step2_body).await?;
+
+            debug!("Tokens received");
+            trace_sensitive("Tokens received", &format!("{step2_response:#?}"));
+
+            debug!("Successfully authenticated");
+
+            self.authenticated = true;
+            self.tokens = Some(step2_response.tokens()?);
+            Ok(())
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Helper function to get the right endpoint address
+    /// Returns the endpoint if it's a URL, or resolves the DID to get the endpoint
+    /// # Returns
+    /// The endpoint address or a AuthenticationAbort error (hard abort)
+    async fn _get_endpoint_address(
+        &self,
+        endpoint_did: &str,
+        did_resolver: &DIDCacheClient,
+    ) -> Result<String> {
+        if endpoint_did.starts_with("did:") {
+            let doc = did_resolver.resolve(endpoint_did).await?;
+            if let Some(endpoint) = DIDAuthentication::find_service_endpoint(&doc.doc) {
+                Ok(endpoint)
+            } else {
+                Err(DIDAuthError::AuthenticationAbort(
+                    "No service endpoint found. DID doesn't contain a #auth service".into(),
+                ))
+            }
+        } else {
+            Ok(endpoint_did.to_string())
+        }
+    }
+
+    /// Refresh the JWT access token
+    /// # Arguments
+    ///   * `refresh_token` - The refresh token to be used
+    /// # Returns
+    /// A packed DIDComm message to be sent
+    async fn _create_refresh_request<S>(
+        &self,
+        profile_did: &str,
+        endpoint_did: &str,
+        did_resolver: &DIDCacheClient,
+        secrets_resolver: &S,
+    ) -> Result<String>
+    where
+        S: SecretsResolver,
+    {
+        let refresh_token = if let Some(tokens) = &self.tokens {
+            &tokens.refresh_token
+        } else {
+            return Err(DIDAuthError::Authentication(
+                "No tokens found to refresh".to_owned(),
+            ));
+        };
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let refresh_message = Message::build(
+            Uuid::new_v4().to_string(),
+            "https://affinidi.com/atm/1.0/authenticate/refresh".to_string(),
+            json!({"refresh_token": refresh_token}),
+        )
+        .to(endpoint_did.to_string())
+        .from(profile_did.to_owned())
+        .created_time(now)
+        .expires_time(now + 60)
+        .finalize();
+
+        _pack_encrypted_for_did(
+            &refresh_message,
+            profile_did,
+            endpoint_did,
+            did_resolver,
+            secrets_resolver,
+        )
+        .await
+        .map_err(|err| {
+            DIDAuthError::Authentication(format!(
+                "Couldn't pack authentication refresh message: {err:?}"
+            ))
+        })
+    }
+
+    /// Mint a new access token now, even though the current one is still
+    /// valid — a **proactive** refresh.
+    ///
+    /// [`Self::authenticate`] deliberately does not do this: it refreshes only
+    /// when [`refresh_check`] says it must, which is inside the last five
+    /// seconds of the token's life, so an ordinary call on a healthy token
+    /// costs nothing. A caller that wants to get ahead of expiry — a transport
+    /// rebuilding its connection so the new socket carries a fresh token, say —
+    /// wants the opposite, and had no way to ask for it.
+    ///
+    /// If the *refresh* token has itself expired there is nothing to refresh
+    /// with; this returns an error and the caller should run a full
+    /// [`Self::authenticate`].
+    ///
+    /// # Returns
+    /// Ok if a new token was obtained; the tokens are in `self`.
+    pub async fn refresh_tokens<S>(
+        &mut self,
+        profile_did: &str,
+        endpoint_did: &str,
+        did_resolver: &DIDCacheClient,
+        secrets_resolver: &S,
+        client: &Client,
+    ) -> Result<()>
+    where
+        S: SecretsResolver,
+    {
+        self._refresh_authentication(
+            profile_did,
+            endpoint_did,
+            did_resolver,
+            secrets_resolver,
+            client,
+            true,
+        )
+        .await
+    }
+
+    /// Refresh the access tokens as required.
+    ///
+    /// `force_refresh` promotes a "still valid, nothing to do" answer into a
+    /// real refresh; it cannot rescue an expired *refresh* token, which still
+    /// falls through to a full handshake.
+    async fn _refresh_authentication<S>(
+        &mut self,
+        profile_did: &str,
+        endpoint_did: &str,
+        did_resolver: &DIDCacheClient,
+        secrets_resolver: &S,
+        client: &Client,
+        force_refresh: bool,
+    ) -> Result<()>
+    where
+        S: SecretsResolver,
+    {
+        let Some(tokens) = &self.tokens else {
+            return Err(DIDAuthError::Authentication(
+                "No tokens found to refresh".to_owned(),
+            ));
+        };
+
+        let check = refresh_decision(refresh_check(tokens), force_refresh);
+        if check == RefreshCheck::Refresh && force_refresh {
+            debug!("Access token still valid, but a refresh was requested");
+        }
+
+        match check {
+            RefreshCheck::Ok => {
+                // Tokens are valid, do not need to refresh
+                Ok(())
+            }
+            RefreshCheck::Refresh => {
+                // Access token has expired, refresh it
+                // Check if custom refresh handler is provided
+                // If so, use it to refresh
+                if let Some(handlers) = &self.custom_handlers
+                    && let Some(refresh_handler) = &handlers.refresh_handler
+                {
+                    debug!("Using custom refresh handler");
+                    let new_tokens = refresh_handler
+                        .refresh(profile_did, endpoint_did, tokens, did_resolver, client)
+                        .await?;
+
+                    self.tokens = Some(new_tokens);
+                    debug!("JWT successfully refreshed using custom handler");
+                    return Ok(());
+                }
+
+                // Refresh using default logic
+                debug!("Refreshing tokens");
+                let refresh_msg = self
+                    ._create_refresh_request(
+                        profile_did,
+                        endpoint_did,
+                        did_resolver,
+                        secrets_resolver,
+                    )
+                    .await?;
+
+                let endpoint = self
+                    ._get_endpoint_address(endpoint_did, did_resolver)
+                    .await?;
+
+                let new_tokens = _http_post::<HTTPResponse<AuthRefreshResponse>>(
+                    client,
+                    &[&endpoint, "/refresh"].concat(),
+                    &refresh_msg,
+                )
+                .await?;
+
+                let Some(tokens) = &mut self.tokens else {
+                    return Err(DIDAuthError::Authentication(
+                        "No tokens found to refresh".to_owned(),
+                    ));
+                };
+
+                tokens.access_token = new_tokens.data.access_token;
+                tokens.access_expires_at = new_tokens.data.access_expires_at;
+                // Update rotated refresh token if provided
+                if !new_tokens.data.refresh_token.is_empty() {
+                    tokens.refresh_token = new_tokens.data.refresh_token;
+                    tokens.refresh_expires_at = new_tokens.data.refresh_expires_at;
+                }
+
+                debug!("JWT successfully refreshed");
+                Ok(())
+            }
+            RefreshCheck::Expired => {
+                // Access and refresh tokens have expired, need to re-authenticate
+                Err(DIDAuthError::Authentication(
+                    "Access and refresh tokens have expired".to_owned(),
+                ))
+            }
+        }
+    }
+
+    /// Creates an Affinidi Trusted Messaging Authentication Challenge Response Message
+    /// # Arguments
+    /// * `body` - The challenge body
+    /// # Returns
+    /// A DIDComm message to be sent
+    ///
+    /// Notes:
+    /// - This message will expire after 60 seconds
+    fn _create_auth_challenge_response(
+        &self,
+        profile_did: &str,
+        endpoint_did: &str,
+        body: &DidChallenges,
+    ) -> Result<Message> {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let body = if let DidChallenges::Complex(c) = body {
+            json!({"challenge": c.data.challenge, "session_id": c.session_id})
+        } else {
+            json!({"challenge": body.challenge()})
+        };
+
+        Ok(Message::build(
+            Uuid::new_v4().to_string(),
+            "https://affinidi.com/atm/1.0/authenticate".to_owned(),
+            body,
+        )
+        .to(endpoint_did.to_string())
+        .from(profile_did.to_owned())
+        .created_time(now)
+        .expires_time(now + 60)
+        .finalize())
+    }
+}
+
+/// Log a sensitive authentication artifact (challenge, token, packed message,
+/// HTTP body) at `TRACE` only — never `DEBUG` — so operational debug logs never
+/// contain raw tokens or challenges. Enabling `TRACE` is an explicit opt-in for
+/// deep debugging.
+fn trace_sensitive(label: &str, value: &str) {
+    trace!("{label}:\n{value}");
+}
+
+async fn _http_post<T>(client: &Client, url: &str, body: &str) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    debug!("POSTing to {}", url);
+    trace_sensitive("HTTP POST body", body);
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .map_err(|e| DIDAuthError::Authentication(format!("HTTP POST failed ({url}): {e:?}")))?;
+
+    let response_status = response.status();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let rate_limit_source = header(HttpStatusError::RATE_LIMIT_SOURCE_HEADER);
+    let retry_after = header(reqwest::header::RETRY_AFTER.as_str());
+    let response_body = response
+        .text()
+        .await
+        .map_err(|e| DIDAuthError::Authentication(format!("Couldn't get HTTP body: {e:?}")))?;
+
+    debug!("POST {url} -> status {response_status}");
+    trace_sensitive("HTTP response body", &response_body);
+    if !response_status.is_success() {
+        if response_status.as_u16() == 401 {
+            return Err(DIDAuthError::ACLDenied("Authentication Denied".into()));
+        } else {
+            // The status, and for a 429 who refused and when to come back, stay
+            // data: the retry loop honours `Retry-After`, and a caller can tell
+            // a rate limiter from a broken service.
+            return Err(HttpStatusError::from_parts(
+                "authentication request",
+                response_status.as_u16(),
+                rate_limit_source.as_deref(),
+                retry_after.as_deref(),
+                response_body,
+            )
+            .with_url(url)
+            .into());
+        }
+    }
+
+    serde_json::from_str::<T>(&response_body).map_err(|e| {
+        DIDAuthError::Authentication(format!("Couldn't deserialize AuthorizationResponse: {e}"))
+    })
+}
+
+/// Bridge helper: pack a DIDComm message encrypted for a recipient DID.
+///
+/// Resolves both DIDs to get key agreement keys, looks up the sender's
+/// private key from the secrets resolver, and calls authcrypt.
+///
+/// Key selection: resolves the sender's key agreement curve first, then
+/// picks the first recipient key agreement key on the **same curve**.
+/// This avoids curve mismatches when the recipient advertises multiple
+/// key agreement keys across different curves (e.g. secp256k1 + X25519).
+async fn _pack_encrypted_for_did<S>(
+    msg: &Message,
+    sender_did: &str,
+    recipient_did: &str,
+    did_resolver: &DIDCacheClient,
+    secrets_resolver: &S,
+) -> Result<String>
+where
+    S: SecretsResolver,
+{
+    // 1. Resolve the sender DID and enumerate its *usable* key-agreement
+    //    keys — those we hold a secret for, on a supported curve.
+    //    Bidirectional negotiation needs the whole set (sender curve order
+    //    is irrelevant; selection follows the documented curve preference),
+    //    not just `first()`.
+    let sender_doc = did_resolver
+        .resolve(sender_did)
+        .await
+        .map_err(|e| DIDAuthError::DIDResolver(format!("{e}")))?;
+    let sender_ka_kids = sender_doc.doc.find_key_agreement(None);
+
+    let mut sender_keys: Vec<(&str, PrivateKeyAgreement, Curve)> = Vec::new();
+    for &kid in &sender_ka_kids {
+        let Some(secret) = secrets_resolver.get_secret(kid).await else {
+            continue;
+        };
+        let Some(curve) = secret.get_key_type().key_agreement_curve() else {
+            continue;
+        };
+        match PrivateKeyAgreement::from_raw_bytes(curve, secret.get_private_bytes()) {
+            Ok(private) => sender_keys.push((kid, private, curve)),
+            Err(e) => debug!("skipping unusable sender key {kid}: {e}"),
+        }
+    }
+    if sender_keys.is_empty() {
+        return Err(DIDAuthError::DIDComm(
+            "sender has no usable key agreement key".into(),
+        ));
+    }
+    let sender_curves: Vec<Curve> = sender_keys.iter().map(|(_, _, c)| *c).collect();
+
+    // 2. Resolve the recipient DID and negotiate the best shared-curve pair.
+    let recipient_doc = did_resolver
+        .resolve(recipient_did)
+        .await
+        .map_err(|e| DIDAuthError::DIDResolver(format!("{e}")))?;
+    let recipient_ka_kids = recipient_doc.doc.find_key_agreement(None);
+
+    let pairing = negotiate_authcrypt(
+        &sender_curves,
+        &recipient_doc.doc,
+        &recipient_ka_kids,
+        &DEFAULT_CURVE_PREFERENCE,
+    )
+    .map_err(|e| DIDAuthError::DIDComm(e.to_string()))?;
+
+    // The negotiated curve was drawn from `sender_curves`, so a matching sender
+    // key should always be present; return an error rather than panicking if a
+    // future change to the negotiation ever breaks that invariant.
+    let (sender_kid, sender_private, _) = sender_keys
+        .iter()
+        .find(|(_, _, c)| *c == pairing.curve)
+        .ok_or_else(|| {
+            DIDAuthError::DIDComm(
+                "internal error: negotiated curve has no matching sender key".into(),
+            )
+        })?;
+
+    // 3. Pack with authcrypt.
+    pack::pack_encrypted_authcrypt(
+        msg,
+        sender_kid,
+        sender_private,
+        &[(pairing.recipient_kid, &pairing.recipient_pub)],
+    )
+    .map_err(|e| DIDAuthError::DIDComm(format!("pack failed: {e}")))
+}
+
+/// The most [`DIDAuthentication::authenticate`] spends waiting on rate limiters
+/// across all its retries — and so also the longest single `Retry-After` it
+/// will wait out.
+///
+/// Bounded because its callers are: the TDK's authentication task gives the
+/// whole call 10 s by default, and a wait that outlives the caller turns a
+/// precise "rate-limited by the mediator, retry in 30 s" into a bare timeout.
+/// Past the budget the loop stops and returns the `429` (inside
+/// [`DIDAuthError::RetriesExhausted`]) for the caller to act on.
+pub const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(5);
+
+/// How long to wait before the next attempt after `err`, or `None` to give up.
+///
+/// An ordinary failure waits the backoff `timer` (seconds). A rate-limited one
+/// (`429`) waits at least `Retry-After` — retrying sooner only spends another
+/// request against the same limiter — and that wait counts against
+/// [`MAX_RATE_LIMIT_WAIT`]: when it would take the running total
+/// (`rate_limit_waited`) past the budget, give up instead.
+fn retry_delay(
+    err: &DIDAuthError,
+    timer: u64,
+    rate_limit_waited: &mut Duration,
+) -> Option<Duration> {
+    let backoff = Duration::from_secs(timer);
+    let Some(status) = err.http_status().filter(|s| s.is_rate_limited()) else {
+        return Some(backoff);
+    };
+    let delay = status
+        .retry_after()
+        .map_or(backoff, |wait| wait.max(backoff));
+    let total = *rate_limit_waited + delay;
+    if total > MAX_RATE_LIMIT_WAIT {
+        return None;
+    }
+    *rate_limit_waited = total;
+    Some(delay)
+}
+
+/// Apply a caller's `force_refresh` to what [`refresh_check`] concluded.
+///
+/// `refresh_check` answers "must this be refreshed?", which is only true inside
+/// the last five seconds of the access token's life. A caller doing a
+/// **proactive** refresh is asking a different question — it wants a new token
+/// precisely while the old one is still good — and had no way to say so: the
+/// intent was accepted at the task boundary and then discarded here, so the
+/// refresh silently did nothing and the caller acted on a token that had not
+/// changed. See [`DIDAuthentication::refresh_tokens`].
+///
+/// Force overrides only `Ok`. `Expired` means the *refresh* token is gone too,
+/// which no amount of forcing can mend — that still needs a full handshake.
+fn refresh_decision(check: RefreshCheck, force_refresh: bool) -> RefreshCheck {
+    match (check, force_refresh) {
+        (RefreshCheck::Ok, true) => RefreshCheck::Refresh,
+        (check, _) => check,
+    }
+}
+
+/// Possible responses from checking authentication JWT tokens
+#[derive(PartialEq, Debug)]
+pub enum RefreshCheck {
+    /// Tokens are valid, do not need to bre refreshed
+    Ok,
+    /// Access Token has expired and needs to be refreshed
+    Refresh,
+    /// Access and Refresh Tokens have expired, need to re-authenticate from scratch
+    Expired,
+}
+
+/// Checks if the tokens need to be refreshed?
+pub fn refresh_check(tokens: &AuthorizationTokens) -> RefreshCheck {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    debug!(
+        "checking auth expiry: now({}), access_expires_at({}), delta({}), expired?({}), refresh_expires_at({}), delta({}), expired?({})",
+        now,
+        tokens.access_expires_at,
+        tokens.access_expires_at as i64 - now as i64,
+        tokens.access_expires_at - 5 <= now,
+        tokens.refresh_expires_at,
+        tokens.refresh_expires_at as i64 - now as i64,
+        tokens.refresh_expires_at <= now
+    );
+
+    if tokens.access_expires_at - 5 <= now {
+        if tokens.refresh_expires_at <= now {
+            // Both access and refresh tokens have expired
+            RefreshCheck::Expired
+        } else {
+            // Only the access token has expired
+            RefreshCheck::Refresh
+        }
+    } else {
+        // Tokens are still valid
+        RefreshCheck::Ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{AuthorizationTokens, RefreshCheck, refresh_check, refresh_decision};
+    use std::time::SystemTime;
+
+    /// Sensitive auth artifacts must be logged via `trace_sensitive` (TRACE),
+    /// never at DEBUG, so operational debug logs can't leak tokens/challenges.
+    #[test]
+    fn sensitive_artifacts_are_not_logged_at_debug() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for BufWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(BufWriter(buf.clone()))
+            .finish();
+
+        let secret = "SUPER_SECRET_JWT.header.payload.sig";
+        tracing::subscriber::with_default(subscriber, || {
+            crate::trace_sensitive("Tokens received", secret);
+            tracing::debug!("Tokens received");
+        });
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logged.contains(secret),
+            "sensitive value must not appear at DEBUG level; got:\n{logged}"
+        );
+        assert!(
+            logged.contains("Tokens received"),
+            "the non-sensitive breadcrumb should still be logged at DEBUG"
+        );
+    }
+
+    #[test]
+    fn refresh_check_valid() {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tokens = AuthorizationTokens {
+            access_expires_at: now + 900,
+            refresh_expires_at: now + 1800,
+            ..Default::default()
+        };
+
+        assert_eq!(refresh_check(&tokens), RefreshCheck::Ok);
+    }
+
+    #[test]
+    fn refresh_check_refresh() {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tokens = AuthorizationTokens {
+            access_expires_at: now,
+            refresh_expires_at: now + 1800,
+            ..Default::default()
+        };
+
+        assert_eq!(refresh_check(&tokens), RefreshCheck::Refresh);
+    }
+
+    #[test]
+    fn refresh_check_expired() {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tokens = AuthorizationTokens {
+            access_expires_at: now,
+            refresh_expires_at: now,
+            ..Default::default()
+        };
+
+        assert_eq!(refresh_check(&tokens), RefreshCheck::Expired);
+    }
+
+    /// A forced refresh of a still-valid token actually refreshes.
+    ///
+    /// This is the regression that produced a reconnect storm. The websocket
+    /// transport refreshes proactively at 80% of the token's life and then
+    /// rebuilds the socket on the new token. `refresh_check` said `Ok` (the
+    /// token had ~180 s left), the force was dropped, and the socket was
+    /// rebuilt on the *same* token — so the next deadline was 80% of what
+    /// remained, and again, and again: teardowns at T-180 s, T-36 s, T-7 s and
+    /// finally T+expired, where the refresh at last ran for real. Four
+    /// reconnects per token instead of one, per profile.
+    #[test]
+    fn a_forced_refresh_of_a_valid_token_refreshes() {
+        assert_eq!(
+            refresh_decision(RefreshCheck::Ok, true),
+            RefreshCheck::Refresh
+        );
+    }
+
+    /// Without a force, a valid token is left alone — every ordinary
+    /// `authenticate` call takes this path, and refreshing on each one would
+    /// trade a reconnect storm for a request storm.
+    #[test]
+    fn an_unforced_valid_token_is_left_alone() {
+        assert_eq!(refresh_decision(RefreshCheck::Ok, false), RefreshCheck::Ok);
+    }
+
+    /// Force cannot rescue an expired refresh token: there is nothing left to
+    /// refresh *with*, so this still has to fall through to a full handshake.
+    #[test]
+    fn force_does_not_override_an_expired_refresh_token() {
+        assert_eq!(
+            refresh_decision(RefreshCheck::Expired, true),
+            RefreshCheck::Expired
+        );
+    }
+
+    /// A token already due a refresh is unaffected by the flag either way.
+    #[test]
+    fn a_due_refresh_is_unchanged_by_the_flag() {
+        for force in [true, false] {
+            assert_eq!(
+                refresh_decision(RefreshCheck::Refresh, force),
+                RefreshCheck::Refresh
+            );
+        }
+    }
+
+    mod http_status {
+        use crate::errors::{DIDAuthError, HttpStatusError};
+        use crate::{DIDAuthentication, MAX_RATE_LIMIT_WAIT, retry_delay};
+        use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
+        use affinidi_secrets_resolver::SimpleSecretsResolver;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        fn rate_limited(retry_after: Option<u64>) -> DIDAuthError {
+            HttpStatusError::from_parts(
+                "authentication request",
+                429,
+                Some("mediator"),
+                retry_after.map(|s| s.to_string()).as_deref(),
+                "",
+            )
+            .into()
+        }
+
+        /// Serve `response` to every request on a loopback port. Returns the
+        /// base URL and a count of requests served.
+        async fn serve(response: &'static str) -> (String, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let served = Arc::new(AtomicUsize::new(0));
+            let counter = served.clone();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut request = [0u8; 8192];
+                    let _ = socket.read(&mut request).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            (url, served)
+        }
+
+        async fn authenticate(endpoint: &str, retry_limit: i32) -> DIDAuthError {
+            let resolver = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+                .await
+                .unwrap();
+            let secrets = SimpleSecretsResolver::new(&[]).await;
+            DIDAuthentication::new()
+                .authenticate(
+                    "did:example:alice",
+                    endpoint,
+                    &resolver,
+                    &secrets,
+                    &reqwest::Client::new(),
+                    retry_limit,
+                )
+                .await
+                .unwrap_err()
+        }
+
+        #[test]
+        fn ordinary_failures_use_the_backoff() {
+            let mut waited = Duration::ZERO;
+            let err = DIDAuthError::Authentication("boom".into());
+            assert_eq!(
+                retry_delay(&err, 3, &mut waited),
+                Some(Duration::from_secs(3))
+            );
+            let err = DIDAuthError::from(HttpStatusError::new("x", 503));
+            assert_eq!(
+                retry_delay(&err, 1, &mut waited),
+                Some(Duration::from_secs(1))
+            );
+            assert_eq!(waited, Duration::ZERO);
+        }
+
+        /// A 429 waits at least `Retry-After`, never less than the backoff, and
+        /// the waits are budgeted.
+        #[test]
+        fn a_429_waits_retry_after_within_the_budget() {
+            let mut waited = Duration::ZERO;
+            assert_eq!(
+                retry_delay(&rate_limited(Some(3)), 1, &mut waited),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                retry_delay(&rate_limited(Some(0)), 2, &mut waited),
+                Some(Duration::from_secs(2))
+            );
+            assert_eq!(waited, MAX_RATE_LIMIT_WAIT);
+            // Budget spent: give up rather than retry into the limiter.
+            assert_eq!(retry_delay(&rate_limited(None), 1, &mut waited), None);
+            // One wait longer than the whole budget is not attempted at all.
+            assert_eq!(
+                retry_delay(&rate_limited(Some(30)), 1, &mut Duration::default()),
+                None
+            );
+        }
+
+        #[test]
+        fn http_status_is_seen_through_retries_exhausted() {
+            let err = DIDAuthError::RetriesExhausted {
+                attempts: 3,
+                last: Box::new(rate_limited(Some(2))),
+            };
+            assert!(err.is_rate_limited());
+            assert_eq!(
+                err.http_status().unwrap().rate_limit_source.as_deref(),
+                Some("mediator")
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains("Maximum number of authentication retries reached (3 attempt(s))")
+                    && text.contains("rate-limited by mediator"),
+                "{text}"
+            );
+            assert!(!DIDAuthError::Authentication("x".into()).is_rate_limited());
+        }
+
+        /// The loop keeps the 429 (and who sent it) and waits `Retry-After`
+        /// between attempts, rather than reporting only "retries reached".
+        #[tokio::test]
+        async fn the_retry_loop_preserves_a_429_and_waits_retry_after() {
+            let (url, served) = serve(
+                "HTTP/1.1 429 Too Many Requests\r\n\
+                 x-rate-limit-source: mediator\r\n\
+                 retry-after: 2\r\n\
+                 content-type: application/json\r\n\
+                 content-length: 108\r\n\
+                 connection: close\r\n\r\n\
+                 {\"error\":\"rate_limited\",\"limiter\":\"mediator\",\"message\":\"Rate limit exceeded. Try later.\",\"retryAfterSecs\":2}",
+            )
+            .await;
+
+            let started = Instant::now();
+            let err = authenticate(&url, 2).await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(served.load(Ordering::SeqCst), 2);
+            assert!(elapsed >= Duration::from_secs(2), "waited only {elapsed:?}");
+            let DIDAuthError::RetriesExhausted { attempts, last } = &err else {
+                panic!("expected RetriesExhausted, got {err:?}");
+            };
+            assert_eq!(*attempts, 2);
+            assert!(matches!(**last, DIDAuthError::HttpStatus(_)), "{last:?}");
+            assert!(err.is_rate_limited());
+            let status = err.http_status().unwrap();
+            assert_eq!(status.status, 429);
+            assert_eq!(status.rate_limit_source.as_deref(), Some("mediator"));
+            assert_eq!(status.retry_after_secs, Some(2));
+            assert_eq!(
+                status.url.as_deref(),
+                Some(format!("{url}/challenge").as_str())
+            );
+        }
+
+        /// A 429 asking for more than the budget ends the loop at once.
+        #[tokio::test]
+        async fn a_long_retry_after_is_returned_not_waited_out() {
+            let (url, served) = serve(
+                "HTTP/1.1 429 Too Many Requests\r\n\
+                 x-rate-limit-source: mediator\r\n\
+                 retry-after: 60\r\n\
+                 content-length: 0\r\n\
+                 connection: close\r\n\r\n",
+            )
+            .await;
+
+            let started = Instant::now();
+            let err = authenticate(&url, 5).await;
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(served.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                err,
+                DIDAuthError::RetriesExhausted { attempts: 1, .. }
+            ));
+            assert_eq!(err.http_status().unwrap().retry_after_secs, Some(60));
+        }
+
+        /// A 429 with no source header (a proxy) is still typed, unattributed.
+        #[tokio::test]
+        async fn an_unlabelled_429_is_typed_and_unattributed() {
+            let (url, _) = serve(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 4\r\nconnection: close\r\n\r\nslow",
+            )
+            .await;
+            let err = authenticate(&url, 1).await;
+            assert!(err.is_rate_limited());
+            let status = err.http_status().unwrap();
+            assert_eq!(status.rate_limit_source, None);
+            assert_eq!(status.retry_after_secs, None);
+            assert_eq!(status.body, "slow");
+        }
+
+        #[tokio::test]
+        async fn other_statuses_are_typed_and_not_rate_limited() {
+            let (url, _) = serve(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\nconnection: close\r\n\r\nbusy",
+            )
+            .await;
+            let err = authenticate(&url, 1).await;
+            assert!(!err.is_rate_limited());
+            assert_eq!(err.http_status().unwrap().status, 503);
+        }
+
+        /// A 401 is still an ACL denial, returned without retrying.
+        #[tokio::test]
+        async fn a_401_is_still_acl_denied() {
+            let (url, served) = serve(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await;
+            let err = authenticate(&url, 3).await;
+            assert!(matches!(err, DIDAuthError::ACLDenied(_)), "{err:?}");
+            assert_eq!(served.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    // Boundary smoke test: this crate now delegates curve negotiation to
+    // `affinidi-did-common::key_negotiation` (exhaustively tested there).
+    // Here we confirm the wiring compiles and behaves for the real
+    // curve-mismatch bug — recipient [Ed25519(undecodable), P-256, X25519],
+    // X25519 sender → skip the first two and pick X25519 — plus the
+    // both-sets-named failure message.
+    #[test]
+    fn authcrypt_negotiation_at_call_site() {
+        use affinidi_crypto::jose::key_agreement::{Curve, PrivateKeyAgreement};
+        use affinidi_did_common::{
+            Document,
+            key_negotiation::{DEFAULT_CURVE_PREFERENCE, negotiate_authcrypt},
+        };
+
+        let ka_jwk = |kid: &str, curve: Curve| {
+            serde_json::json!({
+                "id": kid,
+                "type": "JsonWebKey2020",
+                "controller": "did:web:example",
+                "publicKeyJwk": PrivateKeyAgreement::generate(curve).public_key().to_jwk(),
+            })
+        };
+        let ed_kid = "did:web:example#ed";
+        let p256_kid = "did:web:example#p256";
+        let x_kid = "did:web:example#x";
+        // Ed25519 signing key wrongly listed under keyAgreement (undecodable
+        // as a KA curve) — exercises the codec-skip path via multibase.
+        let ed_vm = serde_json::json!({
+            "id": ed_kid,
+            "type": "Multikey",
+            "controller": "did:web:example",
+            "publicKeyMultibase":
+                affinidi_encoding::encode_multikey(affinidi_encoding::ED25519_PUB, &[9u8; 32]),
+        });
+        let doc: Document = serde_json::from_value(serde_json::json!({
+            "id": "did:web:example",
+            "verificationMethod": [ed_vm, ka_jwk(p256_kid, Curve::P256), ka_jwk(x_kid, Curve::X25519)],
+            "keyAgreement": [ed_kid, p256_kid, x_kid],
+        }))
+        .unwrap();
+        let kids = [ed_kid, p256_kid, x_kid];
+
+        let m =
+            negotiate_authcrypt(&[Curve::X25519], &doc, &kids, &DEFAULT_CURVE_PREFERENCE).unwrap();
+        assert_eq!(m.recipient_kid, x_kid);
+        assert_eq!(m.curve, Curve::X25519);
+
+        // No shared curve → error names both offered sets.
+        let err = negotiate_authcrypt(&[Curve::K256], &doc, &kids, &DEFAULT_CURVE_PREFERENCE)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("K256") && msg.contains("X25519"), "{msg}");
+    }
+}

@@ -1,0 +1,343 @@
+# Changelog
+
+## Unreleased (0.15.10) — `sha2` 0.11, drop `rand_core` 0.6
+
+No behaviour change and no public API change. `sha2` is a private dependency;
+`rand_core` 0.6 was declared but unused and is removed.
+
+## [0.15.9] - Unreleased
+
+### Security
+
+- **Authcrypt decryption binds the sender key id to the key used.** An
+  ECDH-1PU JWE is now accepted only when its protected header carries both
+  `skid` and `apu`, `skid` is a DID URL with a `#fragment`, and `apu` decodes
+  to exactly the bytes of `skid`; `sender_kid` in the result is that `skid`.
+  Previously the sender key id was reported from `apu` while callers resolved
+  the key from `skid`, and nothing required the two to agree. Anything else is
+  refused with the new `DIDCommError::SenderKeyBinding`.
+- **The key-only entry points no longer open authcrypt.**
+  `jwe::decrypt::decrypt`, `message::unpack::unpack` and
+  `message::pack::unpack_encrypted` take a sender public key with no key id,
+  so nothing can tell whether it is the key of the JWE's `skid`; a caller that
+  looked the key up for the peer it expected would have had any message from
+  that key reported as sent by whoever `skid` named. They now refuse an
+  ECDH-1PU JWE when given a sender key (`SenderKeyBinding`); anoncrypt,
+  signed and plaintext messages unpack as before. Use the `_bound` functions.
+- **A signed message's `signer_kid` is the key id the caller verified it
+  under.** `unpack_bound` takes the signer key with its key id (`SignerKey`)
+  and refuses a JWS with no signature by that key id
+  (`DIDCommError::SignerKeyBinding`); previously `signer_kid` came from the
+  header whatever key verified it. `DIDCommAgent::unpack` verifies a JWS
+  against the expected peer's signing key id, so a JWS naming another key is
+  refused.
+- The pre-0.14 ECDH-1PU KEK fallback (issue #322) is removed: a JWE from a
+  sender still deriving the unprefixed-tag KEK no longer decrypts.
+- `DIDCommAgent::unpack` passes the expected peer's key agreement key id with
+  its key, so an authcrypt JWE from any other key id is refused.
+- Anoncrypt (ECDH-ES) is unchanged.
+
+### Added
+
+- `jwe::decrypt::decrypt_bound`, `message::pack::unpack_encrypted_bound` and
+  `message::unpack::unpack_bound`. They take `Option<SenderKey<'_>>` — the
+  sender public key together with the key id it was resolved for
+  (`SenderKey::new(kid, &public)`) — and refuse the message unless that key id
+  is the `skid`; `unpack_bound` also takes `Option<SignerKey<'_>>`
+  (`SignerKey::new(kid, &VerifyKey)`) for signed messages.
+- `jws::verify::verify_bound(jws, SignerKey)`: verifies the signature by that
+  key id and reports it as `signer_kid`.
+- `jwe::decrypt::authcrypt_sender_kid(jwe)` and
+  `ProtectedHeader::authcrypt_sender_kid()` return the checked key id to
+  resolve (`None` for anoncrypt); `ProtectedHeader::from_base64url`;
+  `jwe::envelope::{ALG_AUTHCRYPT, ALG_ANONCRYPT}`.
+- `SenderKey` and `SignerKey` are re-exported at the crate root;
+  `SenderKey` also from `message::pack`.
+- `DIDCommError::SenderKeyBinding`, `DIDCommError::SignerKeyBinding`.
+
+### Deprecated
+
+- `jwe::decrypt::decrypt`, `message::unpack::unpack`,
+  `message::pack::unpack_encrypted` (see Security above), and
+  `jws::verify::{verify_ed25519, verify_p256, verify_secp256k1}`, which report
+  `signer_kid` from the header without tying it to the key passed; use
+  `verify_bound`.
+- `DecryptedJwe::legacy_kek_used` and `UnpackResult::Encrypted::legacy_kek_used`
+  are always `false` and will be removed in the next minor.
+
+## [0.15.8] - 2026-08-04
+
+> Renumbered from the `0.15.6`/`0.15.7` this work originally carried: those
+> two numbers were published from `main` in the meantime (curve25519-dalek 5
+> and elliptic-curve 0.14 respectively), so the multi-signature and
+> `kid`-header changes below ship as a single `0.15.8`.
+
+### Security
+
+- **`ParsedSignature::kid_from_protected` — signer-`kid` provenance (SSRF
+  enabler).** `parse_jws` falls back to the per-signature *unprotected* header
+  for the signer `kid` (interop with credo-ts / didcomm-python). That header is
+  outside the signing input, so **any intermediary** — a mediator, a relay — can
+  rewrite it in transit without invalidating the signature. A caller that turns
+  a `kid` into a DID resolution (an outbound HTTPS fetch for `did:web`) was
+  therefore letting such an intermediary choose the host contacted, on a message
+  that had not been verified yet. `ParsedSignature` now reports whether the
+  `kid` came from the integrity-protected header so callers can refuse to act on
+  the rewritable one; `affinidi-messaging-sdk` 0.19.0 uses this to bind an
+  unprotected `kid` to the signed payload's `from`. `ParsedSignature` is also now
+  `#[non_exhaustive]` (ADR 0003 point 1) — both changes are free here, as this
+  type has not previously been published.
+
+### Added
+
+- **Multi-signature JWS verification primitives.** `jws::verify::parse_jws`
+  splits a JWS (General JSON Serialization) into its payload and **every**
+  signature entry (`ParsedSignature { kid, alg, signing_input, signature }`),
+  and `jws::verify::verify_parsed_signature` verifies one entry against
+  resolved key material (`VerifyKey::{Ed25519, P256, Secp256k1}`), enforcing
+  that the key family matches the signature `alg`. This lets a caller resolve
+  each signer's key (e.g. via DID resolution) and verify all signatures on a
+  message, instead of only the first. The existing single-signature
+  `verify_ed25519` / `verify_p256` / `verify_secp256k1` helpers are unchanged.
+- **Multi-signature signing.** `jws::sign::sign_multi` (and the
+  `message::pack::pack_signed_multi` convenience) produce a JWS carrying one
+  signature per `JwsSigner` over the same payload, mixing Ed25519 (`EdDSA`),
+  P-256 (`ES256`), and secp256k1 (`ES256K`). `ecdsa` is enabled on the runtime
+  `p256`/`k256` dependencies to provide ES256/ES256K signing.
+
+### Changed
+
+- **Signed messages now carry the signer `kid` in *both* the protected and the
+  per-signature unprotected header.** Previously `sign_ed25519` and `sign_multi`
+  placed `kid` only in the protected header. This applies to **every** signature
+  algorithm — `sign_multi` routes Ed25519 (`EdDSA`), P-256 (`ES256`) and
+  secp256k1 (`ES256K`) signers through the same builder, so all three now emit
+  `kid` in both headers. The DIDComm v2.1 signed-message
+  test vectors (§Appendix C.2) — and interoperating implementations that follow
+  them (e.g. credo-ts, SICPA `didcomm-python`) — read the signer `kid` from the
+  *unprotected* `header.kid`, so a message signed by this crate could not be
+  attributed by those verifiers (they found no `kid` where they look). Emitting
+  `kid` in both locations keeps it integrity-protected (the JOSE convention that
+  key-selection material be signed over, matching the spec's §5.2.2
+  construction) while also being consumable by test-vector-conformant verifiers.
+  The two copies always carry identical values.
+
+  This is wire-compatible and non-breaking:
+  - the signing input is unchanged (the unprotected header is never signed
+    over), so signatures remain cryptographically valid and byte-identical apart
+    from the added header;
+  - `jws::verify` already **prefers** the protected `kid` and falls back to the
+    unprotected one, so verification of both old (protected-only) and
+    third-party (unprotected-only) messages is unaffected — no verifier change
+    was required.
+
+## 2nd August 2026 (0.15.7)
+
+The unused `jwk` feature is dropped from the `p256`/`k256` deps — JWK
+handling goes through `affinidi-crypto`'s own `to_jwk`/`from_jwk`, and the
+feature does not exist in 0.14.
+
+Moves this crate to the **elliptic-curve 0.14** family (`p256` / `k256` /
+`p384` / `p521` 0.13 -> 0.14), which brings rand_core 0.10, digest 0.11 and
+signature 3 with it.
+
+API changes handled: the sec1 traits were renamed (`ToEncodedPoint` ->
+`ToSec1Point`, `FromEncodedPoint` -> `FromSec1Point`), `EncodedPoint` became a
+generic alias for `Sec1Point<C>` so it needs a per-module binding, and the
+deprecated `SigningKey::random(rng)` is now `Generate::generate()` (system
+CSPRNG, panics on failure).
+
+Patch bump, per [ADR 0003](../../../docs/adr/0003-public-api-semver-policy.md) point 3: `vta-sdk` and `didwebvh-rs` redirect
+this crate through `[patch.crates-io]`, and a minor bump breaks the redirect.
+
+Crypto behaviour is unchanged — the golden/KAT vectors (`p256_sign_verify_roundtrip`,
+`secp256k1_es256k_golden` RFC 6979, `ecdh_1pu_x25519_kek_golden`,
+`concat_kdf_es_golden`, `a256cbc_hs512_golden`) all still pass.
+
+## 31st July 2026 (0.15.6)
+
+Moves to **curve25519-dalek 5** (`ed25519-dalek` 2 -> 3, `x25519-dalek` 2 -> 3),
+which brings rand_core 0.10 and signature 3 with it. rand 0.10 renamed `OsRng`
+to `SysRng` *and* made it fallible (`TryRng<Error = SysError>`), so it no longer
+satisfies dalek's `CryptoRng` bound; key generation moves to `rand::rng()`.
+
+Patch bump, per [ADR 0003](../../../docs/adr/0003-public-api-semver-policy.md) point 3: `vta-sdk` pins this crate through
+`[patch.crates-io]`, and a minor bump would break the redirect and pull a second
+copy from crates.io.
+
+All notable changes to `affinidi-messaging-didcomm` are documented here.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this crate follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.15.5] - 2026-07-16
+
+### Added
+
+- **ES256K (ECDSA secp256k1) JWS verification.** `jws::verify::verify_secp256k1`
+  verifies DIDComm signed messages whose protected header declares `alg: ES256K`,
+  alongside the existing `EdDSA` and `ES256` paths. The signer `kid` is
+  attributed from the protected header, falling back to the per-signature
+  unprotected header. Verify-only — this crate does not sign ES256K. Signer-key
+  resolution and the inner/top-level JWS dispatch live in the mediator's
+  `didcomm_compat` shim.
+
+### Changed
+
+- Internal: `verify_ed25519` / `verify_p256` / `verify_secp256k1` now share one
+  JWS parsing/dispatch skeleton instead of three copies. Public signatures and
+  behavior are unchanged (the Ed25519 wrong-length-signature error message now
+  names the accepted algs).
+
+## [0.15.4] - 2026-06-30
+
+### Added
+
+- **ES256 (ECDSA P-256) JWS verification.** `jws::verify::verify_p256` verifies
+  DIDComm signed messages whose protected header declares `alg: ES256`,
+  alongside the existing `EdDSA` path. The signer `kid` is attributed from the
+  protected header, falling back to the per-signature unprotected header
+  (#323 semantics). Signer-key resolution and the inner/top-level JWS dispatch
+  live in the mediator's `didcomm_compat` shim. Verify-only — this crate does
+  not sign ES256.
+- **Fully-specified `Ed25519` alg accepted on verification.** `verify_ed25519`
+  now accepts a protected-header `alg` of either `EdDSA` (polymorphic, RFC 8037)
+  or `Ed25519` (fully-specified, draft-ietf-jose-fully-specified-algorithms) —
+  both denote Ed25519 signatures. Signing still emits `EdDSA` for broad interop.
+
+## [0.15.3] - 2026-06-14
+
+### Added
+
+- **Off-by-default `arbitrary` feature (#477).** Adds hand-written, depth- and
+  width-bounded `arbitrary::Arbitrary` impls for the wire types (`Message`,
+  `Attachment`, `AttachmentData`) for structure-aware coverage-guided fuzzing.
+  No runtime/behaviour change and nothing is pulled in unless the feature is
+  enabled. Patch bump (additive) keeps the `vta-sdk` `[patch.crates-io]`
+  coupling valid — see ADR 0003.
+
+## [0.15.2] - 2026-06-13
+
+### Changed
+
+- `DIDCommError` is now `#[non_exhaustive]` (semver wave W7, released W11). Match
+  with a wildcard arm. Patch bump preserves the `vta-sdk` `[patch.crates-io]`
+  coupling — see ADR 0003 and `docs/migration/2026-06-semver-wave.md`.
+
+## [0.15.1] - 2026-06-06
+
+### Added
+
+- **P-384 and P-521 authcrypt/anoncrypt (#357).** The JWE encrypt/decrypt
+  paths are curve-agnostic (the ephemeral key is generated on the
+  recipient's curve, and the `alg`/`enc`/KDF/key-wrap are uniform), so the
+  new `affinidi-crypto` P-384/P-521 key-agreement curves work on the wire
+  with no protocol changes. Added full ECDH-1PU and ECDH-ES JWE roundtrip
+  tests for both curves.
+
+## [0.15.0] - 2026-06-01
+
+Completes #327: this crate now contains **no bespoke crypto** — only the
+DIDComm/JOSE envelope layer. All key agreement, the Concat KDF, A256KW,
+A256CBC-HS512, and EdDSA now come from `affinidi-crypto`'s `jose` module
+(landed in affinidi-crypto 0.1.8–0.1.10). **Wire output is unchanged** —
+proven byte-identical by the known-answer vectors shared between the two
+crates (the ECDH-1PU KEK, Concat-KDF, A256CBC-HS512, and EdDSA vectors all
+match across the move; see affinidi-crypto `jose::kat` and PR #336).
+
+### Removed (breaking)
+
+- The `crypto` module (`affinidi_messaging_didcomm::crypto::*`:
+  `aes_kw`, `content_encryption`, `ecdh_1pu`, `ecdh_es`, `key_agreement`,
+  `signing`) is **deleted**. The key-agreement *types* (`Curve`,
+  `PublicKeyAgreement`, `PrivateKeyAgreement`, `EphemeralKeyPair`) now live
+  at `affinidi_crypto::jose::key_agreement`; import them from there.
+- This is the reason for the **minor** version bump.
+
+### Changed
+
+- `pack`/`unpack`, JWE encrypt/decrypt, and JWS sign/verify now call
+  `affinidi-crypto::jose`. `DIDCommError` gains `From<CryptoError>` so the
+  envelope layer surfaces the same error variants as before.
+- Dropped now-unused direct deps (`aes`, `cbc`, `hmac`, `subtle`,
+  `x25519-dalek`, `zeroize`); added `affinidi-crypto` with the `jose`
+  feature.
+
+### Compatibility note
+
+This minor bump un-unifies `vta-sdk` (which pins `didcomm ^0.14`) from the
+workspace `[patch.crates-io]` redirect: the tree temporarily carries two
+didcomm versions (internal `0.15`, vta-sdk's registry `0.14`). This is
+intentional and resolves once `vta-sdk` is republished against `0.15`
+(tracked alongside #328). Internal dependents' requirement pins were moved
+to `"0.15"` in the same change; their own release-version bumps are
+deferred to that coordinated vta-sdk release.
+
+## [0.14.1] - 2026-06-01
+
+Test-only; no shipped behaviour change (the published crate is
+byte-identical to 0.14.0). Patch-level so the workspace `[patch.crates-io]`
+keeps `vta-sdk` unified on one didcomm version.
+
+### Added
+
+- **Known-answer test harness for the JOSE crypto primitives**
+  (`src/crypto/kat.rs`). Pins the byte-level output of AES-256 Key Wrap
+  (a real RFC 3394 §4.6 vector), the ECDH-ES Concat KDF, the ECDH-1PU KEK
+  derivation (including the #322 length-prefixed `cc_tag`), A256CBC-HS512,
+  and EdDSA. This is the safety net for the #327 migration of this
+  crate's hand-rolled crypto into `affinidi-crypto`: the relocated
+  implementation must keep these vectors passing byte-for-byte. See
+  `docs/adr/0001-centralize-jose-crypto-in-affinidi-crypto.md`.
+
+## [0.14.0] - 2026-05-31
+
+DIDComm v2.1 interop fixes found via an interop matrix against
+[credo-ts](https://github.com/openwallet-foundation/credo-ts) (issues
+#322, #323, #324). Authcrypt is **wire-affecting** — see Migration.
+
+### Fixed
+
+- **ECDH-1PU Concat KDF: length-prefix the content-encryption tag
+  (#322).** `concat_kdf_1pu` fed `cc_tag` into the KDF without the 32-bit
+  big-endian length prefix that every other OtherInfo field carries,
+  yielding a key-encryption-key four bytes' worth of input different from
+  every spec-following implementation (credo-ts/Askar, SICPA
+  didcomm-python). `ECDH-1PU+A256KW` authcrypt now interoperates with
+  spec-compliant peers. Affects key-agreement keys (X25519, P-256,
+  K-256); anoncrypt (ECDH-ES) was never affected.
+- **JWS verification: honour `kid` in the per-signature *unprotected*
+  header (#323).** `JwsSignature` gained an optional unprotected `header`
+  (RFC 7515 §7.2.1). DIDComm / credo-ts / didcomm-python place the signer
+  `kid` there; it was previously dropped, so `signer_kid` came back
+  `None`. Verification reads the protected header first, then the
+  unprotected one.
+- **`unpack()`: auto-unwrap sign-then-encrypt (#324).** When a decrypted
+  JWE turns out to wrap a JWS (DIDComm v2.1 non-repudiation), the inner
+  signature is now verified instead of failing with a missing-field
+  error. `signer_public` is then required, and the result reports
+  `non_repudiation = true` with the inner `signer_kid`.
+
+### Added
+
+- **Dual-KEK decrypt fallback (transitional).** To keep working during a
+  staged rollout, decryption tries the spec-correct KEK first and, on
+  AES-Key-Wrap failure, retries with the legacy (pre-0.14, unprefixed)
+  KEK. `DecryptedJwe.legacy_kek_used` / `UnpackResult::Encrypted
+  { legacy_kek_used, .. }` report when the legacy path was taken — a
+  migration signal. Remove the fallback once it stops occurring.
+
+### Changed
+
+- `UnpackResult` is now `#[non_exhaustive]`; `UnpackResult::Encrypted`
+  gained `legacy_kek_used`, `non_repudiation`, and `signer_kid` fields.
+  Match with a `..` rest pattern.
+- `DecryptedJwe` gained `legacy_kek_used`.
+
+### Migration
+
+Packing now emits the **spec-correct** KEK, so a 0.14 sender's authcrypt
+cannot be decrypted by an un-upgraded 0.13 recipient. The dual-KEK
+fallback only helps the receive side. **Upgrade recipients before
+senders**: once all parties run ≥0.14 (they accept both old and new),
+senders are safe. The previous behaviour only interoperated with other
+affinidi 0.13 nodes — no working external interop is lost.

@@ -1,0 +1,167 @@
+//! Ingress sniffing and keys-free envelope metadata.
+//!
+//! A mediator (or any relay) receiving raw bytes needs to decide *what* a
+//! message is and *who* it is for **without** holding any keys — to route it,
+//! enforce ACLs, and store it. These helpers provide exactly that:
+//!
+//! - [`is_tsp`] — a cheap first-byte classifier distinguishing a TSP message
+//!   from other wire formats (e.g. JSON-based DIDComm).
+//! - [`MetaEnvelope`] — the cleartext envelope (sender VID, receiver VID,
+//!   message type) plus the message id, parsed without decrypting the payload.
+
+use sha2::{Digest, Sha256};
+
+use crate::error::TspError;
+use crate::message::MessageType;
+use crate::message::envelope::Envelope;
+
+/// The leading byte of a TSP message framed with a **short** `-E` count code
+/// (`-E##`), which is `0xF8`. The triplet is `f8 4X XX` — the `f8` comes from
+/// the `-` (DASH) selector packed with the `E` identifier.
+pub const TSP_MAGIC_BYTE: u8 = 0xF8;
+
+/// The leading byte of a TSP message framed with a **long** `-E` count code
+/// (`--E#####`), which is `0xFB` — two DASH selectors rather than one.
+///
+/// Rev 2 could never emit this: its `-E` count covered only the envelope
+/// header, which is a couple of dozen quadlets whatever the message size. Rev 3
+/// widened the count to cover the ciphertext, so any message with more than
+/// 4095 quadlets of content — roughly 12 KB — is framed long and starts `0xFB`.
+/// Ingress classifiers that only knew `0xF8` therefore start dropping large
+/// messages the moment Rev 3 is switched on.
+pub const TSP_MAGIC_BYTE_LONG: u8 = 0xFB;
+
+/// Cheap classifier: does `bytes` look like a TSP message?
+///
+/// This is a pre-classifier for ingress routing, not a validator — it inspects
+/// only the leading byte. A caller routes `is_tsp(bytes)` input to the TSP
+/// handler, which then calls [`MetaEnvelope::parse`] (or a full unpack) to
+/// validate and reject anything malformed.
+///
+/// Both framings are accepted. DIDComm — being JSON or compact-JWS — starts
+/// with `{` (`0x7B`) or `ey…`, so neither byte is ambiguous against it.
+pub fn is_tsp(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.first(),
+        Some(&TSP_MAGIC_BYTE) | Some(&TSP_MAGIC_BYTE_LONG)
+    )
+}
+
+/// Cleartext metadata of a TSP message, parsed without any keys.
+///
+/// The TSP envelope carries the sender VID and receiver VID in the clear (they
+/// are bound to the ciphertext via the HPKE-Base AAD, but readable). This lets a
+/// relay route and account for a message without being able to decrypt it.
+///
+/// Note: in the interop wire format the message *kind* (Direct/Nested/Routed/
+/// Control) is **not** in the cleartext envelope — it lives in the encrypted
+/// payload. [`MetaEnvelope::message_type`] therefore always reports
+/// [`MessageType::Direct`] as a keys-free placeholder; a relay that needs the
+/// real kind must open the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaEnvelope {
+    /// The sender VID.
+    pub sender: String,
+    /// The receiver VID (the next hop / addressee).
+    pub receiver: String,
+    /// Placeholder message type; always [`MessageType::Direct`] from a keys-free
+    /// parse (the real kind is encrypted — see the struct docs).
+    pub message_type: MessageType,
+    /// SHA-256 of the full wire bytes — the message id used for storage and
+    /// idempotency (matches the convention of DIDComm-based mediators).
+    pub sha256: [u8; 32],
+}
+
+impl MetaEnvelope {
+    /// Parse the cleartext envelope of a TSP message and compute its id.
+    ///
+    /// Does **not** decrypt or verify the payload — it only reads the envelope
+    /// and hashes the wire bytes. Returns an error if the bytes are not a
+    /// well-formed TSP envelope.
+    pub fn parse(wire: &[u8]) -> Result<Self, TspError> {
+        let (envelope, _consumed) = Envelope::decode(wire)?;
+        let sha256: [u8; 32] = Sha256::digest(wire).into();
+        Ok(Self {
+            sender: envelope.sender,
+            receiver: envelope.receiver,
+            message_type: envelope.message_type,
+            sha256,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::direct;
+    use ed25519_dalek::SigningKey;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    fn packed() -> direct::PackedMessage {
+        let sign = SigningKey::generate(&mut rand_10::rng());
+        let recv_enc = StaticSecret::random_from_rng(&mut rand_10::rng());
+        direct::pack(
+            b"payload",
+            MessageType::Direct,
+            "did:web:alice",
+            "did:web:bob",
+            &sign.to_bytes(),
+            &PublicKey::from(&recv_enc).to_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn is_tsp_detects_magic_byte() {
+        let msg = packed();
+        assert_eq!(msg.bytes[0], TSP_MAGIC_BYTE);
+        assert!(is_tsp(&msg.bytes));
+    }
+
+    #[test]
+    fn is_tsp_rejects_didcomm_and_empty() {
+        assert!(!is_tsp(b"{\"protected\":\"...\"}")); // DIDComm JSON
+        assert!(!is_tsp(b"eyJhbGciOiJ...")); // compact JWS/JWE
+        assert!(!is_tsp(&[])); // empty
+    }
+
+    #[test]
+    fn meta_envelope_parse_reads_addressing_without_keys() {
+        let msg = packed();
+        let meta = MetaEnvelope::parse(&msg.bytes).unwrap();
+        assert_eq!(meta.sender, "did:web:alice");
+        assert_eq!(meta.receiver, "did:web:bob");
+        assert_eq!(meta.message_type, MessageType::Direct);
+        // id is the sha256 of the full wire bytes, and is deterministic.
+        let expected: [u8; 32] = Sha256::digest(&msg.bytes).into();
+        assert_eq!(meta.sha256, expected);
+    }
+
+    #[test]
+    fn meta_envelope_parse_rejects_garbage() {
+        assert!(MetaEnvelope::parse(b"not a tsp message").is_err());
+        assert!(MetaEnvelope::parse(&[TSP_MAGIC_BYTE, 0x00]).is_err());
+    }
+
+    #[test]
+    fn meta_envelope_reads_addressing_for_routed_message() {
+        // In the interop format the kind is encrypted, so a keys-free parse only
+        // recovers addressing (and reports Direct as a placeholder kind).
+        let sign = SigningKey::generate(&mut rand_10::rng());
+        let recv_enc = StaticSecret::random_from_rng(&mut rand_10::rng());
+        let msg = direct::pack(
+            b"routing-layer!!", // quadlet-aligned: a real inner is a packed message
+            MessageType::Routed,
+            "did:web:alice",
+            "did:web:mediator",
+            &sign.to_bytes(),
+            &PublicKey::from(&recv_enc).to_bytes(),
+        )
+        .unwrap();
+        let meta = MetaEnvelope::parse(&msg.bytes).unwrap();
+        assert_eq!(meta.receiver, "did:web:mediator");
+        assert_eq!(meta.sender, "did:web:alice");
+        // Kind is not in cleartext: keys-free parse reports the Direct placeholder.
+        assert_eq!(meta.message_type, MessageType::Direct);
+    }
+}

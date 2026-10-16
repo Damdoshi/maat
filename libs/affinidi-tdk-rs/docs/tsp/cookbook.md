@@ -1,0 +1,455 @@
+# TSP cookbook
+
+Copy-paste scenarios for using the **Trust Spanning Protocol (TSP)** through the
+Affinidi TDK — sending and receiving TSP messages, relationship forming,
+authentication, and running TSP over a WebSocket.
+
+TSP is **additive alongside DIDComm**: one mediator carries both, one socket can
+carry both, and the same accounts / ACLs / mailbox / pickup machinery is reused
+(an account is keyed on `sha256(vid)`). You opt into TSP per build with the
+`tsp` cargo feature; with it off, nothing here compiles in and DIDComm is
+unchanged.
+
+> The SDK snippets are marked `ignore` because they need an async runtime and a
+> running mediator; they follow the patterns covered by the
+> `affinidi-messaging-test-mediator` integration tests in
+> [affinidi/affinidi-messaging-mediator](https://github.com/affinidi/affinidi-messaging-mediator)
+> (`tests/tsp_delivery.rs`, `tests/tsp_websocket.rs`, `tests/tsp_auth.rs`),
+> which are the runnable, CI-checked source of truth for these APIs.
+
+---
+
+## Contents
+
+- [Enabling TSP](#enabling-tsp)
+- [The carriage model](#the-carriage-model)
+- [Sending](#sending)
+- [Receiving](#receiving)
+- [Traffic shaping](#traffic-shaping)
+- [WebSocket delivery](#websocket-delivery)
+- [Relationships](#relationships)
+- [Parallel relationships](#parallel-relationships)
+- [Authentication](#authentication)
+- [Trust Tasks over TSP](#trust-tasks-over-tsp)
+
+---
+
+## Enabling TSP
+
+**Cargo features** — enable `tsp` on the SDK (and the mediator, if you run one):
+
+```toml
+affinidi-messaging-sdk = { version = "0.19", features = ["tsp"] }
+# Mediator deployments: run TSP alongside DIDComm (dual-protocol).
+affinidi-messaging-mediator = { version = "0.42", features = ["didcomm", "tsp"] }
+```
+
+A TSP client today reuses the profile's **DIDComm-authenticated session**, so a
+dual-protocol mediator (`didcomm,tsp`) is the normal deployment. For a *pure*-TSP
+client see [Authentication](#authentication).
+
+**Endpoint discovery** — for other mediators to route TSP to yours, your
+mediator's DID document must advertise a `TSPTransport` service. With the `tsp`
+feature on:
+
+- **did:web** — added automatically at startup, mirroring the `DIDCommMessaging`
+  endpoint (TSP and DIDComm share `/inbound`). No action needed.
+- **did:peer / did:webvh** — the document is bound to the DID, so the
+  `TSPTransport` service is baked in **when the DID is generated**. The setup
+  wizard does this automatically when you select the `tsp` protocol; if you
+  hand-roll the DID, add the service yourself. The mediator logs a startup
+  warning if `tsp` is on but no `TSPTransport` service is advertised.
+
+> Running a mediator? See the [operator enablement guide](./enablement.md) for
+> the full build + DID-document + verification walkthrough.
+
+---
+
+## The carriage model
+
+A TSP message is always sealed **end-to-end to its final recipient**. How it
+*travels* there is the carriage:
+
+| Carriage | What it is | API |
+|----------|-----------|-----|
+| **Direct** | sealed sender → recipient, no intermediary | `send` / `pack` |
+| **Nested** | a Direct message wrapped once for a single intermediary (metadata privacy — only that intermediary learns the recipient) | `send_nested` |
+| **Routed** | a Direct message relayed through one or more hops | `send_routed` |
+| **Control** | relationship management (invite / accept / cancel) | `send_control`, or the [relationship](#relationships) helpers |
+
+The crucial property: **the mediator strips the outer (Nested/Routed) layers; the
+recipient always opens the innermost Direct message.** So `unpack` works
+identically no matter how a message was carried.
+
+---
+
+## Sending
+
+`atm.tsp()` is the entry point; every call takes the sender's `profile`.
+
+**Direct** — seal straight to a recipient DID and POST it to the mediator:
+
+```rust,ignore
+atm.tsp().send(&alice.profile, &bob_did, b"hello over TSP").await?;
+```
+
+**Routed** — relay through hops; `route` is the ordered hop list ending at the
+final recipient (the inner is sealed to `route.last()`):
+
+```rust,ignore
+let route = vec![mediator_did.clone(), bob_did.clone()];
+atm.tsp().send_routed(&alice.profile, &route, b"routed hello").await?;
+```
+
+**Nested** — wrap a Direct (sealed to `to_did`) inside an outer envelope sealed to
+`intermediary`; only the intermediary learns `to_did`:
+
+```rust,ignore
+atm.tsp()
+    .send_nested(&alice.profile, &mediator_did, &bob_did, b"private hello")
+    .await?;
+```
+
+**Routing a message you packed yourself** — `send_routed_opaque` /
+`send_nested_opaque` take an *already-packed* TSP inner and relay it without
+opening it.
+
+The inner must be a **TSP** message. These once carried an arbitrary blob — a
+DIDComm JWE, so a recipient who did not speak TSP could be reached through a
+TSP-routing mediator. Spec Rev 3 §9.4 carries a routed or nested inner raw, as
+an `Encoded_TSP_Message`, where Rev 2 wrapped it in a self-delimiting `B`
+var-data field. That wrapper is what the bridge relied on, so the bridge is
+gone: an implementation that kept it would only interoperate with itself, since
+a conformant peer rejects a misaligned inner.
+
+**Upper-layer control** — `send_generic_control` carries a payload the layer
+above TSP should treat as signalling rather than as user data:
+
+```rust,ignore
+atm.tsp()
+    .send_generic_control(&alice.profile, &bob_did, b"{\"op\":\"resync\"}")
+    .await?;
+```
+
+It travels exactly like a Direct message and TSP interprets neither, so the only
+difference is the label the receiver gets — `InboundTsp::UpperLayerControl`
+instead of `InboundTsp::Application`. That is what lets a protocol built on TSP
+keep its own signalling apart from user data without inventing a convention
+inside the payload. Not to be confused with `send_control`, which carries TSP's
+*own* relationship messages.
+
+**Sealed box** — for a peer that has not migrated:
+
+```rust,ignore
+atm.tsp().send_sealed_box(&alice.profile, &bob_did, b"hello").await?;
+```
+
+Spec §8 defines two PKAE schemes and keeps this one only for implementations
+that already had it: "implementors SHOULD consider migrating to the HPKE option
+specified in this document. We MAY remove this option in the future." So `send`
+is the default and this is a per-peer compatibility decision. Nothing is
+negotiated — the receiver reads the scheme off the ciphertext field's code, and
+`unpack` accepts either.
+
+Lower-level building blocks: `pack(profile, to_did, payload)` returns the raw qb2
+bytes without sending; `send_raw(profile, bytes)` POSTs already-packed bytes.
+
+---
+
+## Receiving
+
+TSP messages land in the same mailbox as DIDComm. Fetched messages are
+**tagged** with their protocol so you can route without inspecting the body:
+
+```rust,ignore
+let fetched = atm.fetch_messages(&bob.profile, &FetchOptions::default()).await?;
+for el in fetched.success {
+    let stored = el.msg.as_ref().expect("body");
+    match el.protocol {
+        Some(MessageProtocol::Tsp) => {
+            let (payload, sender) = atm.tsp().unpack(&bob.profile, stored).await?;
+            // `sender` is the authenticated sender VID.
+        }
+        _ => { /* DIDComm: atm.unpack(...) */ }
+    }
+}
+```
+
+`unpack` assumes an application message. A listener taking whatever arrives on
+one socket wants **`unpack_message`**, which unpacks once and says which of the
+four kinds it got — a receiver cannot tell them apart without opening the
+message, since the kind lives in the encrypted payload rather than the envelope:
+
+```rust,ignore
+match atm.tsp().unpack_message(&bob.profile, &qb2).await? {
+    InboundTsp::Application { payload, sender } => { /* user data */ }
+    InboundTsp::Control { control, sender, thread_digest } => {
+        // A relationship message. Record it — see Relationships below.
+    }
+    InboundTsp::UpperLayerControl { payload, sender } => { /* your protocol */ }
+    InboundTsp::Padding { sender } => {
+        // §9.4: discard it silently. Still delete it from the mailbox.
+    }
+    _ => { /* `InboundTsp` is #[non_exhaustive] */ }
+}
+```
+
+Two of these were previously indistinguishable from application messages, which
+mattered: a padding message reaching an application arrives as an *empty message
+from a contact*, and that is worse than not sending it. `unpack` refuses one
+outright rather than hand back an empty `Vec` that looks like a real message a
+peer sent with no content.
+
+Helpers: `is_tsp(stored)` (sniff a stored message), `decode`/`encode` (stored
+`base64url(qb2)` ↔ raw qb2), and `unpack_bytes(profile, qb2)` to unpack raw qb2
+directly (what the [WebSocket](#websocket-delivery) consumer yields).
+
+---
+
+## Traffic shaping
+
+Encryption hides what a message says, not that it was sent. §11: "Timing, size,
+and frequency survive encryption, nesting, and routing alike" — so an observer of
+a hop learns when a relationship is busy even when it learns nothing else.
+
+Two mechanisms, both optional and both about spending those three deliberately.
+
+**Padding the message you were sending anyway.** Every payload layout carries a
+padding field whether or not it carries anything, so the choice is only what goes
+in it. `Padding::ToMultipleOf(n)` rounds the frame up to a multiple of `n`, which
+replaces a continuum of observable sizes with a handful of buckets:
+
+```rust,ignore
+let packed = affinidi_tsp::message::direct::pack_padded(
+    b"short", MessageType::Direct, &alice_did, &bob_did,
+    &sign_sk, &enc_pk, &Padding::ToMultipleOf(512),
+)?;
+```
+
+**Sending a message with nothing in it.** `send_padding` emits an `XPAD` frame —
+content-free traffic that occupies time, size and frequency without carrying
+anything:
+
+```rust,ignore
+atm.tsp().send_padding(&alice.profile, &bob_did, &Padding::ToMultipleOf(512)).await?;
+```
+
+The receiver discards it silently and sends nothing back; a padding message that
+provoked a reply would defeat its own purpose.
+
+There is a second use. §7.4.3: an endpoint that rotated because its keys may have
+been compromised sends one of these to each peer, because "a peer holding stale
+key state will fail to verify it and will therefore obtain the new key state,
+whereas a peer that receives nothing has no occasion to". It is signed with the
+new keys, so an adversary holding the old ones cannot produce it.
+
+---
+
+## WebSocket delivery
+
+For low-latency, opt a socket into **raw-TSP mode** with `connect_websocket`. It
+offers a `tsp` subprotocol on the upgrade, so the mediator uses a
+**flush-on-connect + delete-on-successful-send** contract: on connect it drains
+your inbox as raw-TSP `Binary` frames and deletes each once it's sent; new
+messages stream the same way. **You own failure handling** — a dropped socket
+leaves undelivered messages in the inbox for the next connection.
+
+```rust,ignore
+let mut ws = atm.tsp().connect_websocket(&bob.profile).await?;
+while let Some(qb2) = ws.recv().await? {            // next raw TSP message, None on close
+    let (payload, sender) = atm.tsp().unpack_bytes(&bob.profile, &qb2).await?;
+    // ... handle it ...
+}
+ws.close().await?;
+```
+
+`ws.send(&qb2)` sends a raw TSP message inbound over the same socket.
+
+---
+
+## Relationships
+
+TSP relationships follow a small state machine, driven through `atm.tsp()` and
+backed by a **pluggable store** (so where the state lives — memory, a database —
+is yours to choose):
+
+```text
+None ──form_relationship──► Pending ──(peer accepts)──► Bidirectional
+None ──(peer invites)─────► InviteReceived ──accept_relationship──► Bidirectional
+                              (cancel from any state → None)
+```
+
+```rust,ignore
+// Initiator
+atm.tsp().form_relationship(&alice.profile, &bob_did).await?;   // → Pending (sends an invite)
+
+// Responder, after receiving an invite control message:
+let (control, sender, digest) = atm.tsp().unpack_control(&bob.profile, &qb2).await?;
+let incoming = atm.tsp().record_incoming_control(&bob.profile, &sender, &control).await?;
+// incoming.state == InviteReceived
+atm.tsp().accept_relationship(&bob.profile, &sender, digest).await?; // → Bidirectional
+
+let state = atm.tsp().relationship_state(&alice.profile, &bob_did).await?;
+```
+
+Outbound calls **persist only after the control message is sent**.
+`record_incoming_control` advances the FSM for a received invite/accept/cancel
+and returns an `IncomingControl`: its `state` is the new relationship state, and
+`reply_expected` is set when a cancellation ended a relationship held in both
+directions, which spec Rev 3 §7.3 asks you to answer with a cancellation of your
+own.
+
+**This is required before application traffic.** Rev 3 §7.2.2: "It is not
+permissible that one endpoint which has learned a VID of the other simply starts
+with an application level message without first having an exchange of TSP
+control messages." An application message from a VID you hold no relationship
+with is discarded on receipt. A node that is not an endpoint in that sense — an
+intermediary relaying for others — turns the check off:
+
+```rust,ignore
+let config = ATMConfig::builder()
+    .with_tsp_relationship_gating(false)   // default: true
+    .build()?;
+```
+
+**Asking for the reply over a route** — `form_relationship_routed` sends an
+invite whose `Reply_Path` (§7.2.4) names the route the accept should come back
+over. If it is present the peer MUST use it, which is what lets an endpoint only
+reachable through an intermediary form a relationship at all.
+
+**Choosing a store** — the default is ephemeral (in-memory, wiped on restart).
+Implement `RelationshipStore` against durable storage and inject it:
+
+```rust,ignore
+let config = ATMConfig::builder()
+    .with_relationship_store(Arc::new(MyDurableStore::new(/* ... */)))
+    .build()?;
+```
+
+A store also keeps the two thread digests that identify a relationship, one per
+uni-directional half (Rev 3 §7.2.1). Those methods have defaults, so an existing
+store keeps working — but without them the §7.2.3 invite-race tiebreak cannot
+run, since an endpoint needs its own outstanding invite's digest to compare
+against one that arrives. Implement `thread_digests` / `set_thread_digests` to
+get the rule.
+
+---
+
+## Parallel relationships
+
+§7.2.5. Two endpoints that already have a relationship can open a second one
+beside it, using the first as the introduction. The point is that the peer learns
+the new identifier over a channel it already trusts — §11 notes an out-of-band
+introduction has no authenticity of its own, and "a party able to interfere with
+that channel could substitute a VID of its own".
+
+```rust,ignore
+// Alice introduces a second VID of hers over the relationship she already has.
+atm.tsp()
+    .form_parallel_relationship(&alice.profile, &bob_did, &alice2.profile)
+    .await?;
+
+// Bob receives it on the existing relationship. Recording it verifies the
+// introduced VID's own signature — without that, a referral is only a claim
+// that the *sender* wishes to introduce a VID, and says nothing about whether
+// that VID's controller agreed.
+atm.tsp().record_incoming_control(&bob.profile, &alice_did, &control).await?;
+
+// Bob answers from a new VID of his own, to Alice's new VID. §7.2.5 puts the
+// accept between the new pair, not over the relationship it arrived on.
+atm.tsp()
+    .accept_parallel_relationship(&bob2.profile, &alice2_did, invite_digest)
+    .await?;
+
+// Alice completes it. She could not know Bob would answer from `bob2`, so her
+// pending invite was filed against the peer she sent it to; this moves it onto
+// the pair the accept names, and requires the accept to echo her introduction's
+// digest — otherwise any VID could answer an introduction it never received.
+atm.tsp()
+    .record_parallel_accept(&alice2.profile, &bob2_did, &bob_did, &accept)
+    .await?;
+```
+
+The asymmetry is worth understanding rather than working around: a referral names
+a pair that does not fully exist yet. Recording the invite advances no
+relationship state, because the receiver has not chosen its own new VID — that is
+the decision the introduction asks it to make. The pair is recorded when it is
+acted on, which is the first moment both halves exist.
+
+---
+
+## Key-state freshness
+
+A peer's keys change. Where your VID implementation maintains key state itself
+and delivers changes without being asked, you need do nothing. Where you resolve
+key state yourself, Rev 3 §7.4.2 gives two occasions to return to the VID's
+provenance chain, and the SDK takes both: a verification failure inside an
+established relationship is retried once after a refresh, and a message arriving
+after a long silence prompts a refresh before it is acted on. Resolution of any
+one peer is rate limited, because either occasion can be provoked by a message
+that has not been authenticated.
+
+```rust,ignore
+let config = ATMConfig::builder()
+    .with_tsp_key_state_policy(KeyStatePolicy {
+        self_resolving: true,                                  // §7.4.2, the default
+        reverification_threshold: Duration::from_secs(3600),   // default: a day
+        resolution_rate_limit: Duration::from_secs(60),        // default: a minute
+    })
+    .build()?;
+```
+
+The threshold is local policy — endpoints need not agree on it and it is not
+communicated. Choose it against the consequence of acting on a message rather
+than the cost of resolving: the check falls once when a dormant relationship
+resumes, not periodically.
+
+---
+
+## Authentication
+
+**Dual-protocol clients** (the common case) authenticate with DIDComm; TSP calls
+reuse that session automatically — nothing extra to do.
+
+**Pure-TSP clients** (no DIDComm) authenticate by signing the mediator's
+challenge with their VID's Ed25519 key. The SDK ships `TspAuthHandler`; register
+it on the TDK at construction and every profile then authenticates over
+`/tsp/authenticate`:
+
+```rust,ignore
+use affinidi_messaging_sdk::TspAuthHandler;
+use affinidi_tdk::did_authentication::CustomAuthHandlers;
+
+let handlers = CustomAuthHandlers::default()
+    .with_auth_handler(Arc::new(TspAuthHandler::new(secrets.clone())));
+
+let tdk_config = TDKConfig::builder()
+    .with_secrets_resolver(secrets)        // the SAME resolver your VID keys live in
+    .with_custom_auth_handlers(handlers)
+    .build()?;
+```
+
+The handler resolves the mediator's `#auth` service, fetches a challenge, signs
+it, and POSTs to `/tsp/authenticate` — minting the **same** JWT session the
+DIDComm path issues, so all downstream ACL / pickup / WS gates are reused
+unchanged.
+
+---
+
+## Trust Tasks over TSP
+
+Trust Tasks (`messaging/ping`, account/acl/access-list/admin, …) are
+transport-agnostic. The `trust-tasks-tsp` binding carries any Trust Task over
+TSP — so a "TSP ping", account ops, etc. are just the corresponding Trust Task
+sent over a TSP carriage:
+
+```rust,ignore
+use trust_tasks_tsp::{pack_trust_task, pack_trust_task_nested, pack_trust_task_routed};
+
+let wire = pack_trust_task(&doc, &sender_private_vid, &recipient_resolved_vid)?;
+// nested / routed variants mirror the carriage model above.
+atm.tsp().send_raw(&profile, &wire).await?;
+```
+
+The consumer always opens the innermost Direct via `unpack_trust_task`,
+regardless of carriage — the mediator strips the relay layers.

@@ -1,0 +1,90 @@
+[package]
+name = "affinidi-tsp"
+description = "Trust Spanning Protocol (TSP) implementation for the Affinidi TDK"
+version = "0.2.2"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["did-resolver"]
+did-resolver = [
+    "dep:affinidi-did-resolver-cache-sdk",
+    "dep:affinidi-did-common",
+    "dep:affinidi-encoding",
+    "dep:tokio",
+]
+messaging-core = ["dep:affinidi-messaging-core", "dep:async-trait"]
+## Post-quantum PKAE and signatures (Rev 3 §8.2/§8.3): the MLKEM768-X25519
+## hybrid KEM and ML-DSA-65. Off by default — the code point `1AAQ` is still
+## provisional (CESR issue #14) and the VID model does not yet carry keys of
+## these sizes; see `docs/tsp/post-quantum.md`.
+pq = ["dep:hpke", "dep:ml-dsa"]
+## Byte-reproducible packing with caller-fixed ephemeral keys and nonces, to
+## regenerate the specification's Appendix A vectors. Destroys confidentiality
+## if used for a real message — see `message::direct::insecure_deterministic`.
+## Never enable it outside tests; this crate enables it only for its own.
+test-vectors = []
+
+[dependencies]
+# Affinidi crates
+affinidi-cesr = { path = "../../core/affinidi-cesr", version = "0.1" }
+affinidi-messaging-core = { path = "../affinidi-messaging-core", version = "0.1", optional = true }
+
+# Optional Affinidi crates (for DID-based VID resolution)
+affinidi-did-resolver-cache-sdk = { path = "../../identity/affinidi-did-resolver-cache-sdk", version = "0.8", optional = true }
+affinidi-did-common = { path = "../../identity/affinidi-did-common", version = "0.4", optional = true }
+affinidi-encoding = { path = "../../core/affinidi-encoding", version = "0.1", optional = true }
+
+# Crypto
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+hkdf = "0.13"
+sha2 = "0.11"
+## TSP mandates ChaCha20Poly1305 as the HPKE AEAD (spec Rev 3 §8); see docs/tsp/interop.md.
+chacha20poly1305 = "0.11"
+rand_10 = { package = "rand", version = "0.10", default-features = false, features = ["std", "std_rng", "thread_rng"] }
+zeroize = { version = "1", features = ["derive"] }
+blake2 = "0.11"
+
+# Post-quantum (optional, `pq`). Both are the crates the ToIP reference uses at
+# v0.10.0, which is what makes agreement with its published vectors meaningful.
+hpke = { version = "0.14", default-features = false, features = ["alloc", "mlkem", "x25519", "chacha", "hkdfsha2"], optional = true }
+ml-dsa = { version = "0.1", optional = true }
+## Libsodium sealed box (spec Rev 3 §8.3), for the deprecated PKAE scheme.
+## `salsa20` supplies HSalsa20 for the crypto_box key derivation and
+## `crypto_secretbox` the XSalsa20-Poly1305 that wraps the payload. Deliberately
+## NOT the RustCrypto `crypto_box` crate, which would be a drop-in but depends on
+## curve25519-dalek 4 and would reintroduce a second dalek generation into a
+## workspace that is on 5 — the same trap `affinidi-messaging-didcomm-v1`
+## documents against the same primitive.
+salsa20 = "0.11"
+crypto_secretbox = { version = "0.1", default-features = false, features = ["salsa20"] }
+
+# Encoding / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+url = { version = "2", features = ["serde"] }
+thiserror = "2"
+
+# Async (optional, for DID resolution and messaging-core)
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"], optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# Turns `test-vectors` on for this crate's own tests only, so the plain
+# `cargo test -p affinidi-tsp` runs the byte-exact vector re-packs. Dev
+# dependencies never reach a dependent's build.
+affinidi-tsp = { path = ".", default-features = false, features = ["test-vectors"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+hex = "0.4"
+
+[lints]
+workspace = true

@@ -1,0 +1,69 @@
+[package]
+name = "affinidi-messaging-helpers"
+version = "0.13.4"
+description = "CLI tools for Affinidi Messaging (mediator administration)"
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+publish = false
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+repository.workspace = true
+
+## Interactive CLI for managing mediator accounts, ACLs, and permissions.
+## Requires a running mediator instance to connect to.
+[[bin]]
+name = "mediator_administration"
+path = "src/mediator_administration/main.rs"
+
+[dependencies]
+# ── Affinidi Crates ──────────────────────────────────────────────────────
+## SDK for connecting to and communicating with a running mediator
+affinidi-messaging-sdk = { path = "../affinidi-messaging-sdk", version = "0.36" }
+## Trust Tasks payload types (the atm.trust_tasks() surface returns/accepts these).
+trust-tasks-rs = "0.31"
+## TDK for DID resolution and crypto utilities
+affinidi-tdk = { path = "../../tdk/affinidi-tdk", version = "0.26" }
+## DIDComm message types — used by example binaries
+affinidi-crypto = { version = "0.2", features = ["jose"] }
+affinidi-messaging-didcomm = { path = "../affinidi-messaging-didcomm", version = "0.15", features = ["messaging-core"] }
+## Protocol-agnostic messaging-core traits — used by `unified_messaging` example
+affinidi-messaging-core = { path = "../affinidi-messaging-core" }
+## TSP transport — used by `unified_messaging` and `protocol_comparison` examples
+affinidi-tsp = { path = "../affinidi-tsp", features = ["messaging-core"] }
+
+# ── CLI / Interactive UI ─────────────────────────────────────────────────
+clap = { version = "4", features = ["derive"] }
+## Terminal prompts (Select, Input, Confirm) with color themes
+console = "0.16"
+dialoguer = "0.12"
+
+# ── Serialization ────────────────────────────────────────────────────────
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+ahash = { version = "0.8", features = ["serde"] }
+## Base64 encoding/decoding — used by example binaries
+base64 = "0.23"
+
+# ── Utilities ────────────────────────────────────────────────────────────
+regex = "1"
+sha256 = "1"
+tokio = { workspace = true, features = ["full"] }
+tracing = { version = "0.1", features = ["valuable"] }
+tracing-subscriber = { version = "0.3", features = [
+  "env-filter",
+  "fmt",
+  "json",
+  "valuable",
+] }
+## UUIDs — used by example binaries (alice_bob, multi_device, etc.)
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+[dev-dependencies]
+## Stamps `issuedAt` on the Trust Tasks the `hijack_admin` example builds by hand
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[lints]
+workspace = true

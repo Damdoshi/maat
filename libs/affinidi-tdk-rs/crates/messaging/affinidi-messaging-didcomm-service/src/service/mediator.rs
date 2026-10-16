@@ -1,0 +1,240 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use affinidi_messaging_sdk::errors::ATMError;
+use affinidi_messaging_sdk::protocols::mediator::acls::AccessListModeType;
+use affinidi_messaging_sdk::{ATM, profiles::ATMProfile};
+use sha256::digest;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+use trust_tasks_rs::specs::messaging::account;
+
+use super::listener::Listener;
+use crate::error::{DIDCommServiceError, StartupError};
+use crate::handler::{DIDCommHandler, TspHandler};
+
+const OFFLINE_SYNC_INTERVAL_SECS: u64 = 30;
+/// Short retry used only when the very first drains can't run yet because the
+/// websocket is still coming up right after connect — so the initial backlog is
+/// fetched within a second or two instead of waiting a full interval.
+const OFFLINE_SYNC_RETRY_SECS: u64 = 2;
+
+impl Listener {
+    pub(crate) async fn set_acl_mode(
+        &self,
+        acl_mode: &AccessListModeType,
+    ) -> Result<(), DIDCommServiceError> {
+        let atm = self.atm()?;
+        let profile = self.profile()?;
+
+        info!(acl_mode = ?acl_mode, "ACL mode configured");
+
+        // A partial ACL update setting only the access-list mode; the mediator's
+        // self-service gating applies it (the rest of the ACL is left unchanged).
+        let mode = match acl_mode {
+            AccessListModeType::ExplicitAllow => {
+                account::update::v0_1::MediatorAclAccessListMode::ExplicitAllow
+            }
+            AccessListModeType::ExplicitDeny => {
+                account::update::v0_1::MediatorAclAccessListMode::ExplicitDeny
+            }
+        };
+        let acl: account::update::v0_1::MediatorAcl = account::update::v0_1::MediatorAcl::builder()
+            .access_list_mode(Some(mode))
+            .try_into()
+            .expect("MediatorAcl has no required member");
+        atm.trust_tasks()
+            .account_update(
+                profile,
+                Some(digest(&profile.inner.did)),
+                None,
+                Some(acl),
+                None,
+            )
+            .await
+            .map_err(StartupError::AclApply)?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn run_periodic_offline_sync(
+        listener_id: &str,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        handler: &Arc<dyn DIDCommHandler>,
+        tsp_handler: Option<&Arc<dyn TspHandler>>,
+        shutdown: &CancellationToken,
+    ) {
+        let profile_alias = profile.inner.alias.clone();
+        loop {
+            // Drain the offline/queued backlog at the TOP of the loop, so it runs
+            // immediately on connect rather than only after the first interval.
+            // Previously this slept `OFFLINE_SYNC_INTERVAL_SECS` *before* the
+            // first sync, so a message delivered while this listener was offline
+            // (e.g. a membership credential issued before the listener connected)
+            // wasn't picked up for ~30s. Now it arrives in ~1s.
+            let next_delay_secs = match Listener::sync_offline_messages(
+                listener_id,
+                atm,
+                profile,
+                handler,
+                tsp_handler,
+            )
+            .await
+            {
+                Ok(()) => OFFLINE_SYNC_INTERVAL_SECS,
+                Err(e) => {
+                    // A websocket reconnect (e.g. when the mediator closes the
+                    // socket on access-token expiry) can land mid-poll and abort
+                    // an in-flight request. That is expected and self-heals, so
+                    // log it at debug rather than raising a misleading "sync
+                    // failed" warning. Right after connect the socket may still be
+                    // coming up — retry soon so the initial drain isn't delayed a
+                    // whole interval; back off normally on any other error.
+                    if matches!(
+                        e.downcast_ref::<ATMError>(),
+                        Some(ATMError::Disconnected(_))
+                    ) {
+                        debug!(profile = %profile_alias, "Offline sync skipped: websocket reconnecting");
+                        OFFLINE_SYNC_RETRY_SECS
+                    } else {
+                        warn!(profile = %profile_alias, error = %e, "Offline sync failed");
+                        OFFLINE_SYNC_INTERVAL_SECS
+                    }
+                }
+            };
+
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!(profile = %profile_alias, "Offline sync task shutting down");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(next_delay_secs)) => {}
+            }
+        }
+    }
+
+    async fn sync_offline_messages(
+        listener_id: &str,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        handler: &Arc<dyn DIDCommHandler>,
+        tsp_handler: Option<&Arc<dyn TspHandler>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let wait_for_response = true;
+        let messages_limit = 100;
+
+        let status_reply = atm
+            .message_pickup()
+            .send_status_request(profile, wait_for_response, None)
+            .await?;
+
+        let messages_count = status_reply.map(|m| m.message_count).unwrap_or(0);
+        debug!(profile = %profile.inner.alias, count = messages_count, "Offline messages count");
+
+        if messages_count == 0 {
+            return Ok(());
+        }
+
+        // TSP-aware drain: fetch the backlog as classified frames so a TSP
+        // frame goes to the TSP handler (like the live loop) instead of being
+        // DIDComm-unpacked and left to poison-loop. Undeliverable frames are
+        // acked too so the mediator stops redelivering them.
+        #[cfg(feature = "tsp")]
+        {
+            use affinidi_messaging_sdk::protocols::message_pickup::InboundFrame;
+
+            let frames = atm
+                .message_pickup()
+                .send_delivery_request_frames(profile, Some(messages_limit), wait_for_response)
+                .await?;
+
+            let ack_ids: Vec<String> = frames.iter().map(|(_, id)| id.clone()).collect();
+            debug!(profile = %profile.inner.alias, count = frames.len(), "Retrieved offline frames");
+
+            for (frame, _id) in frames {
+                match frame {
+                    Some(InboundFrame::DidComm(message, meta)) => {
+                        let meta = super::listener::convert_meta(*meta);
+                        // Offline drain acks the whole batch below via
+                        // `send_messages_received`, so no per-message ack here.
+                        Listener::dispatch_message(
+                            listener_id,
+                            atm,
+                            profile,
+                            handler,
+                            *message,
+                            meta,
+                            None,
+                        )
+                        .await;
+                    }
+                    Some(InboundFrame::Tsp(packed)) => match tsp_handler {
+                        Some(h) => {
+                            Listener::dispatch_tsp(listener_id, atm, profile, h, *packed).await;
+                        }
+                        None => warn!(
+                            profile = %profile.inner.alias,
+                            "Offline TSP frame but no TSP handler configured — dropping (acked)"
+                        ),
+                    },
+                    // `InboundFrame` is `#[non_exhaustive]`.
+                    Some(_) => warn!(
+                        profile = %profile.inner.alias,
+                        "Unrecognised offline frame kind — dropping (acked)"
+                    ),
+                    // Undeliverable (bad encoding / DIDComm unpack failure): drop
+                    // it; it's in `ack_ids` so the mediator stops redelivering.
+                    None => {}
+                }
+            }
+
+            if !ack_ids.is_empty() {
+                let delete_result = atm
+                    .message_pickup()
+                    .send_messages_received(profile, &ack_ids, wait_for_response)
+                    .await?;
+                if delete_result.is_none() {
+                    warn!(profile = %profile.inner.alias, "No status reply for offline messages ack");
+                }
+            }
+
+            Ok(())
+        }
+
+        #[cfg(not(feature = "tsp"))]
+        {
+            let _ = tsp_handler;
+
+            let offline_messages = atm
+                .message_pickup()
+                .send_delivery_request(profile, Some(messages_limit), wait_for_response)
+                .await?;
+
+            let message_ids: Vec<_> = offline_messages.iter().map(|(m, _)| m.id.clone()).collect();
+
+            debug!(profile = %profile.inner.alias, count = offline_messages.len(), "Retrieved offline messages");
+
+            for (message, meta) in offline_messages {
+                let meta = super::listener::convert_meta(meta);
+                // Offline drain acks the whole batch below via
+                // `send_messages_received`, so no per-message ack here.
+                Listener::dispatch_message(listener_id, atm, profile, handler, message, meta, None)
+                    .await;
+            }
+
+            let delete_result = atm
+                .message_pickup()
+                .send_messages_received(profile, &message_ids, wait_for_response)
+                .await?;
+
+            if delete_result.is_some() {
+                debug!(profile = %profile.inner.alias, "Offline messages acknowledged and deleted");
+            } else {
+                warn!(profile = %profile.inner.alias, "No status reply for offline messages ack");
+            }
+
+            Ok(())
+        }
+    }
+}

@@ -1,0 +1,39 @@
+[package]
+name = "affinidi-did-authentication"
+description = "Using proof of DID ownership to authenticate to services"
+version = "0.3.13"
+edition.workspace = true
+authors.workspace = true
+readme = "README.md"
+homepage.workspace = true
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+affinidi-crypto = { version = "0.2", features = ["jose"] }
+affinidi-messaging-didcomm = { path = "../../messaging/affinidi-messaging-didcomm", version = "0.15" }
+affinidi-did-resolver-cache-sdk = "0.8"
+affinidi-did-common = { version = "0.4", features = ["key-agreement"] }
+affinidi-secrets-resolver = "0.5"
+affinidi-encoding = "0.1"
+## `HttpStatusError`, shared with the messaging SDK (which depends on this
+## crate, so the type cannot live there) and `MessagingError`.
+affinidi-messaging-core = { path = "../../messaging/affinidi-messaging-core", version = "0.1.7" }
+
+base64 = "0.23"
+chrono = "0.4"
+reqwest = { version = "0.13", features = ["rustls", "json"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { workspace = true, features = ["time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "fast-rng"] }
+
+[dev-dependencies]
+## Captures tracing output to assert sensitive values never log at DEBUG.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }

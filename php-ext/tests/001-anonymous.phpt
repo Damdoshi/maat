@@ -1,5 +1,5 @@
 --TEST--
-Maât authenticates no one when no trusted broker ticket is present
+Maât authenticates no one without an Apache verified request context
 --EXTENSIONS--
 maat
 --FILE--

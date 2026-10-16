@@ -1,68 +1,29 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
+/build/
+/build-asan/
+/dist/
 *.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
+*.lo
 *.la
-*.a
-*.lib
+.libs/
+modules/mod_maat/.libs/
+libs/apache-httpd/build/
 
-# Executables
-*.exe
-*.out
-*.app
+# Optional Rust FFI bridge compilation
+libs/maat-bbs/target/
+libs/maat-bbs/vendor/
 
-# Build directories
-build/
-Build/
-build-*/
+# OpenSSH — generated files
+/libs/openssh-portable/buildpkg.sh
+/libs/openssh-portable/libssh.a
+/libs/openssh-portable/openbsd-compat/Makefile
+/libs/openssh-portable/openbsd-compat/libopenbsd-compat.a
+/libs/openssh-portable/openbsd-compat/regress/Makefile
 
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
+# PHP extension — generated files
+/php-ext/config.nice
+/php-ext/maat.dep
 
-# Temporary files
-*.tmp
-*.log
-*.bak
-*.swp
-
-# vcpkg
-vcpkg_installed/
-
-# debug information files
-*.dwo
-
-# test output & cache
-Testing/
-.cache/
+# Python
+__pycache__/
+*.py[cod]
+ubuntu-22.04-server-cloudimg-amd64.img

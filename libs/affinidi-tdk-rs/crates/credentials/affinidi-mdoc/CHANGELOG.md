@@ -1,0 +1,241 @@
+# Affinidi mdoc Changelog
+
+## Unreleased (0.3.3) — `ValidityInfo` dates are CBOR Tag 0
+
+Fixes [#950](https://github.com/affinidi/affinidi-tdk-rs/issues/950); the fix is
+by [@razvp](https://github.com/razvp) ([#951](https://github.com/affinidi/affinidi-tdk-rs/pull/951)).
+
+ISO 18013-5 types `signed`, `validFrom` and `validUntil` as `tdate`, which
+RFC 8610 defines as `#6.0(tstr)`. They were encoded as bare text strings, so a
+strict verifier could reject MSOs issued by this crate. They now carry Tag 0.
+
+- **Wire change for new MSOs:** the encoded MSO, and so the signed payload,
+  differs from 0.3.2 for the same input. Nothing re-encodes a received MSO
+  (digests and signatures are checked over the bytes as received), so MSOs
+  already issued keep verifying.
+- **Decoding is unchanged:** tagged and untagged dates both parse.
+- `ValidityInfo` now derives `PartialEq`.
+
+## Unreleased (0.3.2) — `rand` 0.10
+
+No behaviour change and no public API change. `EdDsaCoseKey::generate` now
+calls `SigningKey::generate` directly: ed25519-dalek 3 and `rand` 0.10 share
+`rand_core` 0.10, so the detour through an intermediate byte array (which left
+an unzeroized copy of the key on the stack) is gone.
+
+## Unreleased (0.3.1) — `sha2` 0.11, `hmac` 0.13, `hkdf` 0.13, `aes-gcm` 0.11
+
+No behaviour change and no public API change: these are private dependencies
+here, which is what lets each crate move on its own schedule. Verified by
+`cargo tree`/grep that no RustCrypto type appears in a public signature anywhere
+in the workspace.
+
+One-line change: `new_from_slice` moved from the `Mac` trait to `KeyInit`.
+144 tests green, including the device-MAC round-trips.
+
+## 1st September 2026 (0.3.0)
+
+Moves to **coset 0.4**.
+
+No source change — the API this crate uses is identical across the bump, and
+0.4.0's one breaking change (the `crit` field on `Header` gains support for
+private-use labels, per [RFC 9052
+§3.1](https://datatracker.ietf.org/doc/html/rfc9052#name-common-cose-header-paramete))
+touches nothing here. All 126 tests pass unmodified.
+
+**Minor rather than patch, because `coset` is in this crate's public API.**
+`IssuerSigned::issuer_auth` and `Document::issuer_auth` are `pub` fields of type
+`coset::CoseSign1`; `sign_mso` returns one; `extract_kid` takes one; and
+`CoseKey::default_algorithm` returns `Option<coset::iana::Algorithm>`. A
+consumer that names those types has to move in the same step, so the version
+has to say so — a patch bump would let cargo resolve a consumer on `coset 0.3`
+beside this crate on 0.4 and fail with duplicate-type errors rather than a
+version conflict.
+
+That is not hypothetical. It is what blocked
+[OpenVTC/verifiable-trust-infrastructure#1225](https://github.com/OpenVTC/verifiable-trust-infrastructure/pull/1225):
+`vta-vault` compares an `alg` taken from `IssuerSigned` against one it builds
+from its own `coset`, and moving only its side produced
+
+```
+error[E0308]: mismatched types
+note: there are multiple different versions of crate `coset` in the dependency graph
+```
+
+This release is what lets that side move.
+
+## 16th August 2026 (0.2.7)
+
+Adds the CBOR wire codec for **`DeviceResponse`** — `to_cbor_bytes` /
+`from_cbor_bytes` — completing the pair started in 0.2.6. This is the
+presentation half: the bytes a holder returns to a reader, and
+(base64url-encoded) the content of an OpenID4VP `vp_token` entry for an
+`mso_mdoc` credential.
+
+Unlike `IssuerSigned`, this is not a straight container mapping. `DeviceResponse`
+models a **single** document while the wire form carries a `documents` array of
+`Document` entries, each nesting `issuerSigned` and `deviceSigned`. Encoding
+emits exactly one entry; decoding refuses anything other than one document
+rather than silently dropping what a reader asked for.
+
+The `issuerSigned` encode/decode is now shared with the 0.2.6 `IssuerSigned`
+path (`issuer_signed_to_value` / `issuer_signed_from_value`) — a `Document`
+embeds exactly that structure, and the two must not drift.
+
+**`deviceSigned.nameSpaces` is Tag24-wrapped on the wire** even though
+`DeviceSigned::namespaces_bytes` holds the untagged inner CBOR. The struct keeps
+the inner form because that is what `DeviceAuthentication` embeds before signing;
+the tag belongs to the wire. Getting this backwards yields a response whose
+device signature no verifier can reproduce.
+
+Two tests assert the **encoded byte shape** rather than a round trip
+(`encoded_device_namespaces_are_tag24_wrapped_on_the_wire`,
+`encoded_issuer_auth_is_an_untagged_cose_sign1`). This is deliberate: the decoder
+tolerates a bare `bstr` for `nameSpaces` and a tag-18 `COSE_Sign1`, so an encoder
+that omits the tag — or adds one — still round-trips cleanly through our own
+code. It is self-consistent and wrong, and only a peer implementation would
+notice. Both assertions were mutation-checked: breaking the encoder fails them,
+while the round-trip tests stayed green.
+
+Patch bump, per [ADR 0003](../../../docs/adr/0003-public-api-semver-policy.md)
+point 3 — purely additive, and a minor bump would break the `[patch.crates-io]`
+redirects.
+
+## 16th August 2026 (0.2.6)
+
+Adds the CBOR **wire codec** for `IssuerSigned` — `to_cbor_bytes` /
+`from_cbor_bytes` (ISO/IEC 18013-5 §8.3.2.1.2.2).
+
+Until now this crate could build, sign and verify an mdoc entirely in memory,
+but could not turn one into the bytes an issuer hands out, or read those bytes
+back: `IssuerSigned` derived only `Debug, Clone`. Any consumer storing a
+credential as opaque bytes — a wallet, a credential vault — therefore had no
+supported way to decode what it held. Every constituent type already
+serialised (`MobileSecurityObject`, `Tag24<T>`, `coset::CoseSign1`); only the
+container was missing.
+
+Deliberately **not** a `derive`. `mso` and `doc_type` are struct fields for
+ergonomics but are not wire members — the MSO lives inside the `issuerAuth`
+payload, and `docType` inside the MSO. A derive would emit both a second time
+and let a decoder trust a `docType` the issuer never signed, so decoding reads
+them out of the signed payload and the outer map is never consulted for them.
+A test asserts an injected outer `docType` is ignored.
+
+Other decisions:
+- **Parsing is not verifying.** `from_cbor_bytes` checks structure only;
+  callers must still run `verify_issuer_auth` and `verify_digests`. They stay
+  separate because the issuer key is normally resolved *from* the decoded
+  credential's `x5chain`.
+- **Digest fidelity holds across a round trip**, because `Tag24`'s
+  `Deserialize` preserves `inner_bytes` — digests are checked against the
+  bytes as received, never a re-encode. Pinned by a test.
+- A **tag-18 wrapped** `COSE_Sign1` is accepted on decode even though ISO
+  specifies untagged, since generic COSE encoders emit it and the tag carries
+  no meaning at that position. Encoding stays untagged, per spec.
+- Absent `nameSpaces` decodes to an empty map rather than erroring — it is
+  optional in the CDDL.
+
+`DeviceResponse` encoding (the presentation path) is intentionally **not** in
+this change: its in-memory shape is a flattened single-document convenience
+model, while the wire form nests `Document` entries with `deviceSigned`, and
+that conversion deserves its own review alongside the `DeviceAuth` /
+`SessionTranscript` semantics.
+
+Patch bump, per [ADR 0003](../../../docs/adr/0003-public-api-semver-policy.md)
+point 3: the change is purely additive (a new module plus two inherent
+methods), and a minor bump would break the `[patch.crates-io]` redirects.
+
+## 2nd August 2026 (0.2.5)
+
+Moves this crate to the **elliptic-curve 0.14** family (`p256` / `k256` /
+`p384` / `p521` 0.13 -> 0.14), which brings rand_core 0.10, digest 0.11 and
+signature 3 with it.
+
+API changes handled: the sec1 traits were renamed (`ToEncodedPoint` ->
+`ToSec1Point`, `FromEncodedPoint` -> `FromSec1Point`), `EncodedPoint` became a
+generic alias for `Sec1Point<C>` so it needs a per-module binding, and the
+deprecated `SigningKey::random(rng)` is now `Generate::generate()` (system
+CSPRNG, panics on failure).
+
+Patch bump, per [ADR 0003](../../../docs/adr/0003-public-api-semver-policy.md) point 3: `vta-sdk` and `didwebvh-rs` redirect
+this crate through `[patch.crates-io]`, and a minor bump breaks the redirect.
+
+Crypto behaviour is unchanged — the golden/KAT vectors (`p256_sign_verify_roundtrip`,
+`secp256k1_es256k_golden` RFC 6979, `ecdh_1pu_x25519_kek_golden`,
+`concat_kdf_es_golden`, `a256cbc_hs512_golden`) all still pass.
+
+## 31st July 2026 (0.2.4)
+
+Moves to **curve25519-dalek 5** (`ed25519-dalek` 2 -> 3, `x25519-dalek` 2 -> 3),
+which brings rand_core 0.10 and signature 3 with it. rand 0.10 renamed `OsRng`
+to `SysRng` *and* made it fallible (`TryRng<Error = SysError>`), so it no longer
+satisfies dalek's `CryptoRng` bound; key generation moves to `rand::rng()`.
+
+Patch bump, per [ADR 0003](../../../docs/adr/0003-public-api-semver-policy.md) point 3: `vta-sdk` pins this crate through
+`[patch.crates-io]`, and a minor bump would break the redirect and pull a second
+copy from crates.io.
+
+## 14th June 2026 Release 0.2.3
+
+- **Fix (build):** `session.rs` no longer calls the now-deprecated
+  `GenericArray::from_slice` for the AES-256-GCM key/nonce — the key is built via
+  `KeyInit::new_from_slice` and the nonce via `Nonce::from([u8; 12])`. This keeps
+  the crate compiling under `-D warnings` against `generic-array` 0.14.9+, which
+  deprecated `from_slice`. Behaviour-identical (round-trip tests unchanged).
+  Supersedes 0.2.2, which carried the same `MdocError` sealing below but failed
+  to publish on the deprecation.
+
+## 14th June 2026 Release 0.2.2
+
+- `MdocError` is now `#[non_exhaustive]` (ADR-0003) so new variants land
+  additively. Patch bump keeps the `0.2` pin valid; consumers that `match` it
+  must add a `_` wildcard arm. No behaviour change. (W7 sweep)
+
+## 1st June 2026 Release 0.2.1
+
+### Security
+
+- **Drops the unmaintained `serde_cbor` dependency (RUSTSEC-2021-0127).**
+  `serde_cbor` was declared in `[dependencies]` but referenced nowhere
+  in the crate — all CBOR encoding/decoding already goes through
+  `ciborium`. Removing the unused dependency clears the advisory with
+  no code or behaviour change.
+
+## 28th May 2026 Release 0.2.0
+
+### Security
+
+- **HIGH — MSO `ValidityInfo` was parsed but never enforced.**
+  `verify_issuer_auth()` and `verify_digests()` accepted an mdoc whose
+  `validUntil` was years in the past. ISO/IEC 18013-5 §9.3.1 requires
+  the reader to reject documents outside their validity window, and
+  `MdocError::Expired` already existed (unused) for exactly this. New
+  `ValidityInfo::check(now)` and `ValidityInfo::check_now()` methods
+  parse the RFC 3339 timestamps and return `Expired` when `now` falls
+  outside `[validFrom, validUntil]`. Verifiers MUST call this on the
+  MSO returned from `IssuerSigned::verify_issuer_auth` — signature and
+  digest checks alone do not establish current validity.
+
+### Breaking
+
+- **`MdocError::Expired` is now `Expired(String)`** (was a unit variant).
+  The variant existed but was unused, so no in-workspace consumer is
+  affected; out-of-workspace callers pattern-matching on the unit form
+  must update to the tuple form, e.g.
+  `Err(MdocError::Expired) => …` becomes
+  `Err(MdocError::Expired(_)) => …`. The carried string describes which
+  bound was crossed (not-yet-valid vs. expired) and the offending
+  timestamp.
+
+### Dependencies
+
+- Adds `time = "0.3"` (with `parsing` feature) — already in the workspace
+  via `affinidi-messaging-sdk`.
+
+### Tests
+
+- `validity_info_check_within_window` — in-window passes.
+- `validity_info_check_expired` — `now > validUntil` returns `Expired`.
+- `validity_info_check_not_yet_valid` — `now < validFrom` returns `Expired`.
+- `validity_info_check_malformed` — non-RFC-3339 timestamps return
+  `InvalidMso`.

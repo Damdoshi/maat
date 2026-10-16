@@ -1,0 +1,26 @@
+# Example only. Do NOT enable before supplying the two trusted HEX constants,
+# service account, host key pins and SSH private key. No authority RPC.
+[Unit]
+Description=Maât public signed trust replication round
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=maat-sync
+Group=maat-sync
+Environment=HOME=/var/lib/maat-sync
+ExecStart=/usr/local/libexec/maat-trust-sync round /var/lib/maat-sync/public.sqlite REPLACE_REGISTRY_HEX REPLACE_AUTHORITY_ED25519_HEX /etc/maat/peers.conf
+TimeoutStartSec=300
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/maat-sync
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Fail closed if the pool is stale. A timer failure must never mark trust
+# usable. Actual verifiers must call ReplicatedTrust::fresh() themselves.

@@ -1,0 +1,17 @@
+Source: libapache2-mod-maat
+Section: web
+Priority: optional
+Maintainer: Maât contributors <maat-developers@localhost>
+Build-Depends: debhelper-compat (= 13), apache2-dev, libapr1-dev, libaprutil1-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/Damdoshi/openssh-portable
+
+Package: libapache2-mod-maat
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, apache2-api-20120211
+Description: experimental Maât broker-integrated request identity for Apache 2.4
+ An Apache module that strips spoofable Maât request headers and
+ verifies single-use SSH tickets directly with the broker on a private listener.
+ Exposes only per-request broker-verified context to php-maat.
+ Does not activate itself and is not ready for production.

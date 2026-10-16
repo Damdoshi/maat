@@ -1,4 +1,6 @@
 #include "http_domain.hpp"
+#include "http_stream.hpp"
+#include "connection_proof.hpp"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
@@ -12,6 +14,7 @@
 #include <vector>
 #include <algorithm>
 #include <sys/prctl.h>
+#include <csignal>
 namespace {
 void sendAll(int fd,const std::string& data) {
     size_t off=0;
@@ -47,40 +50,48 @@ int main(int argc,char** argv) {
         if(getsockopt(broker,SOL_SOCKET,SO_DOMAIN,&domain,&size)!=0 || domain!=AF_UNIX ||
            getsockopt(broker,SOL_SOCKET,SO_TYPE,&type,&size)!=0 || type!=SOCK_SEQPACKET)
             throw std::runtime_error("invalid session capability");
-        auto request=maat::HTTPRequest::read(STDIN_FILENO);
-        // Single SSH string, not a client-supplied session name.
-        auto p=maat::requestMessage("MAATGET2","");
-        p.resize(4+std::strlen("MAATGET2"));
-        if(send(broker,p.data(),p.size(),MSG_NOSIGNAL)!=ssize_t(p.size()))
-            throw std::runtime_error("session capability rejected");
-        uint8_t buf[256];ssize_t n=recv(broker,buf,sizeof(buf),MSG_TRUNC);close(broker);
-        if(n<=0 || n>ssize_t(sizeof(buf))) throw std::runtime_error("issuer rejected session");
-        std::vector<uint8_t> reply(buf,buf+n);size_t off=0;
-        if(maat::readString(reply,off,32)!="MAATHTTP1") throw std::runtime_error("issuer version");
-        auto token=maat::readString(reply,off,64);
-        if(off!=reply.size()) throw std::runtime_error("issuer trailing data");
-        (void)maat::RequestTicket(token);
-        int upstream=connectBackend();
-        try {
-            sendAll(upstream,request.forwarded(token));
-            shutdown(upstream,SHUT_WR);
-            char b[8192];size_t total=0;
-            for(;;) {
-                ssize_t count=read(upstream,b,sizeof(b));
-                if(count<0 && errno==EINTR) continue;
-                if(count<=0) break;
-                total+=size_t(count);
-                if(total>8*1024*1024) throw std::runtime_error("response too large");
-                size_t pos=0;
-                while(pos<size_t(count)) {
-                    ssize_t written=write(STDOUT_FILENO,b+pos,size_t(count)-pos);
-                    if(written<0 && errno==EINTR) continue;
-                    if(written<=0) throw std::runtime_error("client disconnected");
-                    pos+=size_t(written);
+        std::signal(SIGPIPE,SIG_IGN);
+        timeval brokerTimeout{};brokerTimeout.tv_sec=5;
+        if(setsockopt(broker,SOL_SOCKET,SO_RCVTIMEO,&brokerTimeout,sizeof(brokerTimeout))!=0)
+            throw std::runtime_error("cannot set capability timeout");
+        maat::HTTPRequestStream stream(STDIN_FILENO);
+        maat::HTTPRequest request;
+        // Every HTTP message receives a FRESH TCP socket and SCM_RIGHTS
+        // proof. No request inherits an earlier Apache identity context.
+        for(size_t count=0;count<100 && stream.next(request);++count) {
+            int upstream=connectBackend();
+            try {
+                if(!maat::sendOneFD(broker,upstream,"MAATLINK1"))
+                    throw std::runtime_error("cannot register HTTP connection");
+                uint8_t buf[128];
+                ssize_t n=recv(broker,buf,sizeof(buf),MSG_TRUNC);
+                if(n<=0 || n>ssize_t(sizeof(buf)))
+                    throw std::runtime_error("broker denied connection");
+                std::vector<uint8_t> ack(buf,buf+n);size_t off=0;
+                if(maat::readString(ack,off,20)!="MAATREADY1" ||
+                   maat::readString(ack,off,0)!="" || off!=ack.size())
+                    throw std::runtime_error("broker invalid acknowledgement");
+                sendAll(upstream,request.forwarded());
+                shutdown(upstream,SHUT_WR);
+                char b[8192];std::string response;
+                for(;;) {
+                    ssize_t got=read(upstream,b,sizeof(b));
+                    if(got<0 && errno==EINTR) continue;
+                    if(got<0) throw std::runtime_error("HTTP backend read failure");
+                    if(got==0) break;
+                    if(size_t(got)>8*1024*1024-response.size())
+                        throw std::runtime_error("response too large");
+                    response.append(b,size_t(got));
                 }
-            }
-        }catch(...){close(upstream);throw;}
-        close(upstream);
+                const bool head=request.forwarded().compare(0,5,"HEAD ")==0;
+                const std::string framed=maat::HTTPResponse::persistent(response,head);
+                sendAll(STDOUT_FILENO,framed);
+            }catch(...){close(upstream);throw;}
+            close(upstream);
+        }
+        // A client attempting 101 requests will eventually lose its session
+        // capability. Do not offer a way to renew without fresh SSH auth.
+        close(broker);
         return 0;
     } catch(const std::exception& e){
         std::fprintf(stderr,"maat-http-bridge: %s\n",e.what());

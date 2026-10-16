@@ -27,6 +27,8 @@
 
 #include "includes.h"
 
+#include "maat_uid_guard.h"
+
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/queue.h>
@@ -1215,7 +1217,7 @@ mm_maat_bind(uid_t *session_uid)
     mm_request_send(pmonitor->m_recvfd,MONITOR_REQ_MAAT_BIND,m);
     mm_request_receive_expect(pmonitor->m_recvfd,MONITOR_ANS_MAAT_BIND,m);
     if (sshbuf_get_u32(m,&uid)!=0 || sshbuf_len(m)!=0 ||
-        uid<1800000000U || uid>1899999999U)
+        !maat_uid_plausible(uid))
         fatal("Maât monitor returned invalid ephemeral UID");
     *session_uid=(uid_t)uid;
     sshbuf_free(m);

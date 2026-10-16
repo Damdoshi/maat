@@ -9,6 +9,7 @@
 #include <cctype>
 #include <limits>
 #include <pwd.h>
+#include <cstdio>
 namespace maat {
 namespace {
 uint8_t nibble(char c) {
@@ -22,13 +23,6 @@ std::vector<uint8_t> parseHex(const std::string& hex,size_t min,size_t max) {
     for(size_t i=0;i<hex.size();i+=2) r.push_back(uint8_t(nibble(hex[i])*16+nibble(hex[i+1])));
     return r;
 }
-std::string hexEncode(const uint8_t* data,size_t n) {
-    static constexpr char h[]="0123456789abcdef";
-    std::string s;
-    s.reserve(n*2);
-    for(size_t i=0;i<n;++i) { s+=h[data[i]>>4]; s+=h[data[i]&15]; }
-    return s;
-}
 void put(std::vector<uint8_t>& result,const std::string& s) {
     if(s.size()>65535) throw std::invalid_argument("string too big");
     const uint32_t n=uint32_t(s.size());
@@ -40,20 +34,6 @@ void sqlExec(sqlite3* db,const char* s) {
 }
 }
 SessionIdentifier::SessionIdentifier(const std::string& hex):id_(parseHex(hex,16,128)) {}
-RequestTicket::RequestTicket() {
-    size_t off=0;
-    while(off<value_.size()) {
-        ssize_t n=getrandom(value_.data()+off,value_.size()-off,0);
-        if(n<0 && errno==EINTR) continue;
-        if(n<=0) throw std::runtime_error("getrandom failed");
-        off+=size_t(n);
-    }
-}
-RequestTicket::RequestTicket(const std::string& h) {
-    auto data=parseHex(h,32,32);
-    std::copy(data.begin(),data.end(),value_.begin());
-}
-std::string RequestTicket::hex() const { return hexEncode(value_.data(),value_.size()); }
 std::vector<uint8_t> requestMessage(const std::string& magic,const std::string& hex) {
     std::vector<uint8_t> msg; put(msg,magic); put(msg,hex); return msg;
 }
@@ -74,15 +54,34 @@ EphemeralUID::EphemeralUID(uint64_t value,const UIDRange& range):value_(0) {
     if(!range.contains(value)) throw std::invalid_argument("ephemeral UID outside host-reserved range");
     value_=static_cast<uid_t>(value);
 }
-IdentityRepository::IdentityRepository(const std::string& path,const UIDRange& range):range_(range) {
+bool NSSUIDCollisionPolicy::isFree(uid_t uid) const {
+    // Use NSS, not /etc/passwd alone: LDAP/SSSD/etc. may own the UID.
+    // 16 KiB is insufficient for some NSS sources; ERANGE is retried with
+    // increasing bounded buffers. Every other error fails closed.
+    size_t capacity=16384;
+    for (;;) {
+        std::vector<char> buffer(capacity);
+        struct passwd entry{};
+        struct passwd* found=nullptr;
+        const int error=getpwuid_r(uid,&entry,buffer.data(),buffer.size(),&found);
+        if(error==0) return found==nullptr;
+        if(error==ERANGE && capacity<1048576) { capacity*=2; continue; }
+        std::fprintf(stderr,"Maât: unable to verify UID %lu via NSS: %s (%d); refusing allocation\n",
+                     static_cast<unsigned long>(uid),std::strerror(error),error);
+        return false;
+    }
+}
+const UIDCollisionPolicy& systemUIDCollisionPolicy() {
+    static NSSUIDCollisionPolicy policy;
+    return policy;
+}
+IdentityRepository::IdentityRepository(const std::string& path,const UIDRange& range,
+                                       const UIDCollisionPolicy& policy):range_(range),uidPolicy_(policy) {
     if(sqlite3_open_v2(path.c_str(),&db_,SQLITE_OPEN_READWRITE|SQLITE_OPEN_FULLMUTEX,nullptr)!=SQLITE_OK)
         throw std::runtime_error("cannot open SSH database");
     sqlite3_busy_timeout(db_,2000);
     sqlExec(db_,"PRAGMA journal_mode=WAL;");
     sqlExec(db_,"PRAGMA synchronous=FULL;");
-    sqlExec(db_,"CREATE TABLE IF NOT EXISTS maat_request_tokens ("
-       "ticket BLOB PRIMARY KEY, session BLOB NOT NULL, issued_at INTEGER NOT NULL,"
-       "consumed_at INTEGER, FOREIGN KEY(session) REFERENCES verified_ssh_sessions(session));");
     sqlExec(db_,"CREATE TABLE IF NOT EXISTS maat_session_bindings ("
        "session BLOB PRIMARY KEY NOT NULL, bound_at INTEGER NOT NULL);");
     // This ledger is never truncated or reused: even abandoned sessions burn
@@ -106,8 +105,7 @@ IdentityRepository::IdentityRepository(const std::string& path,const UIDRange& r
     }
     sqlite3_finalize(rangeCheck);
     // Crucial: a KEX session ID can be redeemed only once, transactionally.
-    sqlExec(db_,"CREATE UNIQUE INDEX IF NOT EXISTS maat_one_ticket_per_session "
-       "ON maat_request_tokens(session);");
+
 }
 IdentityRepository::~IdentityRepository(){if(db_) sqlite3_close(db_);}
 bool IdentityRepository::bind(const SessionIdentifier& id, uid_t& bridgeUID) {
@@ -129,9 +127,7 @@ bool IdentityRepository::bind(const SessionIdentifier& id, uid_t& bridgeUID) {
         catch(const std::exception&) { break; }
         // Never allocate an existing NSS principal. This is a supplementary
         // guard, not a replacement for a host-wide UID reservation policy.
-        passwd password{}, *found=nullptr;
-        char buffer[16384];
-        if(getpwuid_r(allocated,&password,buffer,sizeof(buffer),&found)!=0 || found!=nullptr) break;
+        if(!uidPolicy_.isFree(allocated)) break;
         const char* bindSQL="INSERT INTO maat_session_bindings(session,bound_at) "
           "SELECT session,?2 FROM verified_ssh_sessions WHERE session=?1 "
           "AND accepted_at>=?3 AND accepted_at<=?2";
@@ -160,67 +156,32 @@ bool IdentityRepository::bind(const SessionIdentifier& id, uid_t& bridgeUID) {
     if(!success) sqlite3_exec(db_,"ROLLBACK",nullptr,nullptr,nullptr);
     return success;
 }
-bool IdentityRepository::issue(const SessionIdentifier& id,const RequestTicket& ticket) {
-    sqlite3_stmt* stmt=nullptr;
-    const char* sql="INSERT INTO maat_request_tokens(ticket,session,issued_at) "
-      "SELECT ?1, session,?3 FROM verified_ssh_sessions WHERE session=?2 "
-      "AND accepted_at>=?4 AND accepted_at<=?3 "
-      "AND EXISTS(SELECT 1 FROM maat_session_bindings WHERE session=?2)";
-    if(sqlite3_prepare_v2(db_,sql,-1,&stmt,nullptr)!=SQLITE_OK) return false;
-    int rc=sqlite3_bind_blob(stmt,1,ticket.bytes().data(),32,SQLITE_TRANSIENT);
-    if(rc==SQLITE_OK) rc=sqlite3_bind_blob(stmt,2,id.bytes().data(),int(id.bytes().size()),SQLITE_TRANSIENT);
-    if(rc==SQLITE_OK) rc=sqlite3_bind_int64(stmt,3,std::time(nullptr));
-    if(rc==SQLITE_OK) rc=sqlite3_bind_int64(stmt,4,std::time(nullptr)-60);
-    if(rc==SQLITE_OK) rc=sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc==SQLITE_DONE && sqlite3_changes(db_)==1;
-}
-bool IdentityRepository::consume(const RequestTicket& ticket,std::string& user,std::vector<uint8_t>& key) {
-    // UPDATE ... RETURNING atomically consumes the token and returns the SSH
-    // assertion. The token is never a claim about civil identity.
-    const char* sql="UPDATE maat_request_tokens SET consumed_at=?2 "
-      "WHERE ticket=?1 AND consumed_at IS NULL AND issued_at>=?3 AND issued_at<=?2 "
-      "RETURNING (SELECT user FROM verified_ssh_sessions WHERE session=maat_request_tokens.session),"
-      "(SELECT key_blob FROM verified_ssh_sessions WHERE session=maat_request_tokens.session)";
+bool IdentityRepository::identityForBoundSession(const SessionIdentifier& sid,
+                                                    std::string& user, std::vector<uint8_t>& key) {
+    const char* sql="SELECT v.user,v.key_blob FROM verified_ssh_sessions v "
+       "JOIN maat_session_bindings b ON b.session=v.session "
+       "JOIN maat_ephemeral_uids e ON e.session=v.session WHERE v.session=?1";
     sqlite3_stmt* stmt=nullptr;
     if(sqlite3_prepare_v2(db_,sql,-1,&stmt,nullptr)!=SQLITE_OK) return false;
-    const sqlite3_int64 now=std::time(nullptr);
-    int rc=sqlite3_bind_blob(stmt,1,ticket.bytes().data(),32,SQLITE_TRANSIENT);
-    if(rc==SQLITE_OK) rc=sqlite3_bind_int64(stmt,2,now);
-    if(rc==SQLITE_OK) rc=sqlite3_bind_int64(stmt,3,now-30);
-    if(rc==SQLITE_OK) rc=sqlite3_step(stmt);
-    bool ok=false;
-    if(rc==SQLITE_ROW && sqlite3_column_type(stmt,0)==SQLITE_TEXT &&
-       sqlite3_column_type(stmt,1)==SQLITE_BLOB) {
+    sqlite3_bind_blob(stmt,1,sid.bytes().data(),int(sid.bytes().size()),SQLITE_TRANSIENT);
+    bool valid=false;
+    if(sqlite3_step(stmt)==SQLITE_ROW && sqlite3_column_type(stmt,0)==SQLITE_TEXT &&
+       sqlite3_column_type(stmt,1)==SQLITE_BLOB && sqlite3_column_bytes(stmt,1)==51) {
         const char* u=reinterpret_cast<const char*>(sqlite3_column_text(stmt,0));
-        auto* bytes=static_cast<const uint8_t*>(sqlite3_column_blob(stmt,1));
-        const int len=sqlite3_column_bytes(stmt,1);
-        if(u && bytes && len==51) { user=u; key.assign(bytes,bytes+len); ok=true; }
-    }
-    if(ok && sqlite3_step(stmt)!=SQLITE_DONE) ok=false;
-    if(sqlite3_finalize(stmt)!=SQLITE_OK) ok=false;
-    return ok;
-}
-HTTPRequest HTTPRequest::read(int fd,size_t maxBody) {
-    HTTPRequest result;
-    char buf[4096];
-    for(;;) {
-        if(result.header_.size()>16384) throw std::invalid_argument("headers too big");
-        auto p=result.header_.find("\r\n\r\n");
-        if(p!=std::string::npos) {
-            result.body_=result.header_.substr(p+4);
-            result.header_.resize(p+4);
-            break;
+        const auto* k=static_cast<const uint8_t*>(sqlite3_column_blob(stmt,1));
+        const int length=sqlite3_column_bytes(stmt,0);
+        if(u && k && length>0 && length<=64) {
+            user.assign(u,static_cast<size_t>(length));key.assign(k,k+51);valid=true;
         }
-        ssize_t n=::read(fd,buf,sizeof(buf));
-        if(n<0 && errno==EINTR) continue;
-        if(n<=0) throw std::invalid_argument("incomplete headers");
-        result.header_.append(buf,size_t(n));
     }
-    if(result.header_.size()>16384) throw std::invalid_argument("headers too big");
-    auto first=result.header_.find("\r\n");
+    sqlite3_finalize(stmt);
+    return valid;
+}
+size_t HTTPRequest::expectedBodyLength(const std::string& header,size_t maxBody) {
+    if(header.size()>16384) throw std::invalid_argument("headers too big");
+    auto first=header.find("\r\n");
     if(first==std::string::npos) throw std::invalid_argument("bad request line");
-    std::string start=result.header_.substr(0,first);
+    std::string start=header.substr(0,first);
     if(start.rfind("GET /",0)!=0 && start.rfind("POST /",0)!=0 && start.rfind("HEAD /",0)!=0)
         throw std::invalid_argument("unsupported method or non-origin form");
     if(start.size()<9 || start.substr(start.size()-9)!=" HTTP/1.1")
@@ -228,11 +189,11 @@ HTTPRequest HTTPRequest::read(int fd,size_t maxBody) {
     for(char c:start) if(uint8_t(c)<32 || uint8_t(c)>126) throw std::invalid_argument("bad request line");
     size_t len=0; bool hasLen=false,hasHost=false;
     size_t cursor=first+2;
-    while(cursor<result.header_.size()-2) {
-        auto end=result.header_.find("\r\n",cursor);
+    while(cursor<header.size()-2) {
+        auto end=header.find("\r\n",cursor);
         if(end==std::string::npos) throw std::invalid_argument("malformed header");
         if(end==cursor) break;
-        auto line=result.header_.substr(cursor,end-cursor);
+        auto line=header.substr(cursor,end-cursor);
         if(line.empty() || line[0]==' ' || line[0]=='\t') throw std::invalid_argument("header folding");
         auto colon=line.find(':');
         if(colon==std::string::npos) throw std::invalid_argument("missing colon");
@@ -243,7 +204,8 @@ HTTPRequest HTTPRequest::read(int fd,size_t maxBody) {
         std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return char(std::tolower(c));});
         for(char c:line) if(c=='\0' || (uint8_t(c)<32 && c!='\t'))
             throw std::invalid_argument("control character");
-        if(name=="transfer-encoding" || name=="connection" || name=="upgrade" || name=="proxy-connection")
+        if(name=="transfer-encoding" || name=="connection" || name=="upgrade" ||
+           name=="proxy-connection" || name=="expect")
             throw std::invalid_argument("ambiguous/framing header");
         if(name=="content-length") {
             if(hasLen) throw std::invalid_argument("duplicate content length");
@@ -261,30 +223,56 @@ HTTPRequest HTTPRequest::read(int fd,size_t maxBody) {
         cursor=end+2;
     }
     if(!hasHost || (start.rfind("POST",0)==0 && !hasLen)) throw std::invalid_argument("missing host or length");
-    if(result.body_.size()>len) throw std::invalid_argument("pipelining or extra body");
-    while(result.body_.size()<len) {
-        ssize_t n=::read(fd,buf,std::min(sizeof(buf),len-result.body_.size()));
+    return len;
+}
+HTTPRequest HTTPRequest::fromFrame(const std::string& header,const std::string& body,size_t maxBody) {
+    const size_t length=expectedBodyLength(header,maxBody);
+    if(body.size()!=length) throw std::invalid_argument("incorrect request body length");
+    HTTPRequest result;result.header_=header;result.body_=body;return result;
+}
+HTTPRequest HTTPRequest::read(int fd,size_t maxBody) {
+    std::string header,body;
+    char buf[4096];
+    for(;;) {
+        if(header.size()>16384) throw std::invalid_argument("headers too big");
+        const auto p=header.find("\r\n\r\n");
+        if(p!=std::string::npos) {
+            body=header.substr(p+4);
+            header.resize(p+4);
+            break;
+        }
+        ssize_t n=::read(fd,buf,sizeof(buf));
+        if(n<0 && errno==EINTR) continue;
+        if(n<=0) throw std::invalid_argument("incomplete headers");
+        header.append(buf,size_t(n));
+    }
+    const size_t len=expectedBodyLength(header,maxBody);
+    if(body.size()>len) throw std::invalid_argument("pipelining or extra body");
+    while(body.size()<len) {
+        ssize_t n=::read(fd,buf,std::min(sizeof(buf),len-body.size()));
         if(n<0 && errno==EINTR) continue;
         if(n<=0) throw std::invalid_argument("incomplete request body");
-        result.body_.append(buf,size_t(n));
+        body.append(buf,size_t(n));
     }
-    return result;
+    return fromFrame(header,body,maxBody);
 }
-std::string HTTPRequest::forwarded(const std::string& ticket) const {
-    // Strip ALL client-supplied identity headers; token only from issuer.
-    size_t first=header_.find("\r\n");
-    std::string out=header_.substr(0,first+2);
+std::string HTTPRequest::forwarded() const {
+    std::string out;
+    auto first=header_.find("\r\n");
+    out+=header_.substr(0,first)+"\r\n";
     size_t cursor=first+2;
     while(cursor<header_.size()-2) {
-        size_t end=header_.find("\r\n",cursor);
-        if(end==cursor || end==std::string::npos) break;
-        std::string line=header_.substr(cursor,end-cursor);
-        std::string name=line.substr(0,line.find(':'));
+        auto end=header_.find("\r\n",cursor);
+        if(end==std::string::npos || end==cursor) break;
+        auto line=header_.substr(cursor,end-cursor);
+        auto name=line.substr(0,line.find(':'));
         std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return char(std::tolower(c));});
+        // Never let client choose any identity-related HTTP header.
         if(name.rfind("x-maat-",0)!=0 && name!="expect") out+=line+"\r\n";
         cursor=end+2;
     }
-    out+="X-Maat-Ticket: "+ticket+"\r\nConnection: close\r\n\r\n";
+    out+="Connection: close\r\n\r\n";
     return out+body_;
 }
-}
+
+} // namespace maat

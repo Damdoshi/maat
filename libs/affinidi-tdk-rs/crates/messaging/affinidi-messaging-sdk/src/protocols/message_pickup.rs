@@ -1,0 +1,2121 @@
+/*!
+ * Message Pickup Protocol 3.0
+ *
+ * NOTE: All Message ID's are SHA256 hashes of the message
+ *
+ * Do not pass message ID's to the mediator, it cannot see inside messages that it is handling.
+ *
+ */
+use crate::messages::compat::UnpackMetadata;
+use affinidi_messaging_didcomm::message::Message;
+use base64::prelude::*;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{Instrument, Level, debug, span, warn};
+use uuid::Uuid;
+
+use crate::{
+    ATM,
+    errors::ATMError,
+    messages::GenericDataStruct,
+    profiles::ATMProfile,
+    transports::{
+        SendMessageResponse,
+        websockets::{WebSocketResponses, websocket::WebSocketCommands},
+    },
+};
+
+#[derive(Default)]
+pub struct MessagePickup {}
+
+/// An inbound message the drain could not process, surfaced before it is
+/// deleted or dropped. Broadcast on the optional unprocessable-message channel
+/// (enable it with
+/// [`crate::config::ATMConfigBuilder::with_unprocessable_message_channel`],
+/// subscribe with [`crate::ATM::get_unprocessable_message_channel`]) so a
+/// consumer can observe or quarantine it instead of losing it to a log line.
+#[derive(Clone, Debug)]
+pub struct UnprocessableMessage {
+    /// The delivery attachment id (== the mediator message id), if present.
+    pub attachment_id: Option<String>,
+    /// The raw attachment payload as received. Empty when the attachment had no
+    /// base64 body.
+    pub raw: String,
+    /// Human-readable reason the message could not be processed.
+    pub reason: String,
+}
+
+/// Broadcast an [`UnprocessableMessage`] on the configured channel, if any.
+/// A full or closed channel must never block or fail the caller.
+pub(crate) fn emit_unprocessable(
+    atm: &ATM,
+    attachment_id: Option<String>,
+    raw: String,
+    reason: String,
+) {
+    if let Some(ch) = &atm.inner.config.unprocessable_message_channel {
+        let _ = ch.send(UnprocessableMessage {
+            attachment_id,
+            raw,
+            reason,
+        });
+    }
+}
+
+/// A single inbound frame off the live-delivery stream, tagged by transport.
+///
+/// `live_stream_next` yields only DIDComm and errors on a TSP frame;
+/// `live_stream_next_packed` yields only TSP and errors on a DIDComm frame. A
+/// node that speaks **both** protocols over one websocket can't know which will
+/// arrive next, so neither single-protocol method fits. `live_stream_next_frame`
+/// returns whichever arrives, tagged here, so a multiplexing consumer (e.g.
+/// `AffinidiMessageService`) can route by transport off a single stream.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum InboundFrame {
+    /// An unpacked DIDComm message and its unpack metadata.
+    DidComm(Box<Message>, Box<UnpackMetadata>),
+    /// A still-packed TSP frame (CESR/qb64), to be handed to
+    /// `atm.tsp().unpack_bytes`. Carried opaquely — the SDK does not unpack it.
+    Tsp(Box<String>),
+}
+
+// Reads the body of an incoming Message Pickup 3.0 Status Request Message
+#[derive(Default, Deserialize)]
+pub struct MessagePickupStatusRequest {
+    pub recipient_did: Option<String>,
+}
+
+// Reads the body of an incoming Message Pickup 3.0 Live Delivery Message
+#[derive(Default, Deserialize)]
+pub struct MessagePickupLiveDelivery {
+    pub live_delivery: bool,
+}
+
+// Body of a StatusRequest reply
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub struct MessagePickupStatusReply {
+    pub recipient_did: String,
+    pub message_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub longest_waited_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_received_time: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_received_time: Option<u64>,
+    pub total_bytes: u64,
+    pub live_delivery: bool,
+}
+impl GenericDataStruct for MessagePickupStatusReply {}
+
+// Reads the body of an incoming Message Pickup 3.0 Delivery Request Message
+#[derive(Default, Deserialize, Serialize)]
+pub struct MessagePickupDeliveryRequest {
+    pub recipient_did: String,
+    pub limit: usize,
+}
+
+// Reads the body of an incoming Message Pickup 3.0 Messages Received Message
+#[derive(Default, Deserialize, Serialize)]
+pub struct MessagePickupMessagesReceived {
+    pub message_id_list: Vec<String>,
+}
+
+impl MessagePickup {
+    /// Sends a Message Pickup 3.0 `Status Request` message
+    /// recipient_did : Optional, allows you to ask for status for a specific DID. If none, will ask for default DID in ATM
+    /// mediator_did  : Optional, allows you to ask a specific mediator. If none, will ask for default mediator in ATM
+    /// wait_for_response : If true, will wait for a response from the server. If false, will return immediately
+    /// wait          : Time Duration to wait for a response from websocket. Default (10 Seconds)
+    ///
+    /// Returns a StatusReply if successful
+    pub async fn send_status_request(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        wait_for_response: bool,
+        wait: Option<Duration>,
+    ) -> Result<Option<MessagePickupStatusReply>, ATMError> {
+        let _span = span!(Level::DEBUG, "send_status_request",);
+
+        async move {
+            debug!(
+                "Profile ({}): Status Request wait: {:?}",
+                profile.inner.alias, wait
+            );
+
+            let (profile_did, mediator_did) = profile.dids()?;
+
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let mut msg = Message::build(
+                Uuid::new_v4().to_string(),
+                "https://didcomm.org/messagepickup/3.0/status-request".to_owned(),
+                json!({"recipient_did": profile_did}),
+            )
+            .to(mediator_did.to_string())
+            .from(profile_did.to_string())
+            .created_time(now)
+            .expires_time(now + 300)
+            .finalize();
+            msg.extra
+                .insert("return_route".to_string(), Value::String("all".into()));
+
+            let msg_id = msg.id.clone();
+
+            debug!("Status-Request message: {:?}", msg);
+
+            // Pack the message
+            let (msg, _) = atm
+                .inner
+                .pack_encrypted(&msg, mediator_did, Some(profile_did))
+                .await
+                .map_err(|e| ATMError::MsgSendError(format!("Error packing message: {e}")))?;
+
+            match atm
+                .send_message(profile, &msg, &msg_id, wait_for_response, false)
+                .await?
+            {
+                SendMessageResponse::Message(message) => {
+                    if wait_for_response {
+                        self._parse_status_response(&message).await
+                    } else {
+                        Ok(None)
+                    }
+                }
+                _ => Err(ATMError::MsgReceiveError(
+                    "Invalid response from API".into(),
+                )),
+            }
+        }
+        .instrument(_span)
+        .await
+    }
+
+    pub(crate) async fn _parse_status_response(
+        &self,
+        message: &Message,
+    ) -> Result<Option<MessagePickupStatusReply>, ATMError> {
+        let status: MessagePickupStatusReply = serde_json::from_value(message.body.clone())
+            .map_err(|err| {
+                ATMError::MsgReceiveError(format!("Error reading status response: {err}"))
+            })?;
+        Ok(Some(status))
+    }
+
+    /// Sends a Message Pickup 3.0 `Live Delivery` message
+    /// Returns the msg_id of the message sent, helpful to get the status response
+    pub async fn toggle_live_delivery(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        live_delivery: bool,
+    ) -> Result<String, ATMError> {
+        let _span = span!(Level::DEBUG, "toggle_live_delivery",);
+        async move {
+            debug!("Setting live_delivery to ({})", live_delivery);
+            let (packed, msg_id) =
+                Self::packed_live_delivery_change(atm, profile, live_delivery).await?;
+
+            atm.send_message(profile, &packed, &msg_id, false, false)
+                .await?;
+            Ok(msg_id)
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Build and pack a Message Pickup 3.0 `live-delivery-change` message
+    /// without sending it. Returns `(packed_message, msg_id)`.
+    ///
+    /// Exists so the websocket transport's connection setup can write the
+    /// frame **directly** to the socket it is holding: that code runs *on*
+    /// the transport task, and routing it through [`ATM::send_message`] would
+    /// enqueue a `SendMessage` command into the transport's own channel and
+    /// then await a reply that only the (currently busy) transport task could
+    /// produce — a deadlock that made every connect attempt time out (#611).
+    /// All other callers should use
+    /// [`toggle_live_delivery`](Self::toggle_live_delivery), which sends
+    /// through the normal transport path.
+    pub(crate) async fn packed_live_delivery_change(
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        live_delivery: bool,
+    ) -> Result<(String, String), ATMError> {
+        let (profile_did, mediator_did) = profile.dids()?;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut msg = Message::build(
+            Uuid::new_v4().to_string(),
+            "https://didcomm.org/messagepickup/3.0/live-delivery-change".to_owned(),
+            json!({"live_delivery": live_delivery}),
+        )
+        .created_time(now)
+        .expires_time(now + 300)
+        .from(profile_did.into())
+        .to(mediator_did.into())
+        .finalize();
+        msg.extra
+            .insert("return_route".to_string(), Value::String("all".into()));
+        let msg_id = msg.id.clone();
+
+        let (packed, _) = atm
+            .inner
+            .pack_encrypted(&msg, mediator_did, Some(profile_did))
+            .await
+            .map_err(|e| ATMError::MsgSendError(format!("Error packing message: {e}")))?;
+
+        Ok((packed, msg_id))
+    }
+
+    /// Waits for the next message to be received via websocket live delivery
+    /// atm         : The ATM SDK to use
+    /// profile     : The profile to use
+    /// wait        : How long to wait (in milliseconds) for a message before returning None
+    ///                 If None, will block forever until a message is received
+    /// auto_delete : If true, will delete the message after receiving it
+    /// Returns a tuple of the message and metadata, or None if no message was received
+    pub async fn live_stream_next(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        wait: Option<Duration>,
+        auto_delete: bool,
+    ) -> Result<Option<(Message, Box<UnpackMetadata>)>, ATMError> {
+        let _span = span!(Level::DEBUG, "live_stream_next");
+
+        async move {
+            let Some(mediator) = &*profile.inner.mediator else {
+                warn!("Mediator not set for profile {}", profile.inner.alias);
+                return Err(ATMError::ProfileError("No Mediator set for profile".into()));
+            };
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Send the next request to the profile websocket
+            // Clone the sender, then drop the read guard *before* the wait
+            // below. `stop_websocket` takes the WRITE lock on this same
+            // `ws_channel_tx`, so a guard held across the wait blocks every
+            // shutdown until the poll window elapses — and with `wait: None`
+            // that window is `Duration::MAX`, i.e. forever. The sender is an
+            // `mpsc::Sender`, so a clone is cheap and carries no borrow.
+            let ws_channel = {
+                let guard = mediator.ws_channel_tx.read().await;
+                let Some(ws_channel) = guard.as_ref() else {
+                    warn!(
+                        "WebSocket channel not set for profile {}",
+                        profile.inner.alias
+                    );
+                    return Err(ATMError::ProfileError(
+                        "No WebSocket channel set for profile".into(),
+                    ));
+                };
+                ws_channel.clone()
+            };
+
+            let tx_uuid = mediator.get_tx_uuid();
+            ws_channel
+                .send(WebSocketCommands::Next(tx_uuid, tx))
+                .await
+                .map_err(|err| {
+                    ATMError::TransportError(format!(
+                        "Could not send Next command to websocket: {err:?}"
+                    ))
+                })?;
+            debug!("sent next request to websocket");
+
+            let Some(value) = await_next(
+                &ws_channel,
+                rx,
+                wait,
+                WebSocketCommands::CancelNext(tx_uuid),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            match value {
+                Ok(WebSocketResponses::MessageReceived(msg, meta)) => {
+                    // If auto_delete is true, delete the message
+                    if auto_delete {
+                        atm.delete_message_background(profile, &meta.sha256_hash)
+                            .await?;
+                    }
+                    Ok(Some((*msg, meta)))
+                }
+                Ok(WebSocketResponses::Disconnected) => {
+                    // Connection dropped while waiting. Treat as "no
+                    // message right now" so streaming callers quietly
+                    // retry on the reconnected socket instead of logging
+                    // a spurious receive error.
+                    debug!("WebSocket disconnected while awaiting next message");
+                    Ok(None)
+                }
+                Ok(WebSocketResponses::PackedMessageReceived(packed_msg)) => {
+                    // A DIDComm-only stream can't handle a packed (e.g.
+                    // TSP/CESR) frame. Erroring here without removing it
+                    // left the message in the mediator queue, so the
+                    // pickup redelivered it every cycle — a poison loop.
+                    // Delete it (when auto_delete) and skip; a consumer
+                    // that wants packed frames uses `live_stream_next_frame`
+                    // / `live_stream_next_packed`.
+                    warn!(
+                        "Dropping unexpected packed message on a DIDComm-only stream \
+                         (use live_stream_next_frame for multiplexed TSP + DIDComm)"
+                    );
+                    if auto_delete {
+                        let sha256_hash = sha256::digest(packed_msg.as_str());
+                        atm.delete_message_background(profile, &sha256_hash).await?;
+                    }
+                    Ok(None)
+                }
+                Err(e) => {
+                    warn!("Error receiving message: {:?}", e);
+                    Err(ATMError::MsgReceiveError(format!(
+                        "Error receiving message: {e:?}"
+                    )))
+                }
+            }
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Waits for the next inbound frame — **DIDComm or TSP** — via websocket
+    /// live delivery, returning it tagged as an [`InboundFrame`].
+    ///
+    /// Unlike [`live_stream_next`](Self::live_stream_next) (DIDComm-only, errors
+    /// on a TSP frame) and [`live_stream_next_packed`](Self::live_stream_next_packed)
+    /// (TSP-only, errors on a DIDComm frame), this accepts **both** off the one
+    /// stream so a multiplexing consumer can route by transport. `auto_delete`
+    /// deletes the received message in the background (by unpack `sha256_hash`
+    /// for DIDComm, by hash of the packed frame for TSP), matching the two
+    /// single-protocol methods.
+    pub async fn live_stream_next_frame(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        wait: Option<Duration>,
+        auto_delete: bool,
+    ) -> Result<Option<InboundFrame>, ATMError> {
+        let _span = span!(Level::DEBUG, "live_stream_next_frame");
+
+        async move {
+            let Some(mediator) = &*profile.inner.mediator else {
+                warn!("Mediator not set for profile {}", profile.inner.alias);
+                return Err(ATMError::ProfileError("No Mediator set for profile".into()));
+            };
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Clone the sender, then drop the read guard *before* the wait
+            // below. `stop_websocket` takes the WRITE lock on this same
+            // `ws_channel_tx`, so a guard held across the wait blocks every
+            // shutdown until the poll window elapses — and with `wait: None`
+            // that window is `Duration::MAX`, i.e. forever. The sender is an
+            // `mpsc::Sender`, so a clone is cheap and carries no borrow.
+            let ws_channel = {
+                let guard = mediator.ws_channel_tx.read().await;
+                let Some(ws_channel) = guard.as_ref() else {
+                    warn!(
+                        "WebSocket channel not set for profile {}",
+                        profile.inner.alias
+                    );
+                    return Err(ATMError::ProfileError(
+                        "No WebSocket channel set for profile".into(),
+                    ));
+                };
+                ws_channel.clone()
+            };
+
+            let tx_uuid = mediator.get_tx_uuid();
+            ws_channel
+                .send(WebSocketCommands::Next(tx_uuid, tx))
+                .await
+                .map_err(|err| {
+                    ATMError::TransportError(format!(
+                        "Could not send Next command to websocket: {err:?}"
+                    ))
+                })?;
+            debug!("sent next request to websocket for inbound frame");
+
+            let Some(value) = await_next(
+                &ws_channel,
+                rx,
+                wait,
+                WebSocketCommands::CancelNext(tx_uuid),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            match value {
+                Ok(WebSocketResponses::MessageReceived(msg, meta)) => {
+                    if auto_delete {
+                        atm.delete_message_background(profile, &meta.sha256_hash)
+                            .await?;
+                    }
+                    Ok(Some(InboundFrame::DidComm(msg, meta)))
+                }
+                Ok(WebSocketResponses::PackedMessageReceived(packed_msg)) => {
+                    if auto_delete {
+                        // The live path carries no attachment id, so the
+                        // message id is reconstructed as sha256 of the
+                        // received frame. This matches the mediator's id
+                        // derivation (`msg_id = digest(body)`), since it
+                        // streams the exact bytes it stored — locked by
+                        // the mediator's `message_id_is_sha256_of_body`.
+                        let sha256_hash = sha256::digest(packed_msg.as_str());
+                        atm.delete_message_background(profile, &sha256_hash).await?;
+                    }
+                    Ok(Some(InboundFrame::Tsp(packed_msg)))
+                }
+                Ok(WebSocketResponses::Disconnected) => {
+                    // Connection dropped while waiting — treat as "no
+                    // message right now" so the consumer's loop quietly
+                    // retries on the reconnected socket.
+                    debug!("WebSocket disconnected while awaiting next frame");
+                    Ok(None)
+                }
+                Err(e) => {
+                    warn!("Error receiving frame: {:?}", e);
+                    Err(ATMError::MsgReceiveError(format!(
+                        "Error receiving frame: {e:?}"
+                    )))
+                }
+            }
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Attempts to retrieve a specific message from the server via websocket live delivery
+    /// atm                 : The ATM SDK to use
+    /// profile             : The profile to use
+    /// msg_id              : The ID of the message to retrieve (matches on either `id` or `pthid`)
+    /// wait                : How long to wait (in milliseconds) for a message before returning None
+    ///                       If 0, will not block
+    /// auto_delete         : If true, will delete the message after receiving it
+    /// Returns a tuple of the message and metadata, or None if no message was received
+    pub async fn live_stream_get(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        msg_id: &str,
+        wait: Duration,
+        auto_delete: bool,
+    ) -> Result<Option<(Message, Box<UnpackMetadata>)>, ATMError> {
+        let (ws_channel, rx) = self.live_stream_register(profile, msg_id).await?;
+        self.live_stream_await(atm, profile, msg_id, ws_channel, rx, wait, auto_delete)
+            .await
+    }
+
+    /// Register interest in the message `msg_id` — matched by id, `thid` or
+    /// `pthid` — without waiting for it. Pair with [`Self::live_stream_await`].
+    ///
+    /// Registering **before** the request that provokes the reply is sent is
+    /// what makes a request/response exchange safe alongside another reader of
+    /// the same live stream: the websocket task offers each inbound message to
+    /// a registered reply first and to a pending `live_stream_next` only after.
+    /// Registering after sending leaves a window in which a fast reply is
+    /// handed to that `next` reader instead, and the exchange times out.
+    pub(crate) async fn live_stream_register(
+        &self,
+        profile: &Arc<ATMProfile>,
+        msg_id: &str,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Sender<WebSocketCommands>,
+            tokio::sync::oneshot::Receiver<WebSocketResponses>,
+        ),
+        ATMError,
+    > {
+        let Some(mediator) = &*profile.inner.mediator else {
+            warn!("Mediator not set for profile {}", profile.inner.alias);
+            return Err(ATMError::ProfileError("No Mediator set for profile".into()));
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Clone the sender and drop the read guard at once: `stop_websocket`
+        // takes the WRITE lock on this same `ws_channel_tx`, so a guard held
+        // across the caller's wait would block every shutdown until it
+        // elapsed. The sender is an `mpsc::Sender`, so a clone is cheap.
+        let ws_channel = {
+            let guard = mediator.ws_channel_tx.read().await;
+            let Some(ws_channel) = guard.as_ref() else {
+                warn!(
+                    "WebSocket channel not set for profile {}",
+                    profile.inner.alias
+                );
+                return Err(ATMError::ProfileError(
+                    "No WebSocket channel set for profile".into(),
+                ));
+            };
+            ws_channel.clone()
+        };
+
+        // Send the get request to the ws_handler
+        ws_channel
+            .send(WebSocketCommands::GetMessage(msg_id.to_string(), tx))
+            .await
+            .map_err(|err| {
+                ATMError::TransportError(format!(
+                    "Could not send GetMessage({msg_id}) Command to websocket: {err:?}"
+                ))
+            })?;
+        debug!("registered interest in {msg_id} with ws_handler");
+        Ok((ws_channel, rx))
+    }
+
+    /// Wait for a message registered with [`Self::live_stream_register`]. On
+    /// timeout the registration is cancelled.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn live_stream_await(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        msg_id: &str,
+        ws_channel: tokio::sync::mpsc::Sender<WebSocketCommands>,
+        rx: tokio::sync::oneshot::Receiver<WebSocketResponses>,
+        wait: Duration,
+        auto_delete: bool,
+    ) -> Result<Option<(Message, Box<UnpackMetadata>)>, ATMError> {
+        let _span = span!(Level::DEBUG, "live_stream_get");
+
+        async move {
+            // A zero `wait` has always meant no timeout here.
+            let wait = (wait.as_millis() > 0).then_some(wait);
+            let cancel = WebSocketCommands::CancelGetMessage(msg_id.to_string());
+            let Some(value) = await_next(&ws_channel, rx, wait, cancel).await? else {
+                return Ok(None);
+            };
+            match value {
+                Ok(WebSocketResponses::MessageReceived(msg, meta)) => {
+                    // If auto_delete is true, delete the message
+                    if auto_delete {
+                        atm.delete_message_background(profile, &meta.sha256_hash)
+                            .await?;
+                    }
+                    Ok(Some((*msg, meta)))
+                }
+                Ok(WebSocketResponses::Disconnected) => {
+                    // Connection dropped while waiting for this specific
+                    // response. The request was lost with the socket, so
+                    // fail fast with a typed error — this lets callers
+                    // tell a reconnect race apart from a genuine
+                    // no-response and avoid a misleading send-failure log.
+                    debug!("WebSocket disconnected while awaiting message {msg_id}");
+                    Err(ATMError::Disconnected(format!(
+                        "Connection reset while awaiting response for {msg_id}"
+                    )))
+                }
+                Ok(WebSocketResponses::PackedMessageReceived(packed_msg)) => {
+                    // A DIDComm-only stream can't handle a packed (e.g.
+                    // TSP/CESR) frame. Erroring here without removing it
+                    // left the message in the mediator queue, so the
+                    // pickup redelivered it every cycle — a poison loop.
+                    // Delete it (when auto_delete) and skip; a consumer
+                    // that wants packed frames uses `live_stream_next_frame`
+                    // / `live_stream_next_packed`.
+                    warn!(
+                        "Dropping unexpected packed message on a DIDComm-only stream \
+                         (use live_stream_next_frame for multiplexed TSP + DIDComm)"
+                    );
+                    if auto_delete {
+                        let sha256_hash = sha256::digest(packed_msg.as_str());
+                        atm.delete_message_background(profile, &sha256_hash).await?;
+                    }
+                    Ok(None)
+                }
+                Err(e) => {
+                    warn!("Error receiving message: {:?}", e);
+                    Err(ATMError::MsgReceiveError(format!(
+                        "Error receiving message: {e:?}"
+                    )))
+                }
+            }
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Sends a Message Pickup 3.0 `Delivery Request` message
+    /// atm           : The ATM SDK to use
+    /// limit         : # of messages to retrieve, defaults to 10 if None
+    pub async fn send_delivery_request(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        limit: Option<usize>,
+        wait_for_response: bool,
+    ) -> Result<Vec<(Message, UnpackMetadata)>, ATMError> {
+        let message = self
+            ._request_delivery(atm, profile, limit, wait_for_response)
+            .await?;
+        self._handle_delivery(atm, profile, &message).await
+    }
+
+    /// TSP-aware sibling of [`send_delivery_request`]: returns each queued
+    /// message as an [`InboundFrame`] (DIDComm or TSP) paired with the
+    /// attachment id needed to acknowledge/delete it — so an offline-sync
+    /// consumer can route TSP frames to a TSP handler instead of DIDComm-
+    /// unpacking (and looping on) them. Undeliverable attachments yield
+    /// `(None, id)` so the caller still acks them. Requires the `tsp` feature.
+    #[cfg(feature = "tsp")]
+    pub async fn send_delivery_request_frames(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        limit: Option<usize>,
+        wait_for_response: bool,
+    ) -> Result<Vec<(Option<InboundFrame>, String)>, ATMError> {
+        let message = self
+            ._request_delivery(atm, profile, limit, wait_for_response)
+            .await?;
+        self._handle_delivery_frames(atm, &message).await
+    }
+
+    /// Send a Message-Pickup 3.0 delivery-request and return the mediator's
+    /// `delivery` message (whose attachments are the queued messages). Shared by
+    /// [`send_delivery_request`] and [`send_delivery_request_frames`].
+    async fn _request_delivery(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        limit: Option<usize>,
+        wait_for_response: bool,
+    ) -> Result<Message, ATMError> {
+        let _span = span!(Level::DEBUG, "send_delivery_request",);
+
+        async move {
+            debug!(
+                "Profile ({}): Delivery Request limit: {:?}",
+                profile.inner.alias, limit
+            );
+            let (profile_did, mediator_did) = profile.dids()?;
+
+            let body = MessagePickupDeliveryRequest {
+                recipient_did: profile_did.into(),
+                limit: limit.unwrap_or(10),
+            };
+
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let mut msg = Message::build(
+                Uuid::new_v4().to_string(),
+                "https://didcomm.org/messagepickup/3.0/delivery-request".to_owned(),
+                serde_json::to_value(body).unwrap(),
+            )
+            .to(mediator_did.into())
+            .from(profile_did.into())
+            .created_time(now)
+            .expires_time(now + 300)
+            .finalize();
+            msg.extra
+                .insert("return_route".to_string(), Value::String("all".into()));
+
+            let msg_id = msg.id.clone();
+
+            debug!("Delivery-Request message: {:?}", msg);
+
+            // Pack the message
+            let msg = {
+                let (msg, _) = atm
+                    .inner
+                    .pack_encrypted(&msg, mediator_did, Some(profile_did))
+                    .await
+                    .map_err(|e| ATMError::MsgSendError(format!("Error packing message: {e}")))?;
+
+                msg
+            };
+
+            match atm
+                .send_message(profile, &msg, &msg_id, wait_for_response, false)
+                .await?
+            {
+                SendMessageResponse::Message(message) => Ok(*message),
+                _ => Err(ATMError::MsgReceiveError("No Messages from API".into())),
+            }
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// TSP-aware sibling of [`_handle_delivery`]: classify each delivered
+    /// attachment (DIDComm vs TSP) and return it as an [`InboundFrame`] paired
+    /// with the attachment id needed to ack/delete it. Undeliverable
+    /// attachments — bad base64/utf8, or a non-TSP frame that fails DIDComm
+    /// unpack — yield `(None, id)` so the caller still acks them and the
+    /// mediator stops redelivering (no redelivery loop). Unlike [`_handle_delivery`],
+    /// a TSP frame is surfaced (`InboundFrame::Tsp`) rather than DIDComm-unpacked
+    /// and dropped.
+    #[cfg(feature = "tsp")]
+    pub(crate) async fn _handle_delivery_frames(
+        &self,
+        atm: &ATM,
+        message: &Message,
+    ) -> Result<Vec<(Option<InboundFrame>, String)>, ATMError> {
+        let mut out: Vec<(Option<InboundFrame>, String)> = Vec::new();
+
+        let Some(attachments) = &message.attachments else {
+            return Ok(out);
+        };
+
+        for attachment in attachments {
+            // No id => we can't ack/delete it individually; skip (leaving it
+            // queued is preferable to acking the wrong message).
+            let Some(id) = attachment.id.clone() else {
+                warn!("Delivery attachment has no id; cannot ack — skipping");
+                continue;
+            };
+            let Some(b64) = &attachment.data.base64 else {
+                warn!("Attachment type not supported: {:?}", attachment.data);
+                emit_unprocessable(
+                    atm,
+                    Some(id.clone()),
+                    String::new(),
+                    format!("unsupported attachment type: {:?}", attachment.data),
+                );
+                out.push((None, id));
+                continue;
+            };
+            let decoded = match BASE64_URL_SAFE_NO_PAD.decode(b64.clone()) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Error decoding attachment to utf8: ({e:?}). id({id})");
+                        emit_unprocessable(
+                            atm,
+                            Some(id.clone()),
+                            b64.clone(),
+                            format!("attachment payload is not valid UTF-8: {e}"),
+                        );
+                        out.push((None, id));
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    warn!("Error decoding base64: ({e:?}). id({id})");
+                    emit_unprocessable(
+                        atm,
+                        Some(id.clone()),
+                        b64.clone(),
+                        format!("attachment is not valid base64: {e}"),
+                    );
+                    out.push((None, id));
+                    continue;
+                }
+            };
+
+            if atm.tsp().is_tsp(&decoded) {
+                out.push((Some(InboundFrame::Tsp(Box::new(decoded))), id));
+            } else {
+                // DIDComm frames pulled via pickup are unpacked under the same
+                // configured secure `unpack_policy` as a direct `atm.unpack`, so
+                // an envelope the policy rejects (e.g. an unauthenticated
+                // wrapping, or a forged `from`) is dropped rather than surfaced.
+                match atm
+                    .inner
+                    .unpack_with(&decoded, atm.inner.config.unpack_policy())
+                    .await
+                {
+                    // The message keeps the id its sender gave it. The
+                    // mediator's id for it (the one to ack or delete) is `id`,
+                    // returned beside it. Overwriting `m.id` with that made a
+                    // reply to a request collected this way thread to the
+                    // mediator's id rather than the sender's, so the sender's
+                    // waiter never matched it. The same request collected
+                    // live kept its id and was answered (VTI-49).
+                    Ok((m, u)) => {
+                        out.push((Some(InboundFrame::DidComm(Box::new(m), Box::new(u))), id));
+                    }
+                    Err(e) => {
+                        warn!("Error unpacking message: ({e:?}); dropping. id({id})");
+                        emit_unprocessable(atm, Some(id.clone()), decoded.clone(), e.to_string());
+                        out.push((None, id));
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Iterates through each attachment and unpacks each message into an array to return.
+    ///
+    /// Each attachment is unpacked under the **configured
+    /// [`UnpackPolicy`](crate::config::UnpackPolicy)** — the same secure
+    /// authenticated-encryption default that [`crate::ATM::unpack`] applies — so
+    /// messages pulled via pickup get the same guarantees as a direct unpack.
+    ///
+    /// An attachment is handled by *recoverability*:
+    /// - **Non-recoverable** — malformed base64/utf8, an unsupported attachment
+    ///   type, or a cryptographically invalid signature (`VerificationFailed`) —
+    ///   can never become processable, so it is **always deleted from the
+    ///   mediator** (best-effort, by its message id) to stop it being
+    ///   redelivered every pickup (which would stall the queue and, under
+    ///   backpressure, the mediator connection).
+    /// - **Policy-rejected** — a disallowed wrapping (`UnexpectedEnvelope`) or an
+    ///   addressing mismatch (`AddressingMismatch`) — is **deleted by default**,
+    ///   because the mediator's per-recipient queue is bounded (a fixed message
+    ///   limit) and a retained reject is redelivered every pickup, so it would
+    ///   accumulate and fill the queue, blocking new inbound messages. Opt in to
+    ///   *retain* these (e.g. for a bounded window during an `unpack_policy`
+    ///   upgrade) via
+    ///   [`ATMConfigBuilder::with_purge_policy_rejected_messages(false)`](crate::config::ATMConfigBuilder::with_purge_policy_rejected_messages).
+    /// - **Transient** — e.g. a temporarily unresolvable signer DID — is always
+    ///   left queued for retry.
+    ///
+    /// Every rejected attachment is reported on the optional
+    /// unprocessable-message channel *before* any deletion, so a consumer can
+    /// observe or quarantine it.
+    pub(crate) async fn _handle_delivery(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        message: &Message,
+    ) -> Result<Vec<(Message, UnpackMetadata)>, ATMError> {
+        let mut response: Vec<(Message, UnpackMetadata)> = Vec::new();
+
+        // Report the unprocessable message on the optional channel (so a
+        // consumer can observe/quarantine it), then decide deletion by
+        // recoverability. `delete_if_present` is the shared best-effort delete
+        // by message id (== the delivery attachment id, which is the mediator's
+        // sha256-of-body message id) so it can't be redelivered every pickup.
+        async fn delete_if_present(atm: &ATM, profile: &Arc<ATMProfile>, id: &Option<String>) {
+            if let Some(id) = id
+                && let Err(e) = atm.delete_message_background(profile, id).await
+            {
+                warn!("Couldn't delete unprocessable message id({id}): {e:?}");
+            }
+        }
+
+        // Non-recoverable input (malformed base64/utf8, unsupported type, an
+        // invalid signature): report, then *always* delete — it can never become
+        // processable, so retaining it would only poison-loop the queue.
+        async fn report_and_delete(
+            atm: &ATM,
+            profile: &Arc<ATMProfile>,
+            id: &Option<String>,
+            raw: String,
+            reason: String,
+        ) {
+            emit_unprocessable(atm, id.clone(), raw, reason);
+            delete_if_present(atm, profile, id).await;
+        }
+
+        // Policy rejection (`UnexpectedEnvelope` / `AddressingMismatch`): report,
+        // then delete by default. The mediator's per-recipient queue is bounded
+        // (a fixed message limit), and a retained reject is redelivered every
+        // pickup, so leaving it queued would accumulate and eventually fill the
+        // queue, blocking new inbound messages. An operator can opt to retain it
+        // (e.g. for a bounded upgrade window) via
+        // `with_purge_policy_rejected_messages(false)`.
+        async fn report_policy_rejected(
+            atm: &ATM,
+            profile: &Arc<ATMProfile>,
+            id: &Option<String>,
+            raw: String,
+            reason: String,
+        ) {
+            emit_unprocessable(atm, id.clone(), raw, reason);
+            if atm.inner.config.purge_policy_rejected_messages() {
+                delete_if_present(atm, profile, id).await;
+            }
+        }
+
+        if let Some(attachments) = &message.attachments {
+            for attachment in attachments {
+                if let Some(b64) = &attachment.data.base64 {
+                    let decoded = match BASE64_URL_SAFE_NO_PAD.decode(b64.clone()) {
+                        Ok(decoded) => match String::from_utf8(decoded) {
+                            Ok(decoded) => decoded,
+                            Err(e) => {
+                                warn!(
+                                    "Undeliverable attachment (not utf8: {e:?}); purging. id({:?})",
+                                    attachment.id
+                                );
+                                report_and_delete(
+                                    atm,
+                                    profile,
+                                    &attachment.id,
+                                    b64.clone(),
+                                    format!("attachment payload is not valid UTF-8: {e}"),
+                                )
+                                .await;
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                "Undeliverable attachment (bad base64: {e:?}); purging. id({:?})",
+                                attachment.id
+                            );
+                            report_and_delete(
+                                atm,
+                                profile,
+                                &attachment.id,
+                                b64.clone(),
+                                format!("attachment is not valid base64: {e}"),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+
+                    // Name a TSP frame before it reaches the DIDComm unpacker.
+                    // This is the DIDComm-only pickup path, so a TSP frame here
+                    // cannot be delivered either way — but "this is TSP and this
+                    // stream doesn't carry TSP" is a diagnosis, where the unpack
+                    // failure below is `Cannot parse message as JSON ... invalid
+                    // number at line 1 column 2` (CESR qb64 opens with `-`),
+                    // which names nothing an operator can act on. Purged like
+                    // any other undeliverable attachment so the mediator stops
+                    // redelivering it every pickup cycle.
+                    if crate::tsp_wire::looks_like_tsp(&decoded) {
+                        warn!(
+                            "Undeliverable attachment: a TSP frame arrived on a DIDComm-only \
+                             pickup stream; purging. id({:?}). The frame is not corrupt — either \
+                             this build lacks the `tsp` feature, or this consumer is using the \
+                             DIDComm-only pickup path (use `live_stream_next_frame` to \
+                             multiplex TSP + DIDComm).",
+                            attachment.id
+                        );
+                        report_and_delete(
+                            atm,
+                            profile,
+                            &attachment.id,
+                            decoded.clone(),
+                            "TSP frame received on a DIDComm-only pickup stream".to_string(),
+                        )
+                        .await;
+                        continue;
+                    }
+
+                    match atm
+                        .inner
+                        .unpack_with(&decoded, atm.inner.config.unpack_policy())
+                        .await
+                    {
+                        Ok((mut m, u)) => {
+                            if let Some(attachment_id) = &attachment.id {
+                                m.id = attachment_id.to_string();
+                            }
+                            response.push((m, u))
+                        }
+                        // A cryptographically invalid signature is deterministic
+                        // garbage — it will never verify on any redelivery — so
+                        // purge it regardless of the policy-retention flag.
+                        Err(e @ ATMError::VerificationFailed(_)) => {
+                            warn!(
+                                "Unprocessable message (invalid signature: {e:?}); purging. id({:?})",
+                                attachment.id
+                            );
+                            report_and_delete(
+                                atm,
+                                profile,
+                                &attachment.id,
+                                decoded.clone(),
+                                e.to_string(),
+                            )
+                            .await;
+                            continue;
+                        }
+                        // A policy rejection — a disallowed wrapping
+                        // (`UnexpectedEnvelope`) or an addressing mismatch
+                        // (`AddressingMismatch`) — is deleted by default: the
+                        // mediator queue is bounded, so a retained reject
+                        // redelivered every pickup would fill it. An operator can
+                        // opt to retain it instead.
+                        Err(
+                            e @ (ATMError::UnexpectedEnvelope(_) | ATMError::AddressingMismatch(_)),
+                        ) => {
+                            warn!(
+                                "Policy-rejected message ({e:?}); {}. id({:?})",
+                                if atm.inner.config.purge_policy_rejected_messages() {
+                                    "purging"
+                                } else {
+                                    "retained"
+                                },
+                                attachment.id
+                            );
+                            report_policy_rejected(
+                                atm,
+                                profile,
+                                &attachment.id,
+                                decoded.clone(),
+                                e.to_string(),
+                            )
+                            .await;
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Error unpacking message ({e:?}); left queued for retry. id({:?})",
+                                attachment.id
+                            );
+                            continue;
+                        }
+                    };
+                } else {
+                    warn!(
+                        "Undeliverable attachment (unsupported type: {:?}); purging. id({:?})",
+                        attachment.data, attachment.id
+                    );
+                    report_and_delete(
+                        atm,
+                        profile,
+                        &attachment.id,
+                        String::new(),
+                        format!("unsupported attachment type: {:?}", attachment.data),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        }
+
+        Ok(response)
+    }
+
+    /// Sends a Message Pickup 3.0 `Messages Received` message
+    /// This effectively deletes the messages from the server
+    /// atm           : The ATM SDK to use
+    /// list          : List of messages to delete (SHA256 message Hashes)
+    ///
+    /// A status reply will be returned if successful
+    pub async fn send_messages_received(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        list: &Vec<String>,
+        wait_for_response: bool,
+    ) -> Result<Option<MessagePickupStatusReply>, ATMError> {
+        let _span = span!(Level::DEBUG, "send_messages_received",);
+
+        async move {
+            debug!(
+                "Profile ({}): Messages Received, # msgs to delete: {}",
+                profile.inner.alias,
+                list.len()
+            );
+
+            let (profile_did, mediator_did) = profile.dids()?;
+
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let mut msg = Message::build(
+                Uuid::new_v4().to_string(),
+                "https://didcomm.org/messagepickup/3.0/messages-received".to_owned(),
+                json!({"message_id_list": list}),
+            )
+            .to(mediator_did.into())
+            .from(profile_did.into())
+            .created_time(now)
+            .expires_time(now + 300)
+            .finalize();
+            msg.extra
+                .insert("return_route".to_string(), Value::String("all".into()));
+
+            let msg_id = msg.id.clone();
+
+            debug!("messages-received message: {:?}", msg);
+
+            // Pack the message
+            let (msg, _) = atm
+                .inner
+                .pack_encrypted(&msg, mediator_did, Some(profile_did))
+                .await
+                .map_err(|e| ATMError::MsgSendError(format!("Error packing message: {e}")))?;
+
+            match atm
+                .send_message(profile, &msg, &msg_id, wait_for_response, false)
+                .await
+            {
+                Ok(SendMessageResponse::Message(message)) => {
+                    if wait_for_response {
+                        self._parse_status_response(&message).await
+                    } else {
+                        Ok(None)
+                    }
+                }
+                Ok(SendMessageResponse::EmptyResponse) => Ok(None),
+                Err(err) => Err(ATMError::MsgReceiveError(format!(
+                    "Invalid response from API: {err}"
+                ))),
+                _ => Err(ATMError::MsgReceiveError(
+                    "Wrong type received from API".into(),
+                )),
+            }
+
+            /*if let SendMessageResponse::Message(message) = atm
+                .send_message(profile, &msg, &msg_id, wait_for_response)
+                .await?
+            {
+                if wait_for_response {
+                    self._parse_status_response(&message).await
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Err(ATMError::MsgReceiveError(
+                    "Invalid response from API".into(),
+                ))
+            }*/
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Waits for the next message to be received via websocket live delivery
+    /// Returns the message as a packed string without unpacking
+    /// atm         : The ATM SDK to use
+    /// profile     : The profile to use
+    /// wait        : How long to wait (in milliseconds) for a message before returning None
+    ///                 If None, will block forever until a message is received
+    /// auto_delete : If true, will delete the message after receiving it
+    /// Returns the packed message string, or None if no message was received
+    pub async fn live_stream_next_packed(
+        &self,
+        atm: &ATM,
+        profile: &Arc<ATMProfile>,
+        wait: Option<Duration>,
+        auto_delete: bool,
+    ) -> Result<Option<String>, ATMError> {
+        let _span = span!(Level::DEBUG, "live_stream_next_packed");
+
+        async move {
+            let Some(mediator) = &*profile.inner.mediator else {
+                warn!("Mediator not set for profile {}", profile.inner.alias);
+                return Err(ATMError::ProfileError("No Mediator set for profile".into()));
+            };
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Send the next request to the profile websocket
+            // Clone the sender, then drop the read guard *before* the wait
+            // below. `stop_websocket` takes the WRITE lock on this same
+            // `ws_channel_tx`, so a guard held across the wait blocks every
+            // shutdown until the poll window elapses — and with `wait: None`
+            // that window is `Duration::MAX`, i.e. forever. The sender is an
+            // `mpsc::Sender`, so a clone is cheap and carries no borrow.
+            let ws_channel = {
+                let guard = mediator.ws_channel_tx.read().await;
+                let Some(ws_channel) = guard.as_ref() else {
+                    warn!(
+                        "WebSocket channel not set for profile {}",
+                        profile.inner.alias
+                    );
+                    return Err(ATMError::ProfileError(
+                        "No WebSocket channel set for profile".into(),
+                    ));
+                };
+                ws_channel.clone()
+            };
+
+            let tx_uuid = mediator.get_tx_uuid();
+            ws_channel
+                .send(WebSocketCommands::Next(tx_uuid, tx))
+                .await
+                .map_err(|err| {
+                    ATMError::TransportError(format!(
+                        "Could not send Next command to websocket: {err:?}"
+                    ))
+                })?;
+            debug!("sent next request to websocket for packed message");
+
+            let Some(value) =
+                await_next(&ws_channel, rx, wait, WebSocketCommands::CancelNext(tx_uuid)).await?
+            else {
+                return Ok(None);
+            };
+            match value {
+                Ok(WebSocketResponses::PackedMessageReceived(packed_msg)) => {
+                    // If auto_delete is true, delete the message
+                    if auto_delete {
+                        let sha256_hash = sha256::digest(packed_msg.as_str());
+                        debug!("Trying to delete message in background with hash: {}", sha256_hash);
+                        atm.delete_message_background(profile, &sha256_hash).await?;
+                        debug!("Deleted message in background with hash: {}", sha256_hash);
+                    }
+                    Ok(Some(*packed_msg))
+                }
+                Ok(WebSocketResponses::Disconnected) => {
+                    // Connection dropped while waiting. Treat as "no
+                    // message right now" so streaming callers quietly
+                    // retry on the reconnected socket.
+                    debug!("WebSocket disconnected while awaiting next packed message");
+                    Ok(None)
+                }
+                Ok(WebSocketResponses::MessageReceived(_, _)) => {
+                    Err(ATMError::MsgReceiveError(
+                        "Received unpacked message when expecting packed message. Make sure WebSocket is configured with skip_unpack_messages=true".into()
+                    ))
+                }
+                Err(e) => {
+                    warn!("Error receiving message: {:?}", e);
+                    Err(ATMError::MsgReceiveError(format!(
+                        "Error receiving message: {e:?}"
+                    )))
+                }
+            }
+        }
+        .instrument(_span)
+        .await
+    }
+
+    /// Attempts to retrieve a specific message from the server via websocket live delivery (packed version)
+    /// Note: This method is not yet implemented as it requires changes to the message cache to support packed messages
+    #[allow(dead_code)]
+    async fn live_stream_get_packed(
+        &self,
+        _profile: &Arc<ATMProfile>,
+        _msg_id: &str,
+        _wait: Duration,
+    ) -> Result<Option<String>, ATMError> {
+        Err(ATMError::MsgReceiveError(
+            "live_stream_get_packed is not yet implemented. The message cache currently only supports unpacked messages. Use live_stream_next_packed() instead.".into()
+        ))
+    }
+}
+
+/// Wrapper struct that holds a reference to ATM, enabling the `atm.message_pickup().method()` pattern
+pub struct MessagePickupOps<'a> {
+    pub(crate) atm: &'a ATM,
+}
+
+impl<'a> MessagePickupOps<'a> {
+    /// Sends a Message Pickup 3.0 `Status Request` message
+    /// See [`MessagePickup::send_status_request`] for full documentation
+    pub async fn send_status_request(
+        &self,
+        profile: &Arc<ATMProfile>,
+        wait_for_response: bool,
+        wait: Option<Duration>,
+    ) -> Result<Option<MessagePickupStatusReply>, ATMError> {
+        MessagePickup::default()
+            .send_status_request(self.atm, profile, wait_for_response, wait)
+            .await
+    }
+
+    /// Sends a Message Pickup 3.0 `Live Delivery` message
+    /// See [`MessagePickup::toggle_live_delivery`] for full documentation
+    pub async fn toggle_live_delivery(
+        &self,
+        profile: &Arc<ATMProfile>,
+        live_delivery: bool,
+    ) -> Result<String, ATMError> {
+        MessagePickup::default()
+            .toggle_live_delivery(self.atm, profile, live_delivery)
+            .await
+    }
+
+    /// Waits for the next message to be received via websocket live delivery
+    /// See [`MessagePickup::live_stream_next`] for full documentation
+    pub async fn live_stream_next(
+        &self,
+        profile: &Arc<ATMProfile>,
+        wait: Option<Duration>,
+        auto_delete: bool,
+    ) -> Result<Option<(Message, Box<UnpackMetadata>)>, ATMError> {
+        MessagePickup::default()
+            .live_stream_next(self.atm, profile, wait, auto_delete)
+            .await
+    }
+
+    /// Attempts to retrieve a specific message from the server via websocket live delivery
+    /// See [`MessagePickup::live_stream_get`] for full documentation
+    pub async fn live_stream_get(
+        &self,
+        profile: &Arc<ATMProfile>,
+        msg_id: &str,
+        wait: Duration,
+        auto_delete: bool,
+    ) -> Result<Option<(Message, Box<UnpackMetadata>)>, ATMError> {
+        MessagePickup::default()
+            .live_stream_get(self.atm, profile, msg_id, wait, auto_delete)
+            .await
+    }
+
+    /// Sends a Message Pickup 3.0 `Delivery Request` message
+    /// See [`MessagePickup::send_delivery_request`] for full documentation
+    pub async fn send_delivery_request(
+        &self,
+        profile: &Arc<ATMProfile>,
+        limit: Option<usize>,
+        wait_for_response: bool,
+    ) -> Result<Vec<(Message, UnpackMetadata)>, ATMError> {
+        MessagePickup::default()
+            .send_delivery_request(self.atm, profile, limit, wait_for_response)
+            .await
+    }
+
+    /// Sends a Message Pickup 3.0 `Messages Received` message
+    /// See [`MessagePickup::send_messages_received`] for full documentation
+    pub async fn send_messages_received(
+        &self,
+        profile: &Arc<ATMProfile>,
+        list: &Vec<String>,
+        wait_for_response: bool,
+    ) -> Result<Option<MessagePickupStatusReply>, ATMError> {
+        MessagePickup::default()
+            .send_messages_received(self.atm, profile, list, wait_for_response)
+            .await
+    }
+
+    /// Waits for the next message to be received via websocket live delivery (packed)
+    /// See [`MessagePickup::live_stream_next_packed`] for full documentation
+    pub async fn live_stream_next_packed(
+        &self,
+        profile: &Arc<ATMProfile>,
+        wait: Option<Duration>,
+        auto_delete: bool,
+    ) -> Result<Option<String>, ATMError> {
+        MessagePickup::default()
+            .live_stream_next_packed(self.atm, profile, wait, auto_delete)
+            .await
+    }
+
+    /// Waits for the next inbound frame (DIDComm or TSP) via websocket live delivery
+    /// See [`MessagePickup::live_stream_next_frame`] for full documentation
+    pub async fn live_stream_next_frame(
+        &self,
+        profile: &Arc<ATMProfile>,
+        wait: Option<Duration>,
+        auto_delete: bool,
+    ) -> Result<Option<InboundFrame>, ATMError> {
+        MessagePickup::default()
+            .live_stream_next_frame(self.atm, profile, wait, auto_delete)
+            .await
+    }
+
+    /// Sends a Message Pickup 3.0 `Delivery Request` and returns each queued
+    /// message as an [`InboundFrame`] (DIDComm or TSP) paired with its ack id —
+    /// the offline/backlog counterpart of [`live_stream_next_frame`].
+    /// See [`MessagePickup::send_delivery_request_frames`] for full documentation.
+    #[cfg(feature = "tsp")]
+    pub async fn send_delivery_request_frames(
+        &self,
+        profile: &Arc<ATMProfile>,
+        limit: Option<usize>,
+        wait_for_response: bool,
+    ) -> Result<Vec<(Option<InboundFrame>, String)>, ATMError> {
+        MessagePickup::default()
+            .send_delivery_request_frames(self.atm, profile, limit, wait_for_response)
+            .await
+    }
+}
+
+/// Wait up to `wait` (forever when `None`) for the websocket task's answer on
+/// `rx`. When the wait runs out, `cancel` withdraws the request and the result
+/// is `None`.
+///
+/// A frame handed over at the instant the wait runs out must not be lost. The
+/// websocket task re-homes a frame only when the hand-over *fails*, which
+/// needs the receiver gone, and a receiver that has timed out but is not yet
+/// dropped accepts the frame and then discards it with itself. So on timeout
+/// the receiver is closed first — any later hand-over fails and is re-homed —
+/// and whatever was handed over before the close is kept. A frame that is
+/// never stored (a monitor batch) has no other copy to fall back on.
+async fn await_next(
+    ws_channel: &mpsc::Sender<WebSocketCommands>,
+    mut rx: oneshot::Receiver<WebSocketResponses>,
+    wait: Option<Duration>,
+    cancel: WebSocketCommands,
+) -> Result<Option<Result<WebSocketResponses, oneshot::error::RecvError>>, ATMError> {
+    let Some(wait) = wait else {
+        return Ok(Some(rx.await));
+    };
+    if let Ok(value) = tokio::time::timeout(wait, &mut rx).await {
+        return Ok(Some(value));
+    }
+    rx.close();
+    if let Ok(value) = rx.try_recv() {
+        debug!("Message arrived as the wait ran out; keeping it");
+        return Ok(Some(Ok(value)));
+    }
+    debug!("Timeout reached, no message received");
+    ws_channel.send(cancel).await.map_err(|err| {
+        ATMError::TransportError(format!(
+            "Could not send the cancel command to websocket: {err:?}"
+        ))
+    })?;
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unprocessable-message resistance of the delivery drain ([`MessagePickup::_handle_delivery`]).
+    //!
+    //! A pickup delivery batch is attacker-influenced: anyone can forward an
+    //! arbitrary (malformed, or policy-rejected) envelope into a recipient's
+    //! mediator queue. These tests confirm such a message cannot take the drain
+    //! (and therefore the pickup loop / mediator connection) down: every
+    //! unprocessable attachment is skipped (deleted best-effort) while the valid
+    //! messages around it are still surfaced, and the call never panics, errors,
+    //! or hangs.
+    use super::*;
+    use crate::config::ATMConfig;
+    use crate::profiles::{ATMProfile, ATMProfileInner};
+    use affinidi_crypto::jose::key_agreement::{Curve, PrivateKeyAgreement, PublicKeyAgreement};
+    use affinidi_did_common::{DID, PeerCreateKey, PeerKeyPurpose, PeerKeyType};
+    use affinidi_messaging_didcomm::jwe::encrypt::authcrypt;
+    use affinidi_messaging_didcomm::jws::sign::{JwsSigner, sign_multi};
+    use affinidi_messaging_didcomm::message::{Attachment, Message as DcMessage};
+    use affinidi_secrets_resolver::SecretsResolver;
+    use affinidi_secrets_resolver::secrets::Secret;
+    use affinidi_tdk_common::TDKSharedState;
+    use affinidi_tdk_common::config::TDKConfig;
+    use serde_json::json;
+
+    /// A did:peer:2 with Ed25519 (V, #key-1) + X25519 (E, #key-2); returns the
+    /// DID and the X25519 secret keyed at `#key-2`.
+    fn peer_with_x25519() -> (String, Secret) {
+        let x = Secret::generate_x25519(Some("t"), None).unwrap();
+        let x_mb = x.get_public_keymultibase().unwrap();
+        let keys = vec![
+            PeerCreateKey::new(PeerKeyPurpose::Verification, PeerKeyType::Ed25519),
+            PeerCreateKey::from_multibase(PeerKeyPurpose::Encryption, x_mb),
+        ];
+        let (did, _) = DID::generate_peer(&keys, None).unwrap();
+        let did = did.to_string();
+        let mut s = x;
+        s.id = format!("{did}#key-2");
+        (did, s)
+    }
+
+    /// An ATM with the **secure default** policy and one recipient secret loaded.
+    async fn atm_with_secret(secret: Secret) -> ATM {
+        let config = ATMConfig::builder().build().unwrap();
+        let tdk = Arc::new(
+            TDKSharedState::new(TDKConfig::headless().unwrap())
+                .await
+                .unwrap(),
+        );
+        tdk.secrets_resolver().insert(secret).await;
+        ATM::new(config, tdk).await.unwrap()
+    }
+
+    /// A profile with no mediator — the drain only uses the profile for the
+    /// (channel-based, fire-and-forget) purge, which needs no live mediator.
+    fn fake_profile() -> Arc<ATMProfile> {
+        Arc::new(ATMProfile {
+            inner: Arc::new(ATMProfileInner {
+                did: "did:peer:fake".to_string(),
+                alias: "test".to_string(),
+                mediator: Arc::new(None),
+            }),
+        })
+    }
+
+    /// `authcrypt(plaintext)` from sender → recipient, base64url-no-pad encoded
+    /// as it would appear inside a pickup delivery attachment.
+    fn authcrypt_b64(
+        sender_did: &str,
+        sender_x: &Secret,
+        recipient_did: &str,
+        recipient_x: &Secret,
+        id: &str,
+    ) -> String {
+        let msg = DcMessage::build(
+            id.to_string(),
+            "example/v1".to_string(),
+            json!({"hello": "world"}),
+        )
+        .from(sender_did.to_string())
+        .to(recipient_did.to_string())
+        .finalize();
+        let plaintext = serde_json::to_string(&msg).unwrap();
+        let sender_priv =
+            PrivateKeyAgreement::from_raw_bytes(Curve::X25519, sender_x.get_private_bytes())
+                .unwrap();
+        let recipient_pub =
+            PublicKeyAgreement::from_raw_bytes(Curve::X25519, recipient_x.get_public_bytes())
+                .unwrap();
+        let jwe = authcrypt(
+            plaintext.as_bytes(),
+            &format!("{sender_did}#key-2"),
+            &sender_priv,
+            &[(&format!("{recipient_did}#key-2"), &recipient_pub)],
+        )
+        .unwrap();
+        BASE64_URL_SAFE_NO_PAD.encode(jwe.as_bytes())
+    }
+
+    /// Build a pickup `delivery` message carrying the given attachments.
+    fn delivery_with(attachments: Vec<Attachment>) -> Message {
+        let mut b = Message::build(
+            "delivery-1".to_string(),
+            "https://didcomm.org/messagepickup/3.0/delivery".to_string(),
+            json!({}),
+        );
+        for a in attachments {
+            b = b.attachment(a);
+        }
+        b.finalize()
+    }
+
+    /// A batch interleaving valid messages with four kinds of unprocessable
+    /// input — malformed base64, valid-base64-but-not-utf8, an unsupported
+    /// attachment type, and a policy-rejected plaintext — must not panic, error,
+    /// or abort: the drain skips each unprocessable attachment and still surfaces
+    /// the valid messages that came *before and after* them.
+    #[tokio::test]
+    async fn unprocessable_messages_are_skipped_and_do_not_stall_the_drain() {
+        let (sender_did, sender_x) = peer_with_x25519();
+        let (recipient_did, recipient_x) = peer_with_x25519();
+        let atm = atm_with_secret(recipient_x.clone()).await;
+        let profile = fake_profile();
+
+        // Valid authcrypt messages (must be surfaced), one before and one after
+        // the unprocessable ones, to prove the batch keeps going.
+        let good1 = Attachment::base64(authcrypt_b64(
+            &sender_did,
+            &sender_x,
+            &recipient_did,
+            &recipient_x,
+            "m1",
+        ))
+        .id("good-1".to_string())
+        .finalize();
+        let good2 = Attachment::base64(authcrypt_b64(
+            &sender_did,
+            &sender_x,
+            &recipient_did,
+            &recipient_x,
+            "m2",
+        ))
+        .id("good-2".to_string())
+        .finalize();
+
+        // Unprocessable 1: malformed base64.
+        let bad_b64 = Attachment::base64("!!!not-valid-base64!!!".to_string())
+            .id("bad-base64".to_string())
+            .finalize();
+        // Unprocessable 2: valid base64 but not utf8.
+        let bad_utf8 = Attachment::base64(BASE64_URL_SAFE_NO_PAD.encode([0xFF, 0xFE, 0xFD]))
+            .id("bad-utf8".to_string())
+            .finalize();
+        // Unprocessable 3: a plaintext the secure default policy rejects.
+        let plaintext = DcMessage::build(
+            "evil".to_string(),
+            "example/v1".to_string(),
+            json!({"x": 1}),
+        )
+        .from(sender_did.clone())
+        .to(recipient_did.clone())
+        .finalize();
+        let rejected_plaintext = Attachment::base64(
+            BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_string(&plaintext).unwrap().as_bytes()),
+        )
+        .id("rejected-plaintext".to_string())
+        .finalize();
+        // Unprocessable 4: unsupported attachment type (json, no base64).
+        let unsupported = Attachment::json(json!({"not": "base64"}))
+            .id("unsupported-json".to_string())
+            .finalize();
+
+        let delivery = delivery_with(vec![
+            good1,
+            bad_b64,
+            bad_utf8,
+            rejected_plaintext,
+            unsupported,
+            good2,
+        ]);
+
+        let out = MessagePickup {}
+            ._handle_delivery(&atm, &profile, &delivery)
+            .await
+            .expect("the drain must not error on an unprocessable batch");
+
+        // Only the two valid authcrypt messages surface; every unprocessable one is skipped.
+        let ids: Vec<&str> = out.iter().map(|(m, _)| m.id.as_str()).collect();
+        assert_eq!(
+            out.len(),
+            2,
+            "only the valid messages should surface, got ids: {ids:?}"
+        );
+        assert!(ids.contains(&"good-1"));
+        assert!(ids.contains(&"good-2"));
+        // The secure default held: everything surfaced is authenticated authcrypt.
+        for (_, meta) in &out {
+            assert!(
+                meta.authenticated,
+                "surfaced pickup messages must be authcrypt-authenticated"
+            );
+        }
+    }
+
+    /// An *entirely* unprocessable batch surfaces nothing and still returns `Ok`
+    /// — a fully-hostile delivery cannot take the drain (or the pickup loop) down.
+    #[tokio::test]
+    async fn all_unprocessable_batch_surfaces_nothing_without_error() {
+        let (_recipient_did, recipient_x) = peer_with_x25519();
+        let atm = atm_with_secret(recipient_x).await;
+        let profile = fake_profile();
+
+        let delivery = delivery_with(vec![
+            Attachment::base64("###".to_string())
+                .id("p1".to_string())
+                .finalize(),
+            Attachment::json(json!({"x": 1}))
+                .id("p2".to_string())
+                .finalize(),
+        ]);
+
+        let out = MessagePickup {}
+            ._handle_delivery(&atm, &profile, &delivery)
+            .await
+            .expect("all-unprocessable batch must not error");
+        assert!(out.is_empty(), "no unprocessable message should surface");
+    }
+
+    /// With an unprocessable-message channel configured, an unprocessable
+    /// attachment is broadcast (id + retained raw payload + reason) *before* it
+    /// is deleted or retained, while a valid message is delivered normally and
+    /// never reported.
+    #[tokio::test]
+    async fn unprocessable_messages_are_reported_on_the_channel() {
+        let (sender_did, sender_x) = peer_with_x25519();
+        let (recipient_did, recipient_x) = peer_with_x25519();
+
+        // ATM with the secure default policy *and* an unprocessable-message channel.
+        let config = ATMConfig::builder()
+            .with_unprocessable_message_channel(16)
+            .build()
+            .unwrap();
+        let tdk = Arc::new(
+            TDKSharedState::new(TDKConfig::headless().unwrap())
+                .await
+                .unwrap(),
+        );
+        tdk.secrets_resolver().insert(recipient_x.clone()).await;
+        let atm = ATM::new(config, tdk).await.unwrap();
+        let mut rx = atm
+            .get_unprocessable_message_channel()
+            .expect("unprocessable channel");
+        let profile = fake_profile();
+
+        // One valid authcrypt (delivered, never reported) + one rejected plaintext
+        // (the secure default rejects the unauthenticated wrapping).
+        let good = Attachment::base64(authcrypt_b64(
+            &sender_did,
+            &sender_x,
+            &recipient_did,
+            &recipient_x,
+            "m1",
+        ))
+        .id("good-1".to_string())
+        .finalize();
+        let plaintext = DcMessage::build(
+            "evil".to_string(),
+            "example/v1".to_string(),
+            json!({"x": 1}),
+        )
+        .from(sender_did.clone())
+        .to(recipient_did.clone())
+        .finalize();
+        let rejected = Attachment::base64(
+            BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_string(&plaintext).unwrap().as_bytes()),
+        )
+        .id("rejected-1".to_string())
+        .finalize();
+
+        let out = MessagePickup {}
+            ._handle_delivery(&atm, &profile, &delivery_with(vec![good, rejected]))
+            .await
+            .expect("drain must not error");
+
+        // The good message is delivered.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.id, "good-1");
+
+        // Exactly one unprocessable event — for the plaintext — carrying its id,
+        // the retained raw payload, and a reason. The good message is not reported.
+        let p = rx
+            .try_recv()
+            .expect("the unprocessable message should be reported");
+        assert_eq!(p.attachment_id.as_deref(), Some("rejected-1"));
+        assert!(
+            !p.raw.is_empty(),
+            "the raw payload is retained for quarantine"
+        );
+        assert!(!p.reason.is_empty(), "a rejection reason is included");
+        assert!(
+            rx.try_recv().is_err(),
+            "only the unprocessable message is reported, not the valid one"
+        );
+    }
+
+    /// Malformed / non-recoverable input — invalid base64, valid base64 that
+    /// isn't UTF-8, and an unsupported (non-base64) attachment type — is still
+    /// reported on the unprocessable-message channel (each with its id and a
+    /// reason) *before* it is deleted. This guards the guarantee across the
+    /// delete-by-default path: reporting happens regardless of whether the
+    /// message is subsequently purged, so a consumer observes every one.
+    #[tokio::test]
+    async fn malformed_messages_are_reported_on_the_channel() {
+        let config = ATMConfig::builder()
+            .with_unprocessable_message_channel(16)
+            .build()
+            .unwrap();
+        let tdk = Arc::new(
+            TDKSharedState::new(TDKConfig::headless().unwrap())
+                .await
+                .unwrap(),
+        );
+        let atm = ATM::new(config, tdk).await.unwrap();
+        let mut rx = atm
+            .get_unprocessable_message_channel()
+            .expect("unprocessable channel");
+        let profile = fake_profile();
+
+        // Invalid base64, valid base64 that isn't UTF-8, and an unsupported
+        // (non-base64) attachment type — three distinct non-recoverable paths.
+        let bad_b64 = Attachment::base64("!!!not-valid-base64!!!".to_string())
+            .id("bad-base64".to_string())
+            .finalize();
+        let bad_utf8 = Attachment::base64(BASE64_URL_SAFE_NO_PAD.encode([0xFF, 0xFE, 0xFD]))
+            .id("bad-utf8".to_string())
+            .finalize();
+        let unsupported = Attachment::json(json!({"not": "base64"}))
+            .id("unsupported-json".to_string())
+            .finalize();
+
+        let out = MessagePickup {}
+            ._handle_delivery(
+                &atm,
+                &profile,
+                &delivery_with(vec![bad_b64, bad_utf8, unsupported]),
+            )
+            .await
+            .expect("drain must not error");
+        assert!(out.is_empty(), "no malformed message surfaces");
+
+        // Every malformed attachment is reported, each with a non-empty reason.
+        let mut reported = std::collections::HashMap::new();
+        while let Ok(p) = rx.try_recv() {
+            assert!(!p.reason.is_empty(), "a reason is included");
+            reported.insert(p.attachment_id.clone().unwrap_or_default(), p.reason);
+        }
+        assert_eq!(
+            reported.len(),
+            3,
+            "all three malformed attachments are reported, got: {reported:?}"
+        );
+        assert!(
+            reported.contains_key("bad-base64"),
+            "invalid base64 reported"
+        );
+        assert!(
+            reported.contains_key("bad-utf8"),
+            "non-UTF-8 payload reported"
+        );
+        assert!(
+            reported.contains_key("unsupported-json"),
+            "unsupported attachment type reported"
+        );
+    }
+
+    /// The unprocessable-message channel is purely opt-in: with none configured
+    /// the drain still skips/deletes unprocessable messages without error.
+    #[tokio::test]
+    async fn unprocessable_channel_is_optional() {
+        let (_recipient_did, recipient_x) = peer_with_x25519();
+        let atm = atm_with_secret(recipient_x).await; // no unprocessable-message channel
+        assert!(atm.get_unprocessable_message_channel().is_none());
+        let profile = fake_profile();
+
+        let delivery = delivery_with(vec![
+            Attachment::base64("###".to_string())
+                .id("p1".to_string())
+                .finalize(),
+        ]);
+        let out = MessagePickup {}
+            ._handle_delivery(&atm, &profile, &delivery)
+            .await
+            .expect("drain must not error without an unprocessable channel");
+        assert!(out.is_empty());
+    }
+
+    /// A did:peer:2 with Ed25519 (V, #key-1) + X25519 (E, #key-2); returns the
+    /// DID and the Ed25519 *signing* secret keyed at `#key-1`.
+    fn peer_with_ed25519() -> (String, Secret) {
+        let ed = Secret::generate_ed25519(Some("t"), None);
+        let ed_mb = ed.get_public_keymultibase().unwrap();
+        let x = Secret::generate_x25519(Some("t"), None).unwrap();
+        let x_mb = x.get_public_keymultibase().unwrap();
+        let keys = vec![
+            PeerCreateKey::from_multibase(PeerKeyPurpose::Verification, ed_mb),
+            PeerCreateKey::from_multibase(PeerKeyPurpose::Encryption, x_mb),
+        ];
+        let (did, _) = DID::generate_peer(&keys, None).unwrap();
+        let did = did.to_string();
+        let mut ed = ed;
+        ed.id = format!("{did}#key-1");
+        (did, ed)
+    }
+
+    /// Regression: a message with an **invalid signature** is a *deterministic*
+    /// failure (it fails verification identically on every redelivery), so the
+    /// drain must **delete** it, not leave it queued to loop forever. A
+    /// transiently unresolvable signer DID would instead be left queued — the
+    /// distinction the [`ATMError::VerificationFailed`] variant draws.
+    ///
+    /// The signature is verified during layer unwrapping, *before* the wrapping
+    /// allow-list runs, so the policy here accepts `SignedPlaintext` to prove
+    /// the purge is driven by the bad signature and not a wrapping rejection.
+    /// Observed via the unprocessable-message channel: the "left queued for
+    /// retry" path does **not** report, so a report proves the delete path ran.
+    #[tokio::test]
+    async fn invalid_signature_is_purged_not_left_queued() {
+        use crate::config::{MessageWrappingType, UnpackPolicy};
+
+        let (signer_did, ed) = peer_with_ed25519();
+
+        // Accept signed-only so the only possible failure is the bad signature.
+        let config = ATMConfig::builder()
+            .with_unprocessable_message_channel(16)
+            .with_unpack_policy(UnpackPolicy {
+                expected: vec![MessageWrappingType::SignedPlaintext],
+                validate_addressing_consistency: false,
+                max_signatures: 5,
+                max_recipients: 100,
+            })
+            .build()
+            .unwrap();
+        let tdk = Arc::new(
+            TDKSharedState::new(TDKConfig::headless().unwrap())
+                .await
+                .unwrap(),
+        );
+        let atm = ATM::new(config, tdk).await.unwrap();
+        let mut rx = atm
+            .get_unprocessable_message_channel()
+            .expect("unprocessable channel");
+        let profile = fake_profile();
+
+        // Sign a plaintext, then corrupt the signature bytes.
+        let msg = DcMessage::build(
+            "evil-sig".to_string(),
+            "example/v1".to_string(),
+            json!({"x": 1}),
+        )
+        .from(signer_did.clone())
+        .to("did:example:recipient".to_string())
+        .finalize();
+        let plaintext = serde_json::to_string(&msg).unwrap();
+        let ed_priv: [u8; 32] = ed.get_private_bytes().try_into().unwrap();
+        let signed = sign_multi(
+            plaintext.as_bytes(),
+            &[JwsSigner::Ed25519 {
+                kid: &format!("{signer_did}#key-1"),
+                private: &ed_priv,
+            }],
+        )
+        .unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&signed).unwrap();
+        let sig = v["signatures"][0]["signature"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let first = sig.chars().next().unwrap();
+        let repl = if first == 'A' { 'B' } else { 'A' };
+        let corrupted: String = std::iter::once(repl).chain(sig.chars().skip(1)).collect();
+        v["signatures"][0]["signature"] = serde_json::Value::String(corrupted);
+        let tampered = serde_json::to_string(&v).unwrap();
+
+        let attachment = Attachment::base64(BASE64_URL_SAFE_NO_PAD.encode(tampered.as_bytes()))
+            .id("bad-sig".to_string())
+            .finalize();
+
+        let out = MessagePickup {}
+            ._handle_delivery(&atm, &profile, &delivery_with(vec![attachment]))
+            .await
+            .expect("drain must not error");
+        assert!(
+            out.is_empty(),
+            "an invalid-signature message is not surfaced"
+        );
+
+        // A report proves the deterministic-delete path ran; the
+        // "left queued for retry" path emits nothing.
+        let p = rx
+            .try_recv()
+            .expect("an invalid signature must be purged (reported), not left queued");
+        assert_eq!(p.attachment_id.as_deref(), Some("bad-sig"));
+        assert!(
+            p.reason.contains("Verification failed"),
+            "reason should name the verification failure, got: {}",
+            p.reason
+        );
+        assert!(rx.try_recv().is_err(), "exactly one unprocessable event");
+    }
+
+    /// The TSP-aware frames drain reports unprocessable messages on the channel
+    /// too: an unprocessable attachment is yielded as `(None, id)` for the caller
+    /// to ack *and* broadcast on the channel, while a valid message is delivered
+    /// as a `DidComm` frame and never reported.
+    #[cfg(feature = "tsp")]
+    #[tokio::test]
+    async fn frames_drain_reports_unprocessable_on_the_channel() {
+        let (sender_did, sender_x) = peer_with_x25519();
+        let (recipient_did, recipient_x) = peer_with_x25519();
+
+        let config = ATMConfig::builder()
+            .with_unprocessable_message_channel(16)
+            .build()
+            .unwrap();
+        let tdk = Arc::new(
+            TDKSharedState::new(TDKConfig::headless().unwrap())
+                .await
+                .unwrap(),
+        );
+        tdk.secrets_resolver().insert(recipient_x.clone()).await;
+        let atm = ATM::new(config, tdk).await.unwrap();
+        let mut rx = atm
+            .get_unprocessable_message_channel()
+            .expect("unprocessable channel");
+
+        let good = Attachment::base64(authcrypt_b64(
+            &sender_did,
+            &sender_x,
+            &recipient_did,
+            &recipient_x,
+            "m1",
+        ))
+        .id("good-1".to_string())
+        .finalize();
+        let plaintext = DcMessage::build(
+            "evil".to_string(),
+            "example/v1".to_string(),
+            json!({"x": 1}),
+        )
+        .from(sender_did.clone())
+        .to(recipient_did.clone())
+        .finalize();
+        let rejected = Attachment::base64(
+            BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_string(&plaintext).unwrap().as_bytes()),
+        )
+        .id("rejected-1".to_string())
+        .finalize();
+
+        let out = MessagePickup {}
+            ._handle_delivery_frames(&atm, &delivery_with(vec![good, rejected]))
+            .await
+            .expect("frames drain must not error");
+
+        // Good delivered as a frame; the unprocessable one yielded as (None, id).
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|(f, id)| id == "good-1" && f.is_some()));
+        assert!(out.iter().any(|(f, id)| id == "rejected-1" && f.is_none()));
+
+        // VTI-49: the delivered message keeps its sender's id — what a reply
+        // threads to — while the mediator's id ("good-1") is the one returned
+        // to ack it.
+        let delivered = out
+            .iter()
+            .find_map(|(f, id)| match f {
+                Some(InboundFrame::DidComm(m, _)) if id == "good-1" => Some(m.id.clone()),
+                _ => None,
+            })
+            .expect("the good attachment is a DIDComm frame");
+        assert_eq!(delivered, "m1");
+
+        // The unprocessable frame is also reported on the channel.
+        let p = rx
+            .try_recv()
+            .expect("the unprocessable frame should be reported");
+        assert_eq!(p.attachment_id.as_deref(), Some("rejected-1"));
+        assert!(!p.raw.is_empty(), "the raw payload is retained");
+        assert!(
+            rx.try_recv().is_err(),
+            "only the unprocessable frame is reported, not the valid one"
+        );
+    }
+
+    // ── `await_next`: a frame handed over as the wait runs out ──────────────
+
+    fn frame(n: usize) -> WebSocketResponses {
+        WebSocketResponses::PackedMessageReceived(Box::new(format!("frame-{n}")))
+    }
+
+    /// A frame already handed over when the wait runs out is returned, not
+    /// dropped with the receiver, and the request is not cancelled — the
+    /// websocket task has already retired it.
+    #[tokio::test]
+    async fn a_frame_ready_when_the_wait_runs_out_is_kept() {
+        for n in 0..200 {
+            let (ws_tx, mut ws_rx) = mpsc::channel(4);
+            let (tx, rx) = oneshot::channel();
+            assert!(tx.send(frame(n)).is_ok());
+
+            let got = await_next(
+                &ws_tx,
+                rx,
+                Some(Duration::ZERO),
+                WebSocketCommands::CancelNext(1),
+            )
+            .await
+            .expect("no transport error");
+
+            assert!(
+                matches!(got, Some(Ok(WebSocketResponses::PackedMessageReceived(ref m))) if **m == format!("frame-{n}")),
+                "iteration {n}: a frame handed over before the timeout was lost"
+            );
+            assert!(
+                ws_rx.try_recv().is_err(),
+                "a retired request is not cancelled"
+            );
+        }
+    }
+
+    /// Under a real race between the hand-over and the timeout, every frame
+    /// ends up somewhere: either the waiter returns it, or the hand-over fails
+    /// and the websocket task gets it back to re-home. A hand-over that
+    /// succeeds while the waiter returns `None` is a lost frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hand_over_racing_the_timeout_is_never_lost() {
+        let wait = Duration::from_micros(500);
+        for n in 0..500 {
+            let (ws_tx, _ws_rx) = mpsc::channel(4);
+            let (tx, rx) = oneshot::channel();
+            let sender = tokio::spawn(async move {
+                tokio::time::sleep(wait).await;
+                tx.send(frame(n)).is_ok()
+            });
+
+            let got = await_next(&ws_tx, rx, Some(wait), WebSocketCommands::CancelNext(1))
+                .await
+                .expect("no transport error");
+            let accepted = sender.await.expect("sender task");
+
+            assert_eq!(
+                accepted,
+                got.is_some(),
+                "iteration {n}: hand-over accepted={accepted} but the waiter returned {}",
+                if got.is_some() {
+                    "the frame"
+                } else {
+                    "nothing"
+                }
+            );
+        }
+    }
+}

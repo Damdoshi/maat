@@ -1,0 +1,225 @@
+# Affinidi DID Authentication
+
+## Unreleased (0.3.13) — an authentication `429` is typed, and survives the retry loop
+
+A non-success response from the authentication service (`/challenge`, the
+authenticate POST, `/refresh`) became `DIDAuthError::Authentication(String)`
+with only the status in the text; and when `authenticate`'s retry loop ran out it
+replaced whatever had happened with `AuthenticationAbort("Maximum number of
+authentication retries reached")`. A `429` — which service refused, and when to
+come back — was lost twice, and the loop retried straight back into the limiter.
+
+### Added
+
+- `DIDAuthError::HttpStatus(Box<HttpStatusError>)` for a non-success status
+  other than `401` (still `ACLDenied`). `HttpStatusError` is
+  `affinidi_messaging_core::HttpStatusError`, re-exported as
+  `affinidi_did_authentication::errors::HttpStatusError` — the same type the
+  messaging SDK and `MessagingError` carry.
+- `DIDAuthError::RetriesExhausted { attempts, last: Box<DIDAuthError> }`: the
+  retry loop gave up, with the last attempt's error kept (also its `source()`).
+- `DIDAuthError::http_status()` / `is_rate_limited()`, which look through
+  `RetriesExhausted` to the last attempt.
+- `MAX_RATE_LIMIT_WAIT` (5 s).
+
+Both variants are additive: `DIDAuthError` is `#[non_exhaustive]`.
+
+### Changed
+
+- **BEHAVIOUR:** a non-success, non-`401` HTTP status is
+  `DIDAuthError::HttpStatus`, not `DIDAuthError::Authentication(String)`.
+  Display still begins `Authentication failed: `.
+- **BEHAVIOUR:** when `DIDAuthentication::authenticate` runs out of retries it
+  returns `DIDAuthError::RetriesExhausted`, not `AuthenticationAbort`. Display
+  still begins `Authentication Aborted: Maximum number of authentication
+  retries reached`, followed by the attempt count and the last error.
+- **BEHAVIOUR:** after a `429` the loop waits at least `Retry-After` (never less
+  than its own backoff) before the next attempt. Rate-limit waits are budgeted
+  at `MAX_RATE_LIMIT_WAIT` across the call: a `Retry-After` that would exceed
+  it ends the loop immediately with `RetriesExhausted` carrying the `429`,
+  rather than being waited out — the TDK's authentication task allows the
+  whole call 10 s, and a longer wait would turn the `429` into a bare timeout.
+- New dependency: `affinidi-messaging-core` 0.1.7.
+
+## Unreleased (0.3.12) — dependency refresh
+
+- Bumps `base64` 0.22 → 0.23.
+- No source or API change; the bumps are declaration-only and the crate
+  compiles unmodified against them. Bumped workspace-wide in the same
+  change so no two versions of these crates are compiled side by side.
+
+## 0.3.11 — 2026-08-18
+
+### Fixed
+
+- **A forced refresh of a still-valid access token now actually refreshes.**
+  `_refresh_authentication` re-derived the decision from `refresh_check`, which
+  only reports `Refresh` inside the last five seconds of the token's life — so a
+  caller that had explicitly asked for a refresh was answered with "still valid,
+  nothing to do" and got its old token back. The intent was accepted at the
+  task boundary (`Refresh needed` was even logged) and then discarded here,
+  because there was no way to express it beyond that point.
+
+  Downstream this produced a reconnect storm. `affinidi-messaging-sdk`'s
+  websocket transport refreshes proactively at 80% of the token's life and
+  rebuilds the socket to carry the new token; because the refresh did nothing,
+  each rebuild re-armed the deadline at 80% of what *remained*. For a 900 s
+  token that is teardowns at T-180 s, T-36 s, T-7 s and finally T+expired —
+  where the refresh at last ran for real — so **four reconnects per token per
+  profile instead of one**, the last two close enough together to look like
+  flapping.
+
+### Added
+
+- `DIDAuthentication::refresh_tokens`, which mints a new access token while the
+  current one is still valid. Purely additive — `authenticate` is unchanged, so
+  an ordinary call on a healthy token still costs nothing. Force promotes only
+  "still valid": an expired *refresh* token still falls through to a full
+  handshake, because there is nothing left to refresh with.
+
+## 0.3.10 — 2026-07-19
+
+### Changed
+
+- Bumped the `affinidi-did-common` requirement from `"0.3"` to `"0.4"`.
+  No functional change to this crate: `Document` gained a typed
+  `also_known_as` field, which is additive.
+
+## 4th July 2026 (0.3.9)
+
+Internal refactor: the local `_key_type_to_curve` helper is replaced by
+`affinidi_crypto::KeyType::key_agreement_curve()`, the shared single source of
+truth for the `KeyType` → key-agreement `Curve` mapping. No public API or
+behaviour change; patch bump — see ADR 0003.
+
+## 13th June 2026 (0.3.8)
+
+Semver wave (W7 — release W11). `DIDAuthError` is now `#[non_exhaustive]` (match
+with a wildcard arm). Patch bump — see ADR 0003 and the migration guide.
+
+## 13th June 2026 (0.3.7)
+
+Auth hygiene (W6):
+
+- Removed the `.expect("negotiated curve came from sender_curves")` in the
+  authcrypt packing path; a missing sender key now returns a `DIDComm` error
+  instead of panicking.
+- Sensitive authentication artifacts — the challenge, the signed challenge
+  response, the packed auth message, the received tokens, and the raw HTTP
+  request/response bodies — now log at `TRACE` via a `trace_sensitive` helper
+  rather than `DEBUG`. `DEBUG` keeps only non-sensitive breadcrumbs
+  ("Challenge received", "Tokens received", request URL + status). A capture
+  test asserts no sensitive value appears at `DEBUG`.
+
+## 6th June 2026 (0.3.6)
+
+- Robust sender/recipient key-agreement negotiation (#357). The authcrypt
+  pack path now enumerates *all* of the sender's usable key-agreement keys
+  and negotiates the best shared curve with the recipient by a documented
+  preference order (`X25519 > P-256 > secp256k1`), instead of deriving the
+  curve from the sender's *first* key only. A sender whose first KA curve
+  has no recipient match but whose second does now packs successfully, and a
+  no-common-curve failure names the curve set each side offered. The
+  negotiation + key-resolution logic moved into `affinidi-did-common`'s new
+  `key_negotiation` module (enabled via its `key-agreement` feature),
+  removing the helpers that were duplicated between this crate and the
+  messaging SDK. The sender key-type → curve mapping now also covers the
+  newly-supported P-384 and P-521 key-agreement curves (#357).
+
+## 1st June 2026 (0.3.5)
+
+- Release on `affinidi-messaging-didcomm` 0.15 (#327). The authcrypt
+  challenge/response now uses the key-agreement types from
+  `affinidi-crypto`'s `jose` module (the `didcomm::crypto` module was
+  removed); added a direct `affinidi-crypto` dependency. No behaviour
+  change — the ECDH-1PU authcrypt path is byte-identical.
+
+## 31st May 2026 (0.3.4)
+
+- Bump `affinidi-messaging-didcomm` to 0.14. This crate authcrypts the
+  DID-authentication challenge/response (ECDH-1PU), so it directly picks
+  up the corrected authcrypt KDF (#322) and is now interoperable with
+  spec-compliant peers; the 0.14 dual-KEK fallback preserves
+  compatibility with not-yet-upgraded peers during rollout. No API
+  change in this crate.
+- Internal: the key-agreement key extractor now delegates to
+  `affinidi-did-common`'s `VerificationMethod::decode_public_key`, so the
+  JWK/multibase parsing is shared with the messaging SDK rather than
+  duplicated here.
+
+## 28th May 2026 (0.3.3)
+
+- **SECURITY (HIGH):** Redact bearer / refresh tokens in `Debug` output for
+  three sibling structs. Each derived `Debug` while holding `access_token`
+  and the long-lived (or rotated one-time) `refresh_token`. Any
+  `debug!`/`warn!("{:?}", x)` on either side of the wire — client session
+  state, threaded SDK profiles, mediator refresh handlers — would leak full
+  session credentials to logs.
+  - `AuthorizationTokens` — primary client-side session credential.
+  - `MPAuthorizationTokens` — Meeting Place auth flow.
+  - `AuthRefreshResponse` — server-side response wrapping the rotated
+    refresh + new access token.
+  Manual `Debug` impls now keep the `*_expires_at` timestamps visible and
+  render the token values as `[REDACTED]`. `Serialize`/`Deserialize`
+  unchanged — wire format and persistence are unaffected.
+
+## 28th March 2026 (0.3.1)
+
+- **FIX:** Republish with `affinidi-messaging-didcomm` 0.13 dependency
+  (published 0.3.0 still referenced 0.12 on crates.io)
+
+## 10th March 2026 (0.2.4)
+
+- **MIGRATION:** Migrated to new `affinidi-messaging-didcomm` 0.13.0
+  - Pack/unpack functions updated to use bridge helpers
+  - Import paths changed from `affinidi_didcomm` to `affinidi_messaging_didcomm`
+
+## 15th December 2025 (0.2.3)
+
+- **FEATURE:** Added support for custom authentication handlers via `CustomAuthHandlers`
+  `CustomAuthHandler` trait allows custom authentication logic
+  `CustomRefreshHandler` trait allows custom token refresh logic
+- **FEATURE:** `DIDAuthentication::with_custom_handlers()` method added
+  Authentication and refresh methods now check for custom handlers before
+  using default logic
+
+## 3rd November 2025 (0.2.2)
+
+- **MAINTENANCE:** Dependency updates
+
+## 30th May 2025 (0.2.0)
+
+- **BREAKING:** Removed SSI crate dependency
+
+## 29th May 2025 (0.1.10)
+
+- **MAINTENANCE:** Updated crate dependencies (SSI Crate 0.10 --> 0.11)
+
+## 3rd May 2025 (0.1.9)
+
+- **FIX:** building the refresh HTTP request was incorrectly using the DID and
+  not the REST API URL
+- **FIX:** Refresh was using wrong DIDComm message type
+- **FIX:** Debug log message could cause a panic in the authentication task due
+  to a negative `u64` value
+
+## 2nd May 2025 (0.1.8)
+
+- **FEATURE:** Adding improved debug messaging for troubleshooting of refreshing
+  auth credentials
+- **FEATURE:** Splitting refresh logic to be more granular so that `tdk-common`
+  authentication task
+  has improved handling of refresh logic
+- **FEATURE:** Added unit tests for token expiry
+
+## 22nd April 2025 (0.1.7)
+
+- Improved logging of error when no auth service is found
+
+## 24th March 2025 Release 0.1.6
+
+- Implemented caching expiry for AuthenticationRecords
+
+## Release 0.1.0
+
+- Initial release of crate

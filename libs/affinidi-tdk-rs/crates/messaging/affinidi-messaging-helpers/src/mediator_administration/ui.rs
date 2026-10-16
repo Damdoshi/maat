@@ -1,0 +1,252 @@
+//! UI Related functions
+use affinidi_messaging_sdk::errors::ATMError;
+use affinidi_messaging_sdk::{ATM, profiles::ATMProfile};
+use console::style;
+use dialoguer::{Confirm, Input, MultiSelect, Select, theme::ColorfulTheme};
+use regex::Regex;
+use sha256::digest;
+use std::sync::Arc;
+use trust_tasks_rs::specs::messaging::account;
+use trust_tasks_rs::specs::messaging::account::list::v0_1::AccountType;
+use trust_tasks_rs::specs::messaging::account::update::v0_1::AccountType as UpdateAccountType;
+
+use crate::SharedConfig;
+
+pub(crate) async fn administration_accounts_menu(
+    atm: &ATM,
+    profile: &Arc<ATMProfile>,
+    theme: &ColorfulTheme,
+    shared_config: &SharedConfig,
+) {
+    let selections = &[
+        "List Administration DIDs",
+        "Add Administration rights to a DID (will create if it doesn't exist)",
+        "Strip Administration rights from a DID (DID will be set back to Standard)",
+        "Back",
+    ];
+
+    loop {
+        let selection = Select::with_theme(theme)
+            .with_prompt("Select an action?")
+            .default(0)
+            .items(&selections[..])
+            .interact()
+            .unwrap();
+
+        match selection {
+            0 => {
+                list_admins(atm, profile, shared_config).await;
+            }
+            1 => add_admin(atm, profile, theme).await,
+            2 => strip_admins(atm, profile, shared_config, theme).await,
+            3 => {
+                break;
+            }
+            _ => {
+                println!("Invalid selection");
+            }
+        }
+    }
+}
+
+/// The mediator's administrator accounts — `account/list` filtered per admin
+/// role (`rootAdmin`, then `admin`), replacing the retired `admin/list` task.
+async fn admin_accounts(
+    atm: &ATM,
+    profile: &Arc<ATMProfile>,
+) -> Result<Vec<account::list::v0_1::Account>, ATMError> {
+    let mut accounts = Vec::new();
+    for role in [AccountType::RootAdmin, AccountType::Admin] {
+        accounts.extend(
+            atm.trust_tasks()
+                .account_list(profile, None, None, Some(role))
+                .await?
+                .accounts,
+        );
+    }
+    Ok(accounts)
+}
+
+/// List first 100 Administration DIDs
+pub(crate) async fn list_admins(atm: &ATM, profile: &Arc<ATMProfile>, config: &SharedConfig) {
+    match admin_accounts(atm, profile).await {
+        Ok(admins) => {
+            println!(
+                "{}",
+                style("Listing Administration DIDs (SHA256 Hashed DID's). NOTE: Will only list first 100 admin accounts!").green()
+            );
+
+            for (idx, admin) in admins.iter().enumerate() {
+                print!(
+                    "  {}",
+                    style(format!("{}: {}", idx, admin.did.as_str())).yellow(),
+                );
+                let (role, color) = match admin.account_type {
+                    AccountType::Mediator => (admin.account_type.to_string(), 27_u8),
+                    AccountType::RootAdmin => (admin.account_type.to_string(), 127_u8),
+                    AccountType::Admin => (admin.account_type.to_string(), 129_u8),
+                    _ => ("Unknown".into(), 1_u8),
+                };
+                print!(" {}", style(format!("({role})")).color256(color));
+                if admin.did.as_str() == config.our_admin_hash.as_str() {
+                    print!(" {}", style("(our Admin account)").color256(208));
+                }
+
+                println!();
+            }
+        }
+        Err(e) => {
+            println!("{}", style(format!("Error: {e}")).red());
+        }
+    }
+}
+
+/// Add new Administration DID
+pub(crate) async fn add_admin(atm: &ATM, profile: &Arc<ATMProfile>, theme: &ColorfulTheme) {
+    println!("Adding new Administration DID (type exit to quit this dialog)");
+
+    let input: String = Input::with_theme(theme)
+        .with_prompt("DID to add")
+        .validate_with(|input: &String| -> Result<(), &str> {
+            let re = Regex::new(r"did:\w*:\w*").unwrap();
+            if re.is_match(input) || input == "exit" {
+                Ok(())
+            } else {
+                Err("Invalid DID format")
+            }
+        })
+        .interact_text()
+        .unwrap();
+
+    if input == "exit" {
+        return;
+    }
+
+    if Confirm::with_theme(theme)
+        .with_prompt(format!("Do you want to add DID ({})?", &input))
+        .interact()
+        .unwrap()
+    {
+        match atm
+            .trust_tasks()
+            .account_update(
+                profile,
+                Some(digest(&input)),
+                Some(UpdateAccountType::Admin),
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(_account) => {
+                println!(
+                    "{}",
+                    style(format!("DID ({}) is now an administrator", &input)).green()
+                );
+                println!(
+                    "  {}{}",
+                    style("DID Hash: ").green(),
+                    style(digest(&input)).yellow()
+                );
+            }
+            Err(e) => {
+                println!("{}", style(format!("Error: {e}")).red());
+            }
+        }
+    }
+}
+
+pub(crate) async fn strip_admins(
+    atm: &ATM,
+    profile: &Arc<ATMProfile>,
+    config: &SharedConfig,
+    theme: &ColorfulTheme,
+) {
+    match admin_accounts(atm, profile).await {
+        Ok(response) => {
+            // remove the mediator administrator account from the list
+            let admins: Vec<String> = response
+                .iter()
+                .filter_map(|x| {
+                    if x.did.as_str() != config.our_admin_hash.as_str()
+                        && x.did.as_str() != config.mediator_did_hash.as_str()
+                    {
+                        Some(x.did.as_str().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if admins.is_empty() {
+                println!("{}", style("No Admin DIDs can be stripped").red());
+                println!();
+                return;
+            }
+            let dids = MultiSelect::with_theme(theme)
+                .with_prompt("Select DIDs to remove (space to select, enter to continue)?")
+                .items(&admins)
+                .report(false)
+                .interact()
+                .unwrap();
+
+            if dids.is_empty() {
+                println!("{}", style("No Admin DIDs selected").red());
+                return;
+            }
+
+            println!();
+            println!(
+                "{}",
+                style("Stripping admin rights from the following DIDs:").green()
+            );
+            for did in &dids {
+                println!("  {}", style(&admins[did.to_owned()]).yellow());
+            }
+
+            if Confirm::with_theme(theme)
+                .with_prompt("Do you want to strip admin access from the selected DIDs?")
+                .interact()
+                .unwrap()
+            {
+                let admins = dids
+                    .iter()
+                    .map(|&idx| admins[idx].clone())
+                    .collect::<Vec<_>>();
+                // One `account/update` per DID — each demotion is its own
+                // signed, auditable document (the batched admin/strip is retired).
+                let mut stripped = 0usize;
+                let mut errors: Vec<String> = Vec::new();
+                for did in &admins {
+                    match atm
+                        .trust_tasks()
+                        .account_update(
+                            profile,
+                            Some(did.clone()),
+                            Some(UpdateAccountType::Standard),
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => stripped += 1,
+                        Err(e) => errors.push(format!("{did}: {e}")),
+                    }
+                }
+                if errors.is_empty() {
+                    println!(
+                        "{}",
+                        style(format!("Stripped admin rights from {stripped} DIDs")).green()
+                    );
+                } else {
+                    for e in &errors {
+                        println!("{}", style(format!("Error: {e}")).red());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            println!("{}", style(format!("Error: {e}")).red());
+        }
+    }
+}

@@ -12,6 +12,11 @@
 #include <arpa/inet.h>
 
 using namespace maat;
+class AvailableUIDs final : public UIDCollisionPolicy {
+public:
+    bool isFree(uid_t) const override { return true; }
+};
+
 static void ck(bool x,const char* m){if(!x){std::fprintf(stderr,"FAIL: %s\n",m);std::exit(1);}}
 static std::vector<uint8_t> key(){std::vector<uint8_t> k(51);k[3]=11;for(int i=0;i<11;++i)k[4+i]="ssh-ed25519"[i];k[18]=32;return k;}
 static int sendClaim(int target,const std::string& session,int fd,int number=1){
@@ -28,8 +33,14 @@ static int sendClaim(int target,const std::string& session,int fd,int number=1){
     return sendmsg(target,&m,MSG_NOSIGNAL);
 }
 int main(){
+    // MAATBIND3 is *deliberately* accepted only from UID 0. The positive
+    // SCM_RIGHTS tests require a disposable privileged test environment.
+    if(geteuid()!=0) {
+        std::puts("SKIP: privileged MAATBIND3 tests require UID 0; use isolated root CI");
+        return 77;
+    }
     char name[]="/tmp/maat-bind-XXXXXX";int f=mkstemp(name);ck(f>=0,"mkstemp");close(f);
-    ReplayStore store(name);IdentityRepository repo(name);RootSessionBinder binder(repo);
+    ReplayStore store(name);AvailableUIDs testUIDs;IdentityRepository repo(name,UIDRange(),testUIDs);RootSessionBinder binder(repo);
     int conn[2],channel[2];
     ck(socketpair(AF_UNIX,SOCK_SEQPACKET,0,conn)==0,"connection");
     ck(socketpair(AF_UNIX,SOCK_SEQPACKET,0,channel)==0,"session");
@@ -53,11 +64,13 @@ int main(){
     uint32_t wire=0;
     std::memcpy(&wire,ack+10,4);
     ck(ntohl(wire)==isolatedUID,"ack UID matches SQLite allocation");
-    auto m=requestMessage("MAATGET2","");m.resize(12);
-    ck(send(channel[0],m.data(),m.size(),0)==(ssize_t)m.size(),"request over endpoint");
-    SessionTicketChannel issuer(repo,result);
-    ck(issuer.serve(remote),"issue via bound channel");
-    char packet[256]{};ck(recv(channel[0],packet,sizeof(packet),0)>0,"ticket response");
+    // Session capability is accepted but cannot mint bearer tickets.
+    // Sending a packet without a connected TCP FD must fail closed.
+    auto m=requestMessage("MAATLINK1","");
+    ck(send(channel[0],m.data(),m.size(),0)==(ssize_t)m.size(),"malformed registration packet");
+    PendingHTTPConnections pending;
+    SessionConnectionChannel registrar(pending,repo,result);
+    ck(!registrar.serve(remote),"registration without TCP FD rejected");
     close(remote);close(channel[0]);close(channel[1]);
     ck(sendClaim(conn[0],std::string(64,'c'),-1,0)>0,"no rights replay");
     ck(binder.receive(conn[1],result,isolatedUID)<0,"replay without endpoint denied");

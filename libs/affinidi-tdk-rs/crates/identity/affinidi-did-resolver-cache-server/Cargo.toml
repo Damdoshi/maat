@@ -1,0 +1,68 @@
+[package]
+name = "affinidi-did-resolver-cache-server"
+version = "0.9.15"
+description = "Affinidi DID Network Cache + Resolver Service"
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+
+[features]
+# `network` enables the WebSocket resolver endpoint on /ws, which is the
+# default transport for `affinidi-did-resolver-cache-sdk` clients. Disable it
+# (with `--no-default-features`) to build an HTTP-only cache server that only
+# exposes /resolve/{did} and the health endpoints.
+default = ["network"]
+network = ["affinidi-did-resolver-cache-sdk/network"]
+
+[dependencies]
+# Affinidi Crates
+# Requires 0.8.19 for WSRequest::agent_name / WSResponse::with_agent_name.
+# `did-ethr` / `did-pkh` / `did-jwk` are opt-in in the SDK: most embedding
+# libraries do not want them. This is a general-purpose resolver *service*, so
+# it keeps full method coverage. `did-jwk` was advertised in the README but not
+# actually enabled here between 0.8.22 and now — the SDK gating in #674 moved
+# it behind a feature and only `did-ethr` / `did-pkh` were opted back in.
+affinidi-did-resolver-cache-sdk = { version = "0.8.37", default-features = true, features = ["did-ethr", "did-pkh", "did-jwk"], path = "../affinidi-did-resolver-cache-sdk/" }
+affinidi-did-common = "0.4"
+# Shared background-task supervision (restart-on-failure + health registry)
+affinidi-task-utils = "0.1"
+affinidi-rate-limit = "0.1"
+
+didwebvh-rs = "0.8"
+agent-names = "0.1.2"
+
+# External Crates
+ahash = "0.8"
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
+] }
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+http = "1"
+moka = { version = "0.12", features = ["future"] }
+rand = "0.10"
+regex = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+toml = "1"
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+affinidi-secrets-resolver = "0.5"
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

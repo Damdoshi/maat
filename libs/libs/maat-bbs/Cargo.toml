@@ -1,0 +1,8 @@
+[package]
+name = "maat-bbs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+affinidi-bbs = "=0.4.0"

@@ -1,0 +1,136 @@
+[workspace]
+members = [
+  # Core: encoding, cryptography, key management, CESR
+  "crates/core/affinidi-cesr",
+  "crates/core/affinidi-encoding",
+  "crates/core/affinidi-crypto",
+  "crates/core/affinidi-rate-limit",
+  "crates/core/affinidi-secrets-resolver",
+  "crates/core/affinidi-bbs",
+  "crates/core/affinidi-task-utils",
+  "crates/core/affinidi-net-guard",
+
+  # Identity: DID resolution, authentication
+  "crates/identity/affinidi-did-common",
+  "crates/identity/affinidi-did-resolver-cache-sdk",
+  "crates/identity/affinidi-did-resolver-cache-server",
+  "crates/identity/did-methods/did-example",
+  "crates/identity/did-methods/did-scid",
+  "crates/identity/did-methods/did-ebsi",
+  "crates/identity/did-methods/did-web",
+  "crates/identity/did-methods/did-webs",
+  "crates/identity/did-methods/did-ethr",
+  "crates/identity/did-methods/did-jwk",
+  "crates/identity/did-methods/did-pkh",
+  "crates/identity/affinidi-did-resolver-traits",
+  "crates/identity/affinidi-did-authentication",
+  "crates/identity/shortcuts/agent-names",
+
+  # Credentials: formats, proofs, status
+  "crates/credentials/affinidi-sd-jwt",
+  "crates/credentials/affinidi-data-integrity",
+  "crates/credentials/affinidi-rdf-encoding",
+  "crates/credentials/affinidi-vc",
+  "crates/credentials/affinidi-status-list",
+  "crates/credentials/affinidi-sd-jwt-vc",
+  "crates/credentials/affinidi-mdoc",
+
+  # Protocols: OID4VC core, SIOPv2, OpenID4VCI, OpenID4VP
+  "crates/protocols/affinidi-oid4vc-core",
+  "crates/protocols/affinidi-siopv2",
+  "crates/protocols/affinidi-openid4vci",
+  "crates/protocols/affinidi-openid4vp",
+
+  # Messaging: core, DIDComm, TSP, SDK (the mediator lives in
+  # affinidi/affinidi-messaging-mediator)
+  "crates/messaging/affinidi-messaging-core",
+  "crates/messaging/affinidi-messaging-delivery",
+  "crates/messaging/affinidi-messaging-didcomm",
+  "crates/messaging/affinidi-messaging-didcomm-v1",
+  "crates/messaging/affinidi-tsp",
+  "crates/messaging/affinidi-messaging-sdk",
+  "crates/messaging/affinidi-messaging-helpers",
+  "crates/messaging/affinidi-messaging-didcomm-service",
+  "crates/messaging/affinidi-messaging-mediator-types",
+  "crates/messaging/affinidi-messaging-text-client",
+
+  # Trust: trust infrastructure
+  "crates/trust/affinidi-trust-lists",
+
+  # TDK: unified entry point
+  "crates/tdk/affinidi-tdk-common",
+  "crates/tdk/affinidi-tdk",
+  "crates/tdk/affinidi-tdk-test-support",
+
+  # Applications
+  "crates/applications/affinidi-meeting-place",
+]
+resolver = "3"
+
+[workspace.package]
+description = "Affinidi Trust Development Kit. A Rust library for building secure, privacy-preserving, and interoperable applications."
+edition = "2024"
+authors = ["Glenn Gore <glenn@affinidi.com>"]
+readme = "README.md"
+homepage = "https://affinidi.com/"
+license = "Apache-2.0"
+keywords = ["ssi", "affinidi"]
+repository = "https://github.com/affinidi/affinidi-tdk-rs"
+publish = true
+rust-version = "1.95.0"
+
+[workspace.dependencies]
+tokio = "1"
+
+[profile.release]
+# Tell `rustc` to optimize for small code size.
+opt-level = "s"
+lto = true
+
+# Redirect crates.io deps to local workspace crates so all members use the same version.
+# Only needed for crates that are referenced by version (not path) in other workspace members.
+[patch.crates-io]
+affinidi-secrets-resolver = { path = "crates/core/affinidi-secrets-resolver" }
+affinidi-task-utils = { path = "crates/core/affinidi-task-utils" }
+affinidi-rate-limit = { path = "crates/core/affinidi-rate-limit" }
+affinidi-net-guard = { path = "crates/core/affinidi-net-guard" }
+affinidi-did-resolver-cache-sdk = { path = "crates/identity/affinidi-did-resolver-cache-sdk" }
+affinidi-did-resolver-traits = { path = "crates/identity/affinidi-did-resolver-traits" }
+affinidi-did-common = { path = "crates/identity/affinidi-did-common" }
+affinidi-crypto = { path = "crates/core/affinidi-crypto" }
+affinidi-encoding = { path = "crates/core/affinidi-encoding" }
+affinidi-data-integrity = { path = "crates/credentials/affinidi-data-integrity" }
+affinidi-rdf-encoding = { path = "crates/credentials/affinidi-rdf-encoding" }
+affinidi-messaging-didcomm = { path = "crates/messaging/affinidi-messaging-didcomm" }
+affinidi-messaging-didcomm-v1 = { path = "crates/messaging/affinidi-messaging-didcomm-v1" }
+affinidi-messaging-sdk = { path = "crates/messaging/affinidi-messaging-sdk" }
+affinidi-messaging-mediator-types = { path = "crates/messaging/affinidi-messaging-mediator-types" }
+affinidi-did-authentication = { path = "crates/identity/affinidi-did-authentication" }
+affinidi-tdk-common = { path = "crates/tdk/affinidi-tdk-common" }
+affinidi-tdk = { path = "crates/tdk/affinidi-tdk" }
+affinidi-meeting-place = { path = "crates/applications/affinidi-meeting-place" }
+affinidi-tsp = { path = "crates/messaging/affinidi-tsp" }
+affinidi-did-web = { path = "crates/identity/did-methods/did-web" }
+# `affinidi-did-webs` depends on `affinidi-cesr` by version, and so does
+# `affinidi-keri-core` from the registry. Without this redirect the workspace
+# builds both the local copy and a crates.io copy, and a `Matter` crossing
+# between them is a mismatched type that points anywhere but here.
+affinidi-cesr = { path = "crates/core/affinidi-cesr" }
+affinidi-did-webs = { path = "crates/identity/did-methods/did-webs" }
+affinidi-did-ethr = { path = "crates/identity/did-methods/did-ethr" }
+affinidi-did-jwk = { path = "crates/identity/did-methods/did-jwk" }
+affinidi-did-pkh = { path = "crates/identity/did-methods/did-pkh" }
+did-scid = { path = "crates/identity/did-methods/did-scid" }
+did-example = { path = "crates/identity/did-methods/did-example" }
+affinidi-messaging-core = { path = "crates/messaging/affinidi-messaging-core" }
+agent-names = { path = "crates/identity/shortcuts/agent-names" }
+affinidi-vc = { path = "crates/credentials/affinidi-vc" }
+affinidi-sd-jwt = { path = "crates/credentials/affinidi-sd-jwt" }
+affinidi-status-list = { path = "crates/credentials/affinidi-status-list" }
+affinidi-oid4vc-core = { path = "crates/protocols/affinidi-oid4vc-core" }
+affinidi-openid4vci = { path = "crates/protocols/affinidi-openid4vci" }
+affinidi-openid4vp = { path = "crates/protocols/affinidi-openid4vp" }
+affinidi-messaging-delivery = { path = "crates/messaging/affinidi-messaging-delivery" }
+
+[workspace.lints.clippy]
+uninlined_format_args = "warn"

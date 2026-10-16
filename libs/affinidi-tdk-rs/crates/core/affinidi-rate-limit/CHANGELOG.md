@@ -1,0 +1,80 @@
+# Changelog
+
+All notable changes to `affinidi-rate-limit` are documented here. The format
+follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this crate
+follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.2] - 2026-09-16
+
+Bound the number of distinct source IPs the limiter tracks, closing an
+unbounded-memory path (CWE-770).
+
+### Security
+
+- The keyed state store is keyed on unauthenticated, client-chosen IPs and
+  `governor` never caps the *number* of keys — only the periodic GC reclaims
+  fully-replenished buckets. Between sweeps a client rotating addresses (an
+  IPv6 /64, say) could grow the map without bound, before any authentication.
+  A hard cap (`MAX_TRACKED_IPS`, 250_000) now bounds it: when the store is full
+  and a *new* IP arrives, the limiter first attempts a throttled reclaim of
+  replenished buckets and, if still full, fails that new IP closed with the
+  usual `429` contract rather than growing the map. An IP already tracked is
+  never refused for capacity or evicted mid-window by this path, and disabled
+  mode (`per_second == 0`) is unaffected. The inline reclaim is throttled to at
+  most one pass per 100ms so the admission check itself can't be turned into a
+  CPU-exhaustion lever. No public API change.
+
+## [0.1.1] - 2026-09-16
+
+A `429` now says which service refused it, when the service names itself.
+
+### Added
+
+- `RateLimiterState::with_source(name)` and `RateLimiterState::source()`. A
+  named limiter's refusal carries the ecosystem's attribution contract:
+  - `x-rate-limit-source: <name>` (`SOURCE_HEADER`);
+  - `Retry-After: <seconds>`, as before;
+  - a JSON body `{"error":"rate_limited","limiter":"<name>","message":"…",
+    "retryAfterSecs":N}` with `Content-Type: application/json`.
+
+  The names clients match on are `mediator`, `vta`, `vtc` and `did-host`.
+- `SOURCE_HEADER` and `RATE_LIMITED_ERROR` constants.
+
+### Unchanged
+
+- An unnamed limiter sends exactly the plain-text `429` it always did, with no
+  source header. Additive: a patch.
+
+## [0.1.0] - 2026-07-20
+
+Initial release. Extracted from `affinidi-messaging-mediator`, where it had lived
+as `common/rate_limiter.rs`, so that more than one service can use it without the
+two copies drifting.
+
+### Added
+
+- `RateLimiterState` — per-IP token bucket over `governor`. `new(per_second,
+  burst)`, `disabled()`, `is_enabled()`, `tracked_keys()`.
+- `RateLimiterState::check(ip)` — the rate-limit decision, exposed separately
+  from the middleware so it can be tested directly. The mediator's copy had no
+  tests at all, largely because the logic was only reachable through a live
+  server; this release ships 12.
+- `RateLimiterState::spawn_gc(shutdown)` — periodic `retain_recent` sweep of the
+  keyed store.
+- `RateLimitLayer` / `RateLimitService` — the `tower` layer.
+- `Refusal` (`#[non_exhaustive]`) — `RateLimited { retry_after_secs }` or
+  `NoClientIp`.
+- `RateLimiterState::on_refused(callback)` — observe refusals without this crate
+  depending on any metrics library. The mediator's `RATE_LIMITED_TOTAL` metric,
+  previously emitted inside the limiter, now rides on this.
+
+### Behaviour carried over deliberately
+
+- **The GC sweep.** `governor` never reclaims keys, so an unswept store grows
+  once per source IP for the process lifetime, keyed on unauthenticated
+  client-chosen input. That was a real bug in the mediator before it was fixed;
+  keeping the fix in one shared place is the main reason this crate exists.
+- **No client IP means refusal, not exemption.** Failing open would be a trivial
+  bypass of per-IP limiting.
+- **`Retry-After` has a floor of 1 second.** Zero would invite an immediate retry
+  that is guaranteed to fail.

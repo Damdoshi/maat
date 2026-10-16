@@ -41,3 +41,17 @@ new default range and continues monotonically from its historical maximum.
 
 Testing: `maat-check-config /etc/maat/uid_range.dab` validates ownership,
 regular-file type, permissions and syntax. Install does not enable services.
+
+## OpenSSH 0.18 UID validation
+
+The broker owns the root-protected `uid_range.dab`, checks NSS and allocates
+UIDs in the exact configured interval. The OpenSSH parent and child processes
+independently reject implausible signed-32-bit UIDs with the shared
+`maat_uid_guard.h` helper (1,000,000 through 2,147,483,646). This check is
+intentionally a **generic safety envelope**, not a hard-coded replacement for
+`uid_range.dab`. Do not try to fix a mismatch by narrowing the broker's range
+to the historical `1800000000..1899999999`: that bypasses the configuration
+interface and could invalidate existing UID allocations.
+
+`maat-uid-guard-tests` verifies both ends of the broker's default range and
+custom allowed ranges, plus forbidden system and out-of-range UIDs.

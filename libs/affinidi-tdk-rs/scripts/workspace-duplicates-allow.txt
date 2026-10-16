@@ -1,0 +1,20 @@
+# Workspace members knowingly shadowed by a crates.io copy.
+#
+# One crate name per line. Every entry is a debt marker, not a resolution:
+# it means local edits to that crate are NOT what the workspace builds against
+# in the affected subtree, and two copies of its types exist in the graph.
+#
+# Only add an entry when the duplicate cannot be fixed from this repository.
+# A missing `[patch.crates-io]` entry is fixable here and does not belong.
+#
+#
+# ---------------------------------------------------------------------------
+#
+# Every entry this file has ever held came from one cycle: the mediator and
+# its `mediator-setup` tool depended on `vta-sdk`, which is built against this
+# workspace's `affinidi-messaging-sdk` / `affinidi-tdk` / `trust-tasks-rs`, so
+# each minor of those crates put registry copies in the graph until a matching
+# vta-sdk was published. The mediator crates moved to
+# https://github.com/affinidi/affinidi-messaging-mediator, and `vta-sdk` left
+# this workspace's graph with them, so the cycle no longer exists here. The
+# history of each crossing is in this file's git log.

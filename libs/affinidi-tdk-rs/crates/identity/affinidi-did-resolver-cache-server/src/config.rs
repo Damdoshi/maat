@@ -1,0 +1,375 @@
+use crate::errors::CacheError;
+use regex::{Captures, Regex};
+use serde::{Deserialize, Serialize};
+use std::{
+    env, fmt,
+    fs::File,
+    io::{self, BufRead},
+    path::Path,
+    time::Duration,
+};
+use tracing::{Level, event, level_filters::LevelFilter};
+use tracing_subscriber::{Registry, reload::Handle};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheConfig {
+    #[serde(default)]
+    pub capacity_count: String,
+    #[serde(default)]
+    pub expire: String,
+    /// TTL in seconds for cached raw `did:webvh` logs. `0` disables the cache,
+    /// which re-fetches `did.jsonl` on every resolution.
+    #[serde(default = "default_webvh_log_expire")]
+    pub webvh_log_expire: String,
+}
+
+/// Default TTL for the raw `did:webvh` log cache.
+///
+/// Defaults to `0` (disabled) so behaviour is unchanged unless explicitly
+/// enabled: caching these files trades upstream load against how quickly a
+/// freshly-published log entry becomes visible, and that is the operator's
+/// call to make.
+fn default_webvh_log_expire() -> String {
+    "0".into()
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig {
+            capacity_count: "1000".into(),
+            expire: "300".into(),
+            webvh_log_expire: default_webvh_log_expire(),
+        }
+    }
+}
+
+/// ConfigRaw Struct is used to deserialize the configuration file
+/// We then convert this to the CacheConfig Struct
+#[derive(Debug, Serialize, Deserialize)]
+struct ConfigRaw {
+    pub log_level: String,
+    pub listen_address: String,
+    pub enable_http_endpoint: String,
+    pub enable_websocket_endpoint: String,
+    /// Agent name (DID shortcut) lookup endpoint. Defaults to **off**: it makes
+    /// the server fetch caller-supplied URLs. See handlers/agent_names.rs.
+    #[serde(default = "default_enable_agent_names")]
+    pub enable_agent_names: String,
+    /// Ceiling on agent name lookups fetching upstream at once. See
+    /// `default_agent_name_concurrency`.
+    #[serde(default = "default_agent_name_concurrency")]
+    pub agent_name_concurrency: String,
+    #[serde(default = "default_rate_limit_per_ip")]
+    pub rate_limit_per_ip: String,
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: String,
+    pub statistics_interval: String,
+    #[serde(default = "default_resolve_timeout")]
+    pub resolve_timeout: String,
+    #[serde(default = "default_max_did_size")]
+    pub max_did_size: String,
+    pub cache: CacheConfig,
+}
+
+/// Default upstream-resolution timeout (seconds), used when the config file
+/// predates the `resolve_timeout` key.
+fn default_resolve_timeout() -> String {
+    "30".into()
+}
+
+/// Default maximum accepted DID length in bytes, used when the config file
+/// predates the `max_did_size` key.
+fn default_max_did_size() -> String {
+    "1024".into()
+}
+
+/// Agent name lookup defaults to **off**. Enabling it lets callers make this
+/// server issue HTTP requests to hosts of their choosing; see
+/// `handlers/agent_names.rs` for the SSRF considerations.
+fn default_enable_agent_names() -> String {
+    "false".into()
+}
+
+/// Ceiling on agent name lookups fetching upstream at once.
+///
+/// Agent name resolution turns one cheap inbound request into one outbound HTTP
+/// request to a host the *caller* chose. Without a ceiling that is an
+/// amplification primitive: a shared cache server can be driven to fan out
+/// arbitrary traffic at third parties, or used to scan them, at a cost to the
+/// attacker of one request each.
+///
+/// The cap bounds that fan-out regardless of how many source addresses the load
+/// arrives from, which per-IP rate limiting alone cannot do. Requests beyond it
+/// are rejected immediately with 503 rather than queued, so a saturated server
+/// sheds load instead of growing an unbounded backlog of pending fetches.
+///
+/// 16 is deliberately modest: agent name lookups are cache-warming, not a hot
+/// path, and a cache server exists precisely so the fetch happens rarely.
+fn default_agent_name_concurrency() -> String {
+    "16".into()
+}
+
+/// Sustained requests per second per client IP; `0` disables limiting.
+///
+/// Matches the mediator's default. Generous for a resolver cache, whose whole
+/// purpose is that most lookups are served from memory.
+///
+/// **Raise or disable this behind a load balancer or NAT**, where many clients
+/// share one source address: `ConnectInfo` reports the *peer* address, so every
+/// client behind a proxy is charged to one bucket and legitimate traffic gets
+/// throttled.
+fn default_rate_limit_per_ip() -> String {
+    "100".into()
+}
+
+/// Token-bucket depth above the sustained per-IP rate.
+fn default_rate_limit_burst() -> String {
+    "50".into()
+}
+
+pub struct Config {
+    pub log_level: LevelFilter,
+    pub listen_address: String,
+    pub enable_http_endpoint: bool,
+    pub enable_websocket_endpoint: bool,
+    pub enable_agent_names: bool,
+    pub agent_name_concurrency: usize,
+    pub rate_limit_per_ip: u32,
+    pub rate_limit_burst: u32,
+    pub statistics_interval: Duration,
+    /// Maximum time a single upstream DID resolution may take before the
+    /// request path gives up and returns an error instead of blocking.
+    pub resolve_timeout: Duration,
+    /// Maximum accepted DID length in bytes; longer DIDs are rejected before
+    /// resolution so a crafted request can't drive unbounded work.
+    pub max_did_size: usize,
+    pub cache_capacity_count: u32,
+    pub cache_expire: u32,
+    /// TTL in seconds for cached raw `did:webvh` logs; `0` disables the cache.
+    pub webvh_log_expire: u32,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("log_level", &self.log_level)
+            .field("listen_address", &self.listen_address)
+            .field("enable_http_endpoint", &self.enable_http_endpoint)
+            .field("enable_agent_names", &self.enable_agent_names)
+            .field("agent_name_concurrency", &self.agent_name_concurrency)
+            .field("rate_limit_per_ip", &self.rate_limit_per_ip)
+            .field("rate_limit_burst", &self.rate_limit_burst)
+            .field("enable_websocket_endpoint", &self.enable_websocket_endpoint)
+            .field(
+                "statistics_interval",
+                &format!("{} seconds", self.statistics_interval.as_secs()),
+            )
+            .field(
+                "resolve_timeout",
+                &format!("{} seconds", self.resolve_timeout.as_secs()),
+            )
+            .field("max_did_size", &format!("{} bytes", self.max_did_size))
+            .field("cache_capacity_count", &self.cache_capacity_count)
+            .field("cache_expire", &format!("{} seconds", self.cache_expire))
+            .field(
+                "webvh_log_expire",
+                &if self.webvh_log_expire == 0 {
+                    "disabled".to_string()
+                } else {
+                    format!("{} seconds", self.webvh_log_expire)
+                },
+            )
+            .finish()
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            log_level: LevelFilter::INFO,
+            listen_address: "".into(),
+            enable_http_endpoint: true,
+            enable_websocket_endpoint: true,
+            enable_agent_names: false,
+            agent_name_concurrency: 16,
+            rate_limit_per_ip: 100,
+            rate_limit_burst: 50,
+            statistics_interval: Duration::from_secs(60),
+            resolve_timeout: Duration::from_secs(30),
+            max_did_size: 1024,
+            cache_capacity_count: CacheConfig::default()
+                .capacity_count
+                .parse()
+                .unwrap_or(1000),
+            cache_expire: CacheConfig::default().expire.parse().unwrap_or(300),
+            webvh_log_expire: 0,
+        }
+    }
+}
+
+impl TryFrom<ConfigRaw> for Config {
+    type Error = CacheError;
+
+    fn try_from(raw: ConfigRaw) -> Result<Self, Self::Error> {
+        Ok(Config {
+            log_level: match raw.log_level.as_str() {
+                "trace" => LevelFilter::TRACE,
+                "debug" => LevelFilter::DEBUG,
+                "info" => LevelFilter::INFO,
+                "warn" => LevelFilter::WARN,
+                "error" => LevelFilter::ERROR,
+                _ => LevelFilter::INFO,
+            },
+            listen_address: raw.listen_address,
+            enable_http_endpoint: raw.enable_http_endpoint.parse().unwrap_or(true),
+            enable_websocket_endpoint: raw.enable_websocket_endpoint.parse().unwrap_or(true),
+            // Defaults to false on a parse failure too: an unreadable value must
+            // not silently turn on a network-facing fetch.
+            enable_agent_names: raw.enable_agent_names.parse().unwrap_or(false),
+            // A zero or unparseable cap would mean "no limit", which is the
+            // opposite of what this setting is for; fall back to the default.
+            agent_name_concurrency: raw
+                .agent_name_concurrency
+                .parse()
+                .ok()
+                .filter(|n: &usize| *n > 0)
+                .unwrap_or(16),
+            // An unparseable value falls back to the default rather than to 0:
+            // 0 means "disabled", and a typo must not silently remove limiting.
+            // An explicit "0" still disables, which is the documented way to.
+            rate_limit_per_ip: raw.rate_limit_per_ip.parse().unwrap_or(100),
+            rate_limit_burst: raw.rate_limit_burst.parse().unwrap_or(50),
+            statistics_interval: Duration::from_secs(raw.statistics_interval.parse().unwrap_or(60)),
+            resolve_timeout: Duration::from_secs(raw.resolve_timeout.parse().unwrap_or(30)),
+            max_did_size: raw.max_did_size.parse().unwrap_or(1024),
+            cache_capacity_count: raw.cache.capacity_count.parse().unwrap_or(1000),
+            cache_expire: raw.cache.expire.parse().unwrap_or(300),
+            webvh_log_expire: raw.cache.webvh_log_expire.parse().unwrap_or(0),
+        })
+    }
+}
+
+/// Read the primary configuration file for the mediator
+/// Returns a ConfigRaw struct, that still needs to be processed for additional information
+/// and conversion to Config struct
+fn read_config_file(file_name: &str) -> Result<ConfigRaw, CacheError> {
+    // Read configuration file parameters
+    event!(Level::INFO, "Config file({})", file_name);
+    let raw_config = read_file_lines(file_name)?;
+
+    event!(Level::DEBUG, "raw_config = {:?}", raw_config);
+    let config_with_vars = expand_env_vars(&raw_config);
+    match toml::from_str(&config_with_vars.join("\n")) {
+        Ok(config) => Ok(config),
+        Err(err) => {
+            event!(
+                Level::ERROR,
+                "Could not parse configuration settings. {:?}",
+                err
+            );
+            Err(CacheError::ConfigError(
+                "NA".into(),
+                format!("Could not parse configuration settings. Reason: {err:?}"),
+            ))
+        }
+    }
+}
+
+/// Reads a file and returns a vector of strings, one for each line in the file.
+/// It also strips any lines starting with a # (comments)
+/// You can join the Vec back into a single string with `.join("\n")`
+pub(crate) fn read_file_lines<P>(file_name: P) -> Result<Vec<String>, CacheError>
+where
+    P: AsRef<Path>,
+{
+    let file = File::open(file_name.as_ref()).map_err(|err| {
+        event!(
+            Level::ERROR,
+            "Could not open file({}). {}",
+            file_name.as_ref().display(),
+            err
+        );
+        CacheError::ConfigError(
+            "NA".into(),
+            format!(
+                "Could not open file({}). {}",
+                file_name.as_ref().display(),
+                err
+            ),
+        )
+    })?;
+
+    let mut lines = Vec::new();
+    for line in io::BufReader::new(file).lines().map_while(Result::ok) {
+        // Strip comments out
+        if !line.starts_with('#') {
+            lines.push(line);
+        }
+    }
+
+    Ok(lines)
+}
+
+/// Replaces all strings ${VAR_NAME:default_value}
+/// with the corresponding environment variables (e.g. value of ${VAR_NAME})
+/// or with `default_value` if the variable is not defined.
+fn expand_env_vars(raw_config: &Vec<String>) -> Vec<String> {
+    let re = Regex::new(r"\$\{(?P<env_var>[A-Z_]{1,}[0-9A-Z_]*):(?P<default_value>.*)\}").unwrap();
+    let mut result: Vec<String> = Vec::new();
+    for line in raw_config {
+        result.push(
+            re.replace_all(line, |caps: &Captures| match env::var(&caps["env_var"]) {
+                Ok(val) => val,
+                Err(_) => (caps["default_value"]).into(),
+            })
+            .into_owned(),
+        );
+    }
+    result
+}
+
+/// Default config path used when no `-c` flag is supplied.
+pub const DEFAULT_CONFIG_PATH: &str = "conf/cache-conf.toml";
+
+pub fn init(
+    config_path: &str,
+    reload_handle: Option<Handle<LevelFilter, Registry>>,
+) -> Result<Config, CacheError> {
+    // Read configuration file parameters
+    let config = read_config_file(config_path)?;
+
+    // Setup logging
+    if let Some(reload_handle) = &reload_handle {
+        let level: LevelFilter = match config.log_level.as_str() {
+            "trace" => LevelFilter::TRACE,
+            "debug" => LevelFilter::DEBUG,
+            "info" => LevelFilter::INFO,
+            "warn" => LevelFilter::WARN,
+            "error" => LevelFilter::ERROR,
+            _ => {
+                event!(
+                    Level::WARN,
+                    "log_level({}) is unknown in config file. Defaults to INFO",
+                    config.log_level
+                );
+                LevelFilter::INFO
+            }
+        };
+        reload_handle
+            .modify(|filter| *filter = level)
+            .map_err(|e| CacheError::InternalError("NA".into(), e.to_string()))?;
+        event!(Level::INFO, "Log level set to ({})", config.log_level);
+    }
+
+    match Config::try_from(config) {
+        Ok(config) => {
+            event!(
+                Level::INFO,
+                "Configuration settings parsed successfully.\n{:#?}",
+                config
+            );
+            Ok(config)
+        }
+        Err(err) => Err(err),
+    }
+}

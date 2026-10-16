@@ -1,0 +1,18 @@
+name: Native PHP 8.4 Maât module
+on:
+  push:
+  pull_request:
+jobs:
+  native-php:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git php8.4-cli php8.4-dev php8.4-common \
+            build-essential autoconf automake pkg-config
+      - uses: actions/checkout@v4
+      - name: Compile and run PHPT suite
+        run: ./php-ext/build.sh

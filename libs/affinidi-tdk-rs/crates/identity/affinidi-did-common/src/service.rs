@@ -1,0 +1,377 @@
+//! https://www.w3.org/TR/cid-1.0/#services
+
+use std::{collections::HashMap, fmt};
+
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, SeqAccess, Visitor},
+};
+use serde_json::Value;
+use url::Url;
+
+use crate::Document;
+
+/// `#[non_exhaustive]`: build via [`ServiceBuilder`] (or deserialization) rather
+/// than a struct literal. Fields stay public for reads.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct Service {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<Url>,
+
+    /// Must have at least one entry
+    #[serde(rename = "type")]
+    #[serde(deserialize_with = "de_type")]
+    pub type_: Vec<String>,
+
+    /// serviceEndpoint
+    pub service_endpoint: Endpoint,
+
+    /// Each Service can have multiple other properties
+    #[serde(flatten)]
+    pub property_set: HashMap<String, Value>,
+}
+
+fn de_type<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringOrVecVisitor;
+
+    impl<'de> Visitor<'de> for StringOrVecVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or a sequence of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value.to_owned()])
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element()? {
+                vec.push(elem);
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVecVisitor)
+}
+
+impl Document {
+    /// Returns a refernce to the first service with the given id, if it exists
+    /// id: the fragment text after the `#` in the full service id URL
+    pub fn find_service(&self, id: &str) -> Option<&Service> {
+        self.service.iter().find(|s| {
+            if let Some(sid) = &s.id {
+                sid.as_str().ends_with(&["#", id].concat())
+            } else {
+                false
+            }
+        })
+    }
+}
+
+/// Service Endpoint definitions
+///
+/// `#[non_exhaustive]`: match with a wildcard arm so new endpoint shapes are
+/// not a breaking change.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum Endpoint {
+    /// Single String (URL)
+    Url(Url),
+
+    /// Can be either a Map or a Set of Strings/Maps
+    Map(Value),
+}
+
+impl Endpoint {
+    /// Returns the first URI String for a service Endpoint, if available
+    /// This may not be what you always want
+    pub fn get_uri(&self) -> Option<String> {
+        match self {
+            Endpoint::Url(uri) => Some(uri.to_string()),
+            Endpoint::Map(map) => match map {
+                Value::Array(array) => array.first().and_then(uri_of),
+                Value::Object(_) => uri_of(map),
+                _ => None,
+            },
+        }
+    }
+
+    /// Returns all found URI's within a service Endpoint
+    pub fn get_uris(&self) -> Vec<String> {
+        match self {
+            Endpoint::Url(uri) => vec![uri.to_string()],
+            Endpoint::Map(map) => match map {
+                Value::Array(array) => array.iter().filter_map(uri_of).collect(),
+                Value::Object(_) => uri_of(map).into_iter().collect(),
+                _ => Vec::new(),
+            },
+        }
+    }
+}
+/// The `uri` member of one service-endpoint object, as a **string**.
+///
+/// `Value::to_string()` is JSON serialisation, so on a `Value::String` it keeps the quotes —
+/// which is how `get_uri` came to return `https://example.com/` for the plain-URL form and
+/// `"\"https://example.com\""` for the map form of the same endpoint. A caller cannot tell
+/// which it got without knowing the shape it did not have to care about, and two callers in
+/// this workspace carried a `trim_matches('"')` to compensate while two others did not and
+/// returned a quoted URI.
+///
+/// `as_str` instead, which yields the value rather than its JSON encoding. A non-string
+/// `uri` is `None`: the specification says the member is a URI, and a number or an object
+/// there is not one — returning its JSON text would be inventing an endpoint.
+fn uri_of(entry: &Value) -> Option<String> {
+    entry.get("uri")?.as_str().map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn make_doc_with_services(services: Vec<Service>) -> Document {
+        Document {
+            id: Url::parse("did:test:1234").unwrap(),
+            also_known_as: vec![],
+            verification_method: vec![],
+            authentication: vec![],
+            assertion_method: vec![],
+            key_agreement: vec![],
+            capability_invocation: vec![],
+            capability_delegation: vec![],
+            service: services,
+            parameters_set: HashMap::new(),
+        }
+    }
+
+    // --- Endpoint::get_uri ---
+
+    #[test]
+    fn get_uri_from_url_endpoint() {
+        let ep = Endpoint::Url(Url::parse("https://example.com").unwrap());
+        assert_eq!(ep.get_uri().unwrap(), "https://example.com/");
+    }
+
+    /// The map form yields the same string the plain-URL form does.
+    ///
+    /// It used to yield `"\"https://example.com\""` — `Value::to_string()` on a JSON string
+    /// keeps the quotes — so which of the two shapes a document happened to use decided
+    /// whether a caller got a usable URI. That was asserted here rather than fixed.
+    #[test]
+    fn get_uri_from_map_object() {
+        let ep = Endpoint::Map(json!({"uri": "https://example.com"}));
+        assert_eq!(ep.get_uri().unwrap(), "https://example.com");
+    }
+
+    #[test]
+    fn get_uri_from_map_array() {
+        let ep = Endpoint::Map(json!([
+            {"uri": "https://first.example.com"},
+            {"uri": "https://second.example.com"}
+        ]));
+        assert_eq!(ep.get_uri().unwrap(), "https://first.example.com");
+    }
+
+    /// A DIDComm service endpoint names its mediator by **DID**, not by URL, so this is the
+    /// shape that actually travels — and the one the quoting broke: `did:webvh:…` came back
+    /// as `"did:webvh:…"`, which resolves as nothing and reads like a malformed document.
+    #[test]
+    fn get_uri_from_a_didcomm_service_endpoint() {
+        let ep = Endpoint::Map(json!({
+            "uri": "did:webvh:QmTS3a:webvh.example:mediator",
+            "accept": ["didcomm/v2"],
+        }));
+        assert_eq!(
+            ep.get_uri().unwrap(),
+            "did:webvh:QmTS3a:webvh.example:mediator"
+        );
+    }
+
+    /// A `uri` that is not a string is not a URI. Returning its JSON text would hand the
+    /// caller an endpoint nobody wrote.
+    #[test]
+    fn get_uri_from_map_object_with_non_string_uri() {
+        assert!(Endpoint::Map(json!({"uri": 42})).get_uri().is_none());
+        assert!(
+            Endpoint::Map(json!({"uri": {"nested": "x"}}))
+                .get_uri()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn get_uri_from_map_empty_array() {
+        let ep = Endpoint::Map(json!([]));
+        assert!(ep.get_uri().is_none());
+    }
+
+    #[test]
+    fn get_uri_from_map_object_missing_uri_key() {
+        let ep = Endpoint::Map(json!({"endpoint": "https://example.com"}));
+        assert!(ep.get_uri().is_none());
+    }
+
+    #[test]
+    fn get_uri_from_map_non_object_non_array() {
+        let ep = Endpoint::Map(json!("just a string"));
+        assert!(ep.get_uri().is_none());
+    }
+
+    // --- Endpoint::get_uris ---
+
+    #[test]
+    fn get_uris_from_url_endpoint() {
+        let ep = Endpoint::Url(Url::parse("https://example.com").unwrap());
+        assert_eq!(ep.get_uris(), vec!["https://example.com/"]);
+    }
+
+    #[test]
+    fn get_uris_from_map_object() {
+        let ep = Endpoint::Map(json!({"uri": "https://example.com"}));
+        assert_eq!(ep.get_uris(), vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn get_uris_from_map_array() {
+        let ep = Endpoint::Map(json!([
+            {"uri": "https://first.example.com"},
+            {"uri": "https://second.example.com"}
+        ]));
+        assert_eq!(
+            ep.get_uris(),
+            vec!["https://first.example.com", "https://second.example.com"]
+        );
+    }
+
+    #[test]
+    fn get_uris_from_map_array_with_missing_uri() {
+        let ep = Endpoint::Map(json!([
+            {"uri": "https://example.com"},
+            {"other": "no-uri-here"}
+        ]));
+        let uris = ep.get_uris();
+        assert_eq!(uris.len(), 1);
+    }
+
+    #[test]
+    fn get_uris_from_map_empty_array() {
+        let ep = Endpoint::Map(json!([]));
+        assert!(ep.get_uris().is_empty());
+    }
+
+    #[test]
+    fn get_uris_from_map_non_object_non_array() {
+        let ep = Endpoint::Map(json!(42));
+        assert!(ep.get_uris().is_empty());
+    }
+
+    // --- Document::find_service ---
+
+    #[test]
+    fn find_service_found() {
+        let svc = Service {
+            id: Some(Url::parse("did:test:1234#my-service").unwrap()),
+            type_: vec!["LinkedDomains".to_string()],
+            service_endpoint: Endpoint::Url(Url::parse("https://example.com").unwrap()),
+            property_set: HashMap::new(),
+        };
+        let doc = make_doc_with_services(vec![svc]);
+        assert!(doc.find_service("my-service").is_some());
+    }
+
+    #[test]
+    fn find_service_not_found() {
+        let svc = Service {
+            id: Some(Url::parse("did:test:1234#my-service").unwrap()),
+            type_: vec!["LinkedDomains".to_string()],
+            service_endpoint: Endpoint::Url(Url::parse("https://example.com").unwrap()),
+            property_set: HashMap::new(),
+        };
+        let doc = make_doc_with_services(vec![svc]);
+        assert!(doc.find_service("other-service").is_none());
+    }
+
+    #[test]
+    fn find_service_no_id() {
+        let svc = Service {
+            id: None,
+            type_: vec!["LinkedDomains".to_string()],
+            service_endpoint: Endpoint::Url(Url::parse("https://example.com").unwrap()),
+            property_set: HashMap::new(),
+        };
+        let doc = make_doc_with_services(vec![svc]);
+        assert!(doc.find_service("anything").is_none());
+    }
+
+    #[test]
+    fn find_service_empty_services() {
+        let doc = make_doc_with_services(vec![]);
+        assert!(doc.find_service("anything").is_none());
+    }
+
+    // --- Service deserialization (type as string or array) ---
+
+    #[test]
+    fn deserialize_service_type_as_string() {
+        let json = r#"{
+            "type": "LinkedDomains",
+            "serviceEndpoint": "https://example.com"
+        }"#;
+        let svc: Service = serde_json::from_str(json).unwrap();
+        assert_eq!(svc.type_, vec!["LinkedDomains"]);
+    }
+
+    #[test]
+    fn deserialize_service_type_as_array() {
+        let json = r#"{
+            "type": ["LinkedDomains", "CredentialRepository"],
+            "serviceEndpoint": "https://example.com"
+        }"#;
+        let svc: Service = serde_json::from_str(json).unwrap();
+        assert_eq!(svc.type_.len(), 2);
+        assert_eq!(svc.type_[0], "LinkedDomains");
+        assert_eq!(svc.type_[1], "CredentialRepository");
+    }
+
+    #[test]
+    fn deserialize_service_with_map_endpoint() {
+        let json = r#"{
+            "id": "did:test:1234#svc",
+            "type": "DIDCommMessaging",
+            "serviceEndpoint": {"uri": "https://example.com/didcomm", "accept": ["didcomm/v2"]}
+        }"#;
+        let svc: Service = serde_json::from_str(json).unwrap();
+        assert!(svc.id.is_some());
+        assert!(matches!(svc.service_endpoint, Endpoint::Map(_)));
+    }
+
+    #[test]
+    fn serialize_service_roundtrip() {
+        let svc = Service {
+            id: Some(Url::parse("did:test:1234#svc").unwrap()),
+            type_: vec!["LinkedDomains".to_string()],
+            service_endpoint: Endpoint::Url(Url::parse("https://example.com").unwrap()),
+            property_set: HashMap::new(),
+        };
+        let json = serde_json::to_string(&svc).unwrap();
+        let back: Service = serde_json::from_str(&json).unwrap();
+        assert_eq!(svc, back);
+    }
+}
