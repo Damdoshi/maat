@@ -1,10 +1,22 @@
 # Maât QEMU E2E — separate Linux kernel
 
-This script is an **opt-in second environment**, not a mandatory Docker
-replacement. It uses a trusted Ubuntu 22.04 **QCOW2 cloud image** which you
-must acquire independently and verify against its publisher's checksum.
-Install host packages (`qemu-system-x86`, `qemu-utils`, `cloud-image-utils`,
-`openssh-client`). For Ubuntu 22.04 use the official **released** AMD64 cloud image:
+The QEMU laboratory uses a separate Linux kernel and an official Ubuntu 22.04
+QCOW2 cloud image. Install host packages (`qemu-system-x86`, `qemu-utils`,
+`cloud-image-utils`, `openssh-client`), then run from the Maât repository root:
+
+```sh
+./check.sh full
+```
+
+`check.sh full` downloads `ubuntu-22.04-server-cloudimg-amd64.img` directly into
+the repository root when absent and passes that exact path to both QEMU suites.
+It verifies SHA-256 from Canonical's HTTPS manifest before use and refuses to
+silently overwrite a mismatched existing image. `./check.sh unit` requires no
+image and performs no network download. The image is a test fixture, not a
+prebuild dependency. HTTPS checksum verification does not replace validation of
+the publisher's signed checksum manifest; see the manual verification steps below.
+
+For Ubuntu 22.04 use the official **released** AMD64 cloud image:
 
 - https://cloud-images.ubuntu.com/releases/server/jammy/release/
 - Download `ubuntu-22.04-server-cloudimg-amd64.img` (QCOW2) and the matching

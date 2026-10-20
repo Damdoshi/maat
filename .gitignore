@@ -7,6 +7,7 @@
 .libs/
 modules/mod_maat/.libs/
 libs/apache-httpd/build/
+traces.txt
 
 # Optional Rust FFI bridge compilation
 libs/maat-bbs/target/
@@ -27,3 +28,24 @@ libs/maat-bbs/vendor/
 __pycache__/
 *.py[cod]
 ubuntu-22.04-server-cloudimg-amd64.img
+
+libs/openssh-portable/Makefile
+libs/openssh-portable/config.h
+libs/openssh-portable/config.log
+libs/openssh-portable/config.status
+libs/openssh-portable/ssh
+libs/openssh-portable/ssh-keygen
+libs/openssh-portable/sshd
+libs/openssh-portable/sshd-auth
+libs/openssh-portable/sshd-session
+modules/mod_maat/ingress_policy.slo
+modules/mod_maat/maat_broker_client.slo
+modules/mod_maat/mod_maat.slo
+php-ext/Makefile
+php-ext/autom4te.cache/
+php-ext/build/
+php-ext/config.h
+php-ext/config.log
+php-ext/config.status
+php-ext/libtool
+php-ext/modules/

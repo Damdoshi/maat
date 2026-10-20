@@ -99,6 +99,5 @@ if ! (cd "$BBS" && cargo metadata --locked --offline --format-version 1 --no-dep
   if [[ -d $BACKUP ]]; then mv -- "$BACKUP" "$VENDOR"; fi
   exit 1
 fi
-wget https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img \
-     -O ubuntu-22.04-server-cloudimg-amd64.img
+./tests/qemu/download-image.sh
 echo 'PASS Maât prebuild: source dependencies ready for ./build.sh'
